@@ -2,6 +2,9 @@
   "name": "@local/dsh-verify",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "type": "module",
   "description": "Detect and run the workspace's check command (test/lint/typecheck) and report a human summary with the failing lines.",
   "exports": {

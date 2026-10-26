@@ -2,6 +2,9 @@
   "name": "@local/dsh-skill-usage",
   "version": "1.0.2",
   "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "type": "module",
   "description": "Tracks skill usage across sessions and flags stale skills that need review.",
   "exports": {

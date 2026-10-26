@@ -2,6 +2,9 @@
   "name": "@local/dsh-repomap",
   "version": "1.0.1",
   "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "type": "module",
   "description": "Ranked repository map and symbol outline for any workspace: which files matter, what they define, within a token budget.",
   "exports": {

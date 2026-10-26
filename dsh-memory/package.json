@@ -2,6 +2,9 @@
   "name": "@local/dsh-memory",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "type": "module",
   "description": "Persistent memory across sessions: agent-curated facts injected into the system prompt, editable with memory tools.",
   "exports": {

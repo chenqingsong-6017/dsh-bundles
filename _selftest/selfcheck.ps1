@@ -61,19 +61,33 @@ foreach ($dir in $bundleDirs) {
     if ($hasInsert) { Check $hasName "$name · insert 行带 name" }
   }
 
-  $indexPath = Join-Path $dir.FullName 'index.js'
-  $declaresEntry = $false
-  if ($pkg.exports) { $declaresEntry = @($pkg.exports.PSObject.Properties.Name) -contains '.' }
-  if (Test-Path $indexPath) {
-    $tmp = Join-Path $env:TEMP ("selfcheck-" + [guid]::NewGuid().ToString('N') + '.mjs')
-    Copy-Item $indexPath $tmp
-    node --check $tmp *> $null
-    Check ($LASTEXITCODE -eq 0) "$name · index.js 语法通过"
-    Remove-Item $tmp -Force
-  } elseif ($declaresEntry) {
-    Check $false "$name · 声明了入口但没有 index.js"
+  # 入口校验：按 package.json 的 main / exports["."] 解析，兼容根 index.js 与 lib/index.js 两种形态
+  $entryRel = $null
+  if ($pkg.main) {
+    $entryRel = [string]$pkg.main
+  } elseif ($pkg.exports) {
+    $dot = $pkg.exports.'.'
+    if ($dot -is [string]) { $entryRel = $dot }
+    elseif ($dot -is [pscustomobject]) {
+      if ($dot.import) { $entryRel = [string]$dot.import }
+      elseif ($dot.require) { $entryRel = [string]$dot.require }
+    }
+  }
+  if (-not $entryRel -and (Test-Path (Join-Path $dir.FullName 'index.js'))) { $entryRel = './index.js' }
+
+  if ($entryRel) {
+    $rel = ($entryRel -replace '\\', '/') -replace '^\./', ''
+    $entryPath = Join-Path $dir.FullName $rel
+    Check (Test-Path $entryPath) "$name · 入口 $rel 存在"
+    if (Test-Path $entryPath) {
+      $tmp = Join-Path $env:TEMP ("selfcheck-" + [guid]::NewGuid().ToString('N') + '.mjs')
+      Copy-Item $entryPath $tmp
+      node --check $tmp *> $null
+      Check ($LASTEXITCODE -eq 0) "$name · 入口 $rel 语法通过"
+      Remove-Item $tmp -Force
+    }
   } else {
-    Write-Host "  · $name · 纯配置 bundle（无 index.js，正常）" -ForegroundColor DarkGray
+    Write-Host "  · $name · 纯配置 bundle（无入口代码，正常）" -ForegroundColor DarkGray
   }
 
   if ($strictBundles -contains $name) {

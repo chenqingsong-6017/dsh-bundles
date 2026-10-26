@@ -2,6 +2,9 @@
   "name": "@local/dsh-computer-bundle",
   "version": "1.0.1",
   "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "type": "module",
   "description": "Mounts computer-use with the Cua Driver native backend for desktop window, mouse and keyboard control.",
   "exports": {

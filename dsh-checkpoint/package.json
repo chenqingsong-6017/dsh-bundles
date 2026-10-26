@@ -2,6 +2,9 @@
   "name": "@local/dsh-checkpoint",
   "version": "1.4.1",
   "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "type": "module",
   "description": "Write-before snapshots and one-call rollback for agent file edits.",
   "exports": {
