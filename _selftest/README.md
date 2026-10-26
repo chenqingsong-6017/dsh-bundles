@@ -12,11 +12,11 @@ pwsh -NoProfile -File ...\selfcheck.ps1 -SkipTests    # 跳过单测，只跑结
 检查四层，退出码非 0 表示有失败：
 
 1. **结构与清单**（每个 bundle）：`package.json` 可解析、声明 `dsh.bundle.patch`、patch 有 insert 或覆盖行、`index.js` 语法（纯配置 bundle 自动跳过）、严格清单里还要求 `locale/en+zh`、`icon.svg`（<256 KiB 且是 SVG）、`README.md`；
-2. **工具输出 schema**：调 `schema-check.mjs`（见下），23 个工具全覆盖；
-3. **单元测试**：跑 `tests/*.test.mjs`（checkpoint 的 diff/hunk、repomap 的符号抽取、skill-usage 的陈旧判定、memory 的渲染、verify 的项目识别、usage 的日志解析、audit 的危险分级与脱敏）；
+2. **工具输出 schema**：调 `schema-check.mjs`（见下），25 个工具全覆盖；
+3. **单元测试**：跑 `tests/*.test.mjs`（checkpoint 的 diff/hunk、repomap 的符号抽取、skill-usage 的陈旧判定、memory 的渲染、verify 的项目识别、usage 的日志解析、audit 的危险分级与脱敏、notify 的触发规则与通知脚本）；
 4. **profile 安装一致性**：bundle 在 `dsh.profile.bundles` 里、依赖是 `link:<bundle 目录>`、`node_modules` 里的链接确实指向同一个目录。
 
-当前结果：**255 项检查全部通过**。
+当前结果：**277 项检查全部通过**。
 
 ## schema-check.mjs
 
@@ -72,7 +72,7 @@ FAIL bad-bundle/bad_tool
 ## 当前结果（2026-10-26）
 
 ```
-23 个工具全部 PASS；staleness-watch SKIP（不注册工具）
+25 个工具全部 PASS；staleness-watch SKIP（不注册工具）
 ```
 
-（2026-10-26：memory 4→5、checkpoint 5→6，新增 dsh-usage 2 个、dsh-audit 3 个工具；repomap/skill-usage/verify 不变。）
+（2026-10-26：memory 4→5、checkpoint 5→6，新增 dsh-usage 2 个、dsh-audit 3 个、dsh-notify 2 个工具；repomap/skill-usage/verify 不变。）

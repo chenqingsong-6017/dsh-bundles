@@ -1,0 +1,18 @@
+# dsh-notify bundle patch.
+#
+# 不在这里写死任何绝对路径 —— 默认落到 DSH_PROFILE_DIR 或 ~/.dsh/dsh-notify。
+# 想改阈值或放置位置，在 profile 的 cordis.patch.yml 里覆盖：
+#
+#   - id: notify
+#     name: "@local/dsh-notify"
+#     config:
+#       storeDir: 'D:\AI\dsh-data\notify'
+#       timeZone: 'Asia/Shanghai'
+#       minDurationMs: 60000      # 只有超过这么久的回合完成才通知
+#       notifyOnComplete: true
+#       notifyOnError: true
+#       notifyOnInterrupt: false
+#       sound: true
+- insert:
+    - id: notify
+      name: '@local/dsh-notify'

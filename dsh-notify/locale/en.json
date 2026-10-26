@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Turn Notifications",
+    "description": "Desktop notifications (Windows toast + sound) when a long-running turn completes or fails; short Q&A stays silent. Also exposes a notify tool so the agent can ping you mid-task. Send failures are logged and never affect the session."
+  }
+}
