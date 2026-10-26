@@ -1,0 +1,22 @@
+# dsh-usage bundle patch.
+#
+# 这里**不写死任何绝对路径** —— 插件默认把索引存到 DSH_PROFILE_DIR 或 ~/.dsh/dsh-usage，
+# 在任何机器上装上都能跑。
+#
+# 想把索引放到别的盘、或启用成本估算，在 profile 的 cordis.patch.yml 里覆盖（用户级配置）：
+#
+#   - id: usage
+#     name: "@local/dsh-usage"
+#     config:
+#       storeDir: 'D:\AI\dsh-data\usage'   # 索引落盘位置
+#       timeZone: 'Asia/Shanghai'          # 报表日期按哪个时区切（默认系统时区）
+#       currency: 'CNY'
+#       prices:                            # 每百万 token 单价；不配则只报 token 不报钱
+#         deepseek-flash:
+#           input: 0.5
+#           output: 8
+#           cacheRead: 0.05
+#           cacheWrite: 0.5
+- insert:
+    - id: usage
+      name: '@local/dsh-usage'

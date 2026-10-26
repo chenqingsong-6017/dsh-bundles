@@ -21,7 +21,8 @@ $profileJson = Join-Path $profileDir 'package.json'
 $strictBundles = @(
   'dsh-checkpoint', 'dsh-skill-usage', 'dsh-memory',
   'dsh-repomap', 'dsh-verify', 'dsh-agents-md',
-  'dsh-browser-bundle', 'dsh-computer-bundle', 'dsh-staleness-watch'
+  'dsh-browser-bundle', 'dsh-computer-bundle', 'dsh-staleness-watch',
+  'dsh-usage'
 )
 
 $failures = [System.Collections.Generic.List[string]]::new()

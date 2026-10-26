@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Usage & Cost Report",
+    "description": "Cross-session token usage from local session logs (input/output/cache read/write), grouped by day, model, or session, with optional cost when a price table is configured. Read-only: it never sends a model request."
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "@local/dsh-usage",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "description": "Cross-session token usage and cost report built from DSH session logs: group by day, model, or session. Read-only, zero context tax.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
