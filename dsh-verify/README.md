@@ -73,9 +73,18 @@ DSH bundle（Host 侧插件）：识别并运行项目自己的检查命令（�
 | `kind=lint`（项目没有 lint 脚本） | 明确返回"没检测到"，没有瞎猜命令 ✅ |
 | 不存在的目录 | 返回"没检测到"，不抛异常 ✅ |
 
+## 验证记录补充（2026-10-26，工作目录解析修复）
+
+| 场景 | 结果 |
+|---|---|
+| 修复前 | 不带 `path` 调 `verify_status`，报的工作区是 `C:\Users\...\.dsh\profiles\desktop`（Host 的 `process.cwd()`），是假路径 |
+| 修复后 | 解析顺序改为 `get(session)` → `ensure(agent)` → 明确报未解析；`verify_status` 输出 `（未解析）` 并附 ⚠ 提示要求传 `path`，不再显示 profile 目录 ✅ |
+| 回归 | `node --check` 通过；`verify.test.mjs` 7 项全过；`schema-check.mjs dsh-verify` 2 个工具 PASS（新增可选 `notice` 字段）✅ |
+
 ## 剩下的边界
 
 - **命令以宿主进程权限运行**，没有经过 fs 沙箱（用的是 `ctx.subprocess`，不是 shell 工具的沙箱路径）；在只读/受限会话里新增 `customCommand` 要谨慎；
 - 不做"编辑后自动跑"（有意）：需要时由 agent 调 `verify`；
 - 只识别常见项目文件；特殊项目用 `customCommand` 覆盖；
-- 输出采集上限 256 KiB，超出部分丢弃（`verify_status` 里会体现退出码，但看不到完整输出）。
+- 输出采集上限 256 KiB，超出部分丢弃（`verify_status` 里会体现退出码，但看不到完整输出）；
+- **会话工作目录解析**（v1.0.1 修）：优先 `workingDirectory.get(session)`（同步、无 fs I/O）→ 失败再 `ensure(agent)`（校验/恢复目录）→ 两者都失败时**不去猜** `process.cwd()`，而是明确报"未取到会话工作目录"并请你传 `path`。桌面版 Host 的 `process.cwd()` 是 profile 目录，以前静默拿它冒充工作区，会让 `verify` 在错误目录跑检查、让 `verify_status` 显示假路径。

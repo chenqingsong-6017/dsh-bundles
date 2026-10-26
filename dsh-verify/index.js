@@ -114,13 +114,46 @@ export function apply(ctx, config) {
   const workingDirectory = ctx.get('workingDirectory')
   let lastRun = null
 
+  /**
+   * 解析要检查的根目录，返回 { root } 或 { root: undefined, error }。
+   *
+   * 顺序：显式 path（相对会话目录解析）→ 会话已提交目录（同步 get，无 fs I/O）→ ensure 校验/恢复。
+   * **绝不**拿 Host 进程的 process.cwd() 冒充会话目录：桌面版的 Host cwd 是 profile 目录，
+   * 静默用它会让 verify 在错误的目录里跑检查、让 verify_status 显示假的工作区。
+   */
   async function resolveRoot(exec, wantedPath) {
     const raw = typeof wantedPath === 'string' && wantedPath.trim() !== '' ? wantedPath.trim() : undefined
-    const cwd =
-      workingDirectory && exec?.agent
-        ? await workingDirectory.ensure(exec.agent, exec.signal).catch(() => undefined)
-        : undefined
-    return raw === undefined ? cwd ?? process.cwd() : path.resolve(cwd ?? process.cwd(), raw)
+    let sessionCwd
+    let sessionError
+
+    if (workingDirectory) {
+      if (exec?.session) {
+        try {
+          const committed = workingDirectory.get(exec.session)
+          if (typeof committed === 'string' && committed.trim() !== '') sessionCwd = committed
+        } catch (error) {
+          sessionError = error instanceof Error ? error.message : String(error)
+        }
+      }
+      if (!sessionCwd && exec?.agent) {
+        try {
+          sessionCwd = await workingDirectory.ensure(exec.agent, exec.signal)
+        } catch (error) {
+          sessionError = error instanceof Error ? error.message : String(error)
+        }
+      }
+    } else {
+      sessionError = 'workingDirectory 服务不可用'
+    }
+
+    if (raw !== undefined) {
+      return { root: path.resolve(sessionCwd ?? process.cwd(), raw) }
+    }
+    if (sessionCwd) return { root: sessionCwd }
+    return {
+      root: undefined,
+      error: `未取到会话工作目录（${sessionError ?? '未提供会话身份'}）`,
+    }
   }
 
   async function resolveArgv(detected) {
@@ -139,8 +172,23 @@ export function apply(ctx, config) {
   }
 
   async function run(exec, args) {
-    const root = await resolveRoot(exec, args?.path)
+    const resolved = await resolveRoot(exec, args?.path)
     const kind = typeof args?.kind === 'string' ? args.kind : 'auto'
+    if (!resolved.root) {
+      return {
+        status: 'error',
+        root: '',
+        kind,
+        command: '',
+        timedOut: false,
+        durationMs: 0,
+        outputLines: 0,
+        omittedLines: 0,
+        lines: [],
+        hint: `${resolved.error}。请传 path 显式指定要检查的目录，例如 path: 'D:\\你的项目'。`,
+      }
+    }
+    const root = resolved.root
     const detected = detectCheck(root, kind, customCommand)
     if (!detected) {
       return {
@@ -334,6 +382,7 @@ export function apply(ctx, config) {
             timeoutMs: { type: 'integer' },
             maxOutputLines: { type: 'integer' },
             lastRun: { type: 'string' },
+            notice: { type: 'string' },
           },
           required: ['root', 'detected', 'kind', 'scripts', 'timeoutMs', 'maxOutputLines'],
           additionalProperties: false,
@@ -341,15 +390,31 @@ export function apply(ctx, config) {
         render(_args, value) {
           const scripts = Array.isArray(value?.scripts) ? value.scripts : []
           const last = value?.lastRun ? `\n上次运行：${value.lastRun}` : '\n上次运行：（还没有）'
+          const notice = value?.notice ? `\n⚠ ${value.notice}` : ''
           return [
             text(
-              `工作区：${value?.root ?? '?'}\n将执行：${value?.detected || '（没检测到，需要 customCommand）'}\n包管理器：${value?.packageManager ?? '—'}\n可用 scripts：${scripts.length > 0 ? scripts.join(', ') : '（无）'}${last}\n上限：${value?.timeoutMs ?? '?'} ms / 最多显示 ${value?.maxOutputLines ?? '?'} 行`,
+              `工作区：${value?.root ?? '?'}\n将执行：${value?.detected || '（没检测到，需要 customCommand）'}\n包管理器：${value?.packageManager ?? '—'}\n可用 scripts：${scripts.length > 0 ? scripts.join(', ') : '（无）'}${last}\n上限：${value?.timeoutMs ?? '?'} ms / 最多显示 ${value?.maxOutputLines ?? '?'} 行${notice}`,
             ),
           ]
         },
       },
       async execute(args, exec) {
-        const root = await resolveRoot(exec, args?.path)
+        const resolved = await resolveRoot(exec, args?.path)
+        if (!resolved.root) {
+          // 拿不到会话目录时不要编造工作区：明确报告并让调用方传 path。
+          return {
+            root: '（未解析）',
+            detected: '',
+            kind: '',
+            packageManager: '—',
+            scripts: [],
+            timeoutMs,
+            maxOutputLines: maxLines,
+            lastRun: '',
+            notice: `${resolved.error}。请传 path 显式指定工作区。`,
+          }
+        }
+        const root = resolved.root
         let pkg
         try {
           pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'))
@@ -374,6 +439,7 @@ export function apply(ctx, config) {
           timeoutMs,
           maxOutputLines: maxLines,
           lastRun: lastRun ? `${lastRun.status} · ${lastRun.command} · ${(lastRun.durationMs / 1000).toFixed(1)}s · ${lastRun.at}` : '',
+          notice: '',
         }
       },
     }),
