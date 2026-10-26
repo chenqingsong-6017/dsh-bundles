@@ -22,7 +22,7 @@ $strictBundles = @(
   'dsh-checkpoint', 'dsh-skill-usage', 'dsh-memory',
   'dsh-repomap', 'dsh-verify', 'dsh-agents-md',
   'dsh-browser-bundle', 'dsh-computer-bundle', 'dsh-staleness-watch',
-  'dsh-usage'
+  'dsh-usage', 'dsh-audit'
 )
 
 $failures = [System.Collections.Generic.List[string]]::new()

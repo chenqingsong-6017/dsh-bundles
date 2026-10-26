@@ -1,0 +1,14 @@
+# dsh-audit bundle patch.
+#
+# 不在这里写死任何绝对路径 —— 默认落到 DSH_PROFILE_DIR 或 ~/.dsh/dsh-audit。
+# 想把审计日志放到别的盘（例如 D 盘），在 profile 的 cordis.patch.yml 里覆盖：
+#
+#   - id: audit
+#     name: "@local/dsh-audit"
+#     config:
+#       storeDir: 'D:\AI\dsh-data\audit'
+#       timeZone: 'Asia/Shanghai'
+#       keepDays: 30
+- insert:
+    - id: audit
+      name: '@local/dsh-audit'

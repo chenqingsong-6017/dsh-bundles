@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Audit">
+  <defs>
+    <linearGradient id="audit-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3a1f22"/>
+      <stop offset="1" stop-color="#160d0f"/>
+    </linearGradient>
+    <linearGradient id="audit-shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f08a8a"/>
+      <stop offset="1" stop-color="#c94a4a"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="15" fill="url(#audit-bg)"/>
+  <path d="M32 11l14 5v13c0 9-6 15-14 19-8-4-14-10-14-19V16l14-5z" fill="none" stroke="url(#audit-shield)" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M25 31l5 5 9-10" fill="none" stroke="#ffd9d9" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="47" cy="17" r="3" fill="#ffb347"/>
+</svg>
