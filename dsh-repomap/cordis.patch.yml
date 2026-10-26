@@ -4,3 +4,4 @@
       config:
         maxChars: 8000
         maxFiles: 4000
+        maxCacheEntries: 8

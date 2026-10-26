@@ -4,4 +4,8 @@
       config:
         # 记忆数据放 D 盘
         storeDir: 'D:\AI\dsh-data\memory'
-        maxBytes: 4000
+        # 存储预算：记忆总量上限（字符），超了拒绝写入而不是悄悄淘汰
+        maxBytes: 8000
+        # 注入预算：每轮系统提示里最多花多少字符。pinned 优先全文，
+        # 其余从新到旧填充，装不下的降级成索引行（用 memory_search 取全文）。
+        maxInjectChars: 1200

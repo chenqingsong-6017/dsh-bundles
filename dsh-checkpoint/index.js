@@ -1,7 +1,12 @@
 /**
- * dsh-checkpoint —— agent 文件改动的「写前快照 + 一键回滚」（v1.3）。
+ * dsh-checkpoint —— agent 文件改动的「写前快照 + 一键回滚」（v1.5）。
  *
  * 抓取原则：**只记用户/工作区文件，不记系统与插件自身目录**（excludeDirs = protectDirs + 数据目录）。
+ *
+ * v1.5 新增「按会话 / 按时间清理」：`checkpoint_prune` 只丢快照记录、从不读写用户文件；
+ * 默认 dryRun（只报告会删几条），真正清理必须 `dryRun: false` + `confirm: true`；
+ * protectDirs 里的快照永不清理（保护逻辑不被绕过）。为此记录里补了 `sessionId` 字段：
+ * 旧存档缺字段按「未知会话/未知时间」处理——不报错，也不会被按会话/按时间清理命中。
  *
  * v2 相比 v1 解决的三件事：
  *   1. 持久化：快照落盘到 `config.storeDir`（默认 `~/.dsh/dsh-checkpoint/snapshots.json`），
@@ -33,6 +38,7 @@ export const inject = ['tools', 'fs']
 const DEFAULT_MAX_BYTES = 1024 * 1024 // 单文件上限 1 MiB
 const MAX_SNAPSHOTS = 200
 const TOTAL_BUDGET = 64 * 1024 * 1024 // 快照总量上限 64 MiB
+const DAY_MS = 24 * 60 * 60 * 1000
 const TARGET_TOOLS = new Set(['write', 'edit'])
 const SHELL_TOOLS = new Set(['pwsh', 'bash', 'sh', 'shell', 'terminal'])
 const DESTRUCTIVE =
@@ -222,7 +228,26 @@ export function apply(ctx, config) {
     return excludeDirs.some((dir) => isInside(dir, osPath))
   }
 
-  /** key(normalized path) -> { path, content: string | null, bytes, capturedAt, created } */
+  /**
+   * 清理判定（纯判断，不碰记录）：'match' | 'other-session' | 'unknown-session' | 'too-recent' | 'unknown-time'。
+   * `sessionId` 与 `olderThanDays` 同时给时取交集；缺 sessionId / 时间戳坏掉的旧记录一律算未知，
+   * 永远不命中（宁可留着，也不清掉拿不准的快照）。
+   */
+  function pruneVerdict(record, { sessionId, olderThanDays, now }) {
+    if (sessionId !== undefined) {
+      const owner = record.sessionId
+      if (typeof owner !== 'string' || owner === '') return 'unknown-session'
+      if (owner !== sessionId) return 'other-session'
+    }
+    if (olderThanDays !== undefined) {
+      const capturedAtMs = Date.parse(String(record.capturedAt ?? ''))
+      if (!Number.isFinite(capturedAtMs)) return 'unknown-time'
+      if (now - capturedAtMs < olderThanDays * DAY_MS) return 'too-recent'
+    }
+    return 'match'
+  }
+
+  /** key(normalized path) -> { path, content: string | null, bytes, capturedAt, created, sessionId: string | null } */
   const records = new Map()
   const restoring = new Set()
   let totalBytes = 0
@@ -241,7 +266,7 @@ export function apply(ctx, config) {
   // ---------- 持久化 ----------
   function serialize() {
     return JSON.stringify({
-      version: 2,
+      version: 3,
       savedAt: new Date().toISOString(),
       records: [...records.values()],
     })
@@ -290,6 +315,8 @@ export function apply(ctx, config) {
           bytes: created ? 0 : content.length,
           capturedAt: typeof item.capturedAt === 'string' ? item.capturedAt : new Date().toISOString(),
           created,
+          // v3 字段：旧存档没有 sessionId → null（未知会话）。不报错、也不被按会话清理命中。
+          sessionId: typeof item.sessionId === 'string' && item.sessionId.trim() !== '' ? item.sessionId.trim() : null,
         })
         if (!created) totalBytes += content.length
       }
@@ -331,7 +358,9 @@ export function apply(ctx, config) {
   }
 
   // ---------- 抓取 ----------
-  async function captureTarget(target, allowCreated) {
+  async function captureTarget(target, allowCreated, sessionId) {
+    // sessionId 来自 exec.agent.id（DSH 会话 id）；拿不到就是 null（未知会话）。
+    const owner = typeof sessionId === 'string' && sessionId.trim() !== '' ? sessionId.trim() : null
     const display = String(target?.displayPath ?? '')
     const key = normalizePath(display)
     if (key === '' || records.has(key) || restoring.has(key)) return
@@ -362,6 +391,7 @@ export function apply(ctx, config) {
           bytes: 0,
           capturedAt: new Date().toISOString(),
           created: true,
+          sessionId: owner,
         })
         return
       }
@@ -384,6 +414,7 @@ export function apply(ctx, config) {
         bytes: content.length,
         capturedAt: new Date().toISOString(),
         created: false,
+        sessionId: owner,
       })
     } catch (error) {
       stats.skipped.unreadable += 1
@@ -398,6 +429,12 @@ export function apply(ctx, config) {
     } catch (error) {
       return undefined
     }
+  }
+
+  /** 从工具执行上下文取会话 id（exec.agent.id）；取不到就是未知会话 */
+  function sessionIdOf(exec) {
+    const id = exec?.agent?.id
+    return typeof id === 'string' && id.trim() !== '' ? id.trim() : undefined
   }
 
   async function captureFromToolArgs(exec) {
@@ -415,7 +452,7 @@ export function apply(ctx, config) {
       stats.skipped.missing += 1
       return
     }
-    await captureTarget(target, true)
+    await captureTarget(target, true, sessionIdOf(exec))
   }
 
   async function captureFromShell(exec) {
@@ -431,7 +468,7 @@ export function apply(ctx, config) {
       } catch (error) {
         continue
       }
-      await captureTarget(target, false)
+      await captureTarget(target, false, sessionIdOf(exec))
     }
   }
 
@@ -737,6 +774,137 @@ export function apply(ctx, config) {
         }
         if (forgotten.length > 0) schedulePersist()
         return { forgotten, remaining: records.size }
+      },
+    }),
+  )
+
+  // ---- checkpoint_prune：按会话 / 按时间清理快照记录（只丢记录，绝不读写用户文件） ----
+  ctx.effect(() =>
+    tools.register({
+      name: 'checkpoint_prune',
+      description:
+        'Prune captured snapshots by session id and/or age. Defaults to a dry run that only reports what would be dropped; dropping records requires dryRun: false plus confirm: true. Only snapshot records are removed — user files are never touched. Snapshots under protectDirs are always kept.',
+      parameters: {
+        type: 'object',
+        properties: {
+          sessionId: {
+            type: 'string',
+            description:
+              'Only prune snapshots captured under this session id. Old snapshots without a recorded session id count as unknown and are kept.',
+          },
+          olderThanDays: {
+            type: 'number',
+            description:
+              'Only prune snapshots captured more than this many days ago. Snapshots without a valid timestamp are kept.',
+          },
+          dryRun: {
+            type: 'boolean',
+            description:
+              'Default true: only report what would be pruned. Pass false together with confirm: true to actually drop the snapshot records.',
+          },
+          confirm: {
+            type: 'boolean',
+            description:
+              'Required together with dryRun: false. Acknowledges dropping snapshot records; files are never modified or deleted.',
+          },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            dryRun: { type: 'boolean' },
+            matched: { type: 'integer' },
+            forgotten: { type: 'array', items: { type: 'string' } },
+            wouldForget: { type: 'array', items: { type: 'string' } },
+            protected: { type: 'integer' },
+            unknown: { type: 'integer' },
+            remaining: { type: 'integer' },
+          },
+          required: ['dryRun', 'matched', 'forgotten', 'wouldForget', 'protected', 'unknown', 'remaining'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          const dryRun = value?.dryRun !== false
+          const matched = value?.matched ?? 0
+          const wouldForget = Array.isArray(value?.wouldForget) ? value.wouldForget : []
+          const skipped = []
+          if ((value?.protected ?? 0) > 0) skipped.push(`受保护目录跳过 ${value.protected} 个`)
+          if ((value?.unknown ?? 0) > 0) skipped.push(`未知会话/时间跳过 ${value.unknown} 个`)
+          const skippedText = skipped.length > 0 ? `（${skipped.join('，')}）` : ''
+          if (matched === 0) {
+            return [text(`没有匹配到可清理的快照${skippedText}，剩余 ${value?.remaining ?? 0} 个。`)]
+          }
+          const shown = wouldForget.slice(0, 20)
+          const more = wouldForget.length > shown.length ? `\n… 还有 ${wouldForget.length - shown.length} 个（不再列出）` : ''
+          const head = dryRun
+            ? `清理预演（dryRun，尚未删除任何东西）：会丢弃 ${matched} 条快照记录${skippedText}，当前共 ${value?.remaining ?? 0} 个、清理后剩 ${Math.max(0, (value?.remaining ?? 0) - matched)} 个。只动快照记录，不会读写任何用户文件。`
+            : `已丢弃 ${matched} 条快照记录${skippedText}（未改动任何用户文件），剩余 ${value?.remaining ?? 0} 个。`
+          const lines = shown.map((item) => `  - ${item}`)
+          if (dryRun) lines.push('确认要清理请传 dryRun: false + confirm: true；只想丢弃指定目标/全部，用 checkpoint_forget。')
+          return [text([head, lines.join('\n') + more].filter(Boolean).join('\n'))]
+        },
+      },
+      async execute(args) {
+        const rawSession = typeof args?.sessionId === 'string' ? args.sessionId.trim() : ''
+        const sessionId = rawSession !== '' ? rawSession : undefined
+        const olderThanDays = args?.olderThanDays
+        if (sessionId === undefined && olderThanDays === undefined) {
+          throw new Error(
+            'checkpoint_prune 至少需要一个过滤条件（sessionId 或 olderThanDays），不会无条件清空全部快照；想丢弃全部请用 checkpoint_forget 的 all: true。',
+          )
+        }
+        if (
+          olderThanDays !== undefined &&
+          (typeof olderThanDays !== 'number' || !Number.isFinite(olderThanDays) || olderThanDays <= 0)
+        ) {
+          throw new Error('olderThanDays 必须是大于 0 的数字（单位：天）。')
+        }
+        const dryRun = args?.dryRun !== false
+        if (!dryRun && args?.confirm !== true) {
+          throw new Error(
+            `真正清理（dryRun: false）会丢弃匹配的快照记录（只删记录、不改动任何用户文件），需要显式传 confirm: true。先看影响面请用默认的 dryRun: true。`,
+          )
+        }
+
+        const now = Date.now()
+        const selected = []
+        const protectedPaths = []
+        let unknown = 0
+        for (const [key, record] of [...records.entries()]) {
+          const verdict = pruneVerdict(record, { sessionId, olderThanDays, now })
+          if (verdict === 'unknown-session' || verdict === 'unknown-time') {
+            unknown += 1
+            continue
+          }
+          if (verdict !== 'match') continue
+          // protectDirs 的保护逻辑对清理同样生效：受保护目标的快照永不清理
+          if (isProtected(record.path)) {
+            protectedPaths.push(record.path)
+            continue
+          }
+          selected.push([key, record])
+        }
+
+        const wouldForget = selected.map(([, record]) => record.path)
+        if (!dryRun) {
+          // 红线：这里只删内存里的快照记录（+ 落盘 snapshots.json），不调用任何 fs 写/删接口
+          for (const [key, record] of selected) {
+            records.delete(key)
+            totalBytes -= record.bytes
+          }
+          if (selected.length > 0) schedulePersist()
+        }
+        return {
+          dryRun,
+          matched: selected.length,
+          forgotten: dryRun ? [] : wouldForget.slice(),
+          wouldForget,
+          protected: protectedPaths.length,
+          unknown,
+          remaining: records.size,
+        }
       },
     }),
   )

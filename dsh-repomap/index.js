@@ -24,6 +24,7 @@
  *   - 超大文件（>512 KiB）跳过；单根目录扫描上限 maxFiles（默认 4000）。
  */
 
+import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 
@@ -32,7 +33,9 @@ export const inject = ['tools']
 
 const MAX_FILE_BYTES = 512 * 1024
 const MAX_SYMBOLS_PER_FILE = 60
-const CACHE_TTL_MS = 5000
+const MAX_SCAN_BYTES = 64 * 1024 * 1024
+const DEFAULT_MAX_CACHE_ENTRIES = 8
+const MAX_CACHE_ENTRIES_LIMIT = 256
 
 const SKIP_DIRS = new Set([
   'node_modules',
@@ -192,20 +195,26 @@ function wordCounts(content) {
   return counts
 }
 
-function scanRoot(root, options) {
-  const files = []
-  const state = { files: 0, skippedLarge: 0, skippedUnsupported: 0, bytes: 0 }
+/**
+ * 只做 readdir + stat：收集候选源文件及其指纹（相对路径 + mtimeMs + size）。
+ * 不读文件内容，所以"缓存命中"只需重新遍历目录、比对指纹，成本远低于重读 + 重解析。
+ */
+function collectEntries(root, options) {
+  const entries = []
+  const counters = { skippedLarge: 0, skippedUnsupported: 0, bytes: 0 }
+
+  const capped = () => entries.length >= options.maxFiles || counters.bytes > options.maxBytes
 
   const walk = (dir) => {
-    if (state.files >= options.maxFiles || state.bytes > options.maxBytes) return
-    let entries
+    if (capped()) return
+    let list
     try {
-      entries = readdirSync(dir, { withFileTypes: true })
+      list = readdirSync(dir, { withFileTypes: true })
     } catch (error) {
       return
     }
-    for (const entry of entries) {
-      if (state.files >= options.maxFiles || state.bytes > options.maxBytes) return
+    for (const entry of list) {
+      if (capped()) return
       const full = path.join(dir, entry.name)
       if (entry.isSymbolicLink()) continue
       if (entry.isDirectory()) {
@@ -216,39 +225,142 @@ function scanRoot(root, options) {
       if (!entry.isFile()) continue
       const ext = path.extname(entry.name).toLowerCase()
       if (!SUPPORTED.has(ext)) {
-        state.skippedUnsupported += 1
+        counters.skippedUnsupported += 1
         continue
       }
-      let size = 0
+      let info
       try {
-        size = statSync(full).size
+        info = statSync(full)
       } catch (error) {
         continue
       }
-      if (size > MAX_FILE_BYTES) {
-        state.skippedLarge += 1
+      if (info.size > MAX_FILE_BYTES) {
+        counters.skippedLarge += 1
         continue
       }
-      let content
-      try {
-        content = readFileSync(full, 'utf8')
-      } catch (error) {
-        continue
-      }
-      files.push({
+      entries.push({
+        full,
         rel: path.relative(root, full).replace(/\\/g, '/'),
         ext,
-        size,
-        symbols: extractSymbols(ext, content),
-        words: wordCounts(content),
+        size: info.size,
+        mtimeMs: info.mtimeMs,
       })
-      state.files += 1
-      state.bytes += size
+      counters.bytes += info.size
     }
   }
 
   walk(root)
+  // 排序有两个作用：readdir 顺序不保证稳定，而缓存指纹要求稳定；顺带让结果可复现
+  entries.sort((a, b) => a.rel.localeCompare(b.rel))
+  return { entries, skippedLarge: counters.skippedLarge, skippedUnsupported: counters.skippedUnsupported }
+}
+
+/** 由"每个文件的相对路径 + mtimeMs + size"算出扫描指纹。任一项变化，指纹就变。 */
+function fingerprintOf(entries) {
+  const hash = createHash('sha1')
+  for (const entry of entries) {
+    hash.update(entry.rel)
+    hash.update('\0')
+    hash.update(String(entry.mtimeMs))
+    hash.update('\0')
+    hash.update(String(entry.size))
+    hash.update('\n')
+  }
+  return hash.digest('hex')
+}
+
+/** 照指纹列表读文件、抽符号、数词频——这是扫描里最贵的一段，只在指纹变化时做。 */
+function readScannedFiles(entries, counters) {
+  const files = []
+  const state = {
+    files: 0,
+    skippedLarge: counters.skippedLarge,
+    skippedUnsupported: counters.skippedUnsupported,
+    bytes: 0,
+    readErrors: 0,
+  }
+  for (const entry of entries) {
+    let content
+    try {
+      content = readFileSync(entry.full, 'utf8')
+    } catch (error) {
+      state.readErrors += 1
+      continue
+    }
+    files.push({
+      rel: entry.rel,
+      ext: entry.ext,
+      size: entry.size,
+      symbols: extractSymbols(entry.ext, content),
+      words: wordCounts(content),
+    })
+    state.files += 1
+    state.bytes += entry.size
+  }
   return { files, state }
+}
+
+/**
+ * 内存级扫描缓存（不落盘，进程重启即失效）。
+ *
+ * 缓存 key = 工作目录 + 全部候选文件的指纹（相对路径 + mtimeMs + size 的哈希）。
+ * 好处：
+ *   - 文件内容（size 变）或 mtime 变 → 指纹变 → 必重扫，不会返回陈旧结果；
+ *   - 新增 / 删除文件 → 参与指纹的文件集合变 → 必重扫；
+ *   - 同内容但不同工作目录 → key 不同，互不串用；
+ *   - 有文件读失败时这次结果可能是残缺快照，一律不缓存（宁可不命中，也不留假命中）。
+ * 淘汰策略：LRU（Map 插入序，命中时删掉重插），上限 maxCacheEntries。
+ *
+ * 导出给单测用；工具层通过 apply() 拿同一个实例，所以同一会话里的重复调用共享缓存。
+ */
+export function createScanCache(options = {}) {
+  const maxFiles =
+    Number.isInteger(options.maxFiles) && options.maxFiles > 0 ? Math.min(options.maxFiles, 20000) : 4000
+  const maxBytes =
+    Number.isInteger(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : MAX_SCAN_BYTES
+  const maxCacheEntries =
+    Number.isInteger(options.maxCacheEntries) && options.maxCacheEntries > 0
+      ? Math.min(options.maxCacheEntries, MAX_CACHE_ENTRIES_LIMIT)
+      : DEFAULT_MAX_CACHE_ENTRIES
+  const cache = new Map()
+  const stats = { hits: 0, misses: 0 }
+
+  const evict = () => {
+    while (cache.size > maxCacheEntries) {
+      const oldest = cache.keys().next()
+      if (oldest.done) break
+      cache.delete(oldest.value)
+    }
+  }
+
+  function scan(root) {
+    const resolvedRoot = path.resolve(root)
+    const collected = collectEntries(resolvedRoot, { maxFiles, maxBytes })
+    const key = `${resolvedRoot}\u0000${fingerprintOf(collected.entries)}`
+
+    const cached = cache.get(key)
+    if (cached !== undefined) {
+      cache.delete(key)
+      cache.set(key, cached)
+      stats.hits += 1
+      return cached
+    }
+
+    stats.misses += 1
+    const { files, state } = readScannedFiles(collected.entries, collected)
+    const value = { files, state }
+    if (state.readErrors === 0) {
+      cache.set(key, value)
+      evict()
+    }
+    return value
+  }
+
+  return {
+    scan,
+    stats: () => ({ hits: stats.hits, misses: stats.misses, size: cache.size }),
+    clear: () => cache.clear(),
+  }
 }
 
 function rankFiles(files) {
@@ -274,10 +386,46 @@ export function apply(ctx, config) {
   const defaultMaxChars =
     Number.isInteger(config?.maxChars) && config.maxChars > 0 ? Math.min(config.maxChars, 64000) : 8000
   const maxFiles = Number.isInteger(config?.maxFiles) && config.maxFiles > 0 ? Math.min(config.maxFiles, 20000) : 4000
-  const maxBytes = 64 * 1024 * 1024
+  const maxCacheEntries =
+    Number.isInteger(config?.maxCacheEntries) && config.maxCacheEntries > 0
+      ? Math.min(config.maxCacheEntries, MAX_CACHE_ENTRIES_LIMIT)
+      : DEFAULT_MAX_CACHE_ENTRIES
   const tools = ctx.tools
   const workingDirectory = ctx.get('workingDirectory')
-  const cache = new Map()
+  // 一个插件实例一份缓存：同一会话里 repo_map / repo_find_symbol 共享扫描结果
+  const scanner = createScanCache({ maxFiles, maxBytes: MAX_SCAN_BYTES, maxCacheEntries })
+  // repo_outline 只涉及单个文件，用"文件路径 + mtimeMs + size"做 key 的小 LRU
+  const outlineCache = new Map()
+
+  function outlineFor(full) {
+    let info
+    try {
+      info = statSync(full)
+    } catch (error) {
+      throw new Error(`读不到文件：${full}`)
+    }
+    const key = `${full}\u0000${info.mtimeMs}\u0000${info.size}`
+    const cached = outlineCache.get(key)
+    if (cached !== undefined) {
+      outlineCache.delete(key)
+      outlineCache.set(key, cached)
+      return cached
+    }
+    let content
+    try {
+      content = readFileSync(full, 'utf8')
+    } catch (error) {
+      throw new Error(`读不到文件：${full}`)
+    }
+    const value = { path: full, symbols: extractSymbols(path.extname(full).toLowerCase(), content) }
+    outlineCache.set(key, value)
+    while (outlineCache.size > maxCacheEntries) {
+      const oldest = outlineCache.keys().next()
+      if (oldest.done) break
+      outlineCache.delete(oldest.value)
+    }
+    return value
+  }
 
   async function resolveRoot(exec, wantedPath) {
     const raw = typeof wantedPath === 'string' && wantedPath.trim() !== '' ? wantedPath.trim() : undefined
@@ -285,21 +433,8 @@ export function apply(ctx, config) {
     return raw === undefined ? cwd ?? process.cwd() : path.resolve(cwd ?? process.cwd(), raw)
   }
 
-  function scanCached(root) {
-    const cached = cache.get(root)
-    const now = Date.now()
-    if (cached && now - cached.at < CACHE_TTL_MS) return cached.value
-    const value = scanRoot(root, { maxFiles, maxBytes })
-    cache.set(root, { at: now, value })
-    if (cache.size > 8) {
-      const oldest = cache.keys().next()
-      if (!oldest.done) cache.delete(oldest.value)
-    }
-    return value
-  }
-
   function buildMap(root, maxChars) {
-    const { files, state } = scanCached(root)
+    const { files, state } = scanner.scan(root)
     const ranked = rankFiles(files)
     const lines = []
     let used = 0
@@ -425,15 +560,7 @@ export function apply(ctx, config) {
         const raw = typeof args?.path === 'string' ? args.path.trim() : ''
         if (raw === '') throw new Error('repo_outline 需要 path。')
         const cwd = workingDirectory && exec?.agent ? await workingDirectory.ensure(exec.agent, exec.signal).catch(() => undefined) : undefined
-        const full = path.resolve(cwd ?? process.cwd(), raw)
-        let content
-        try {
-          content = readFileSync(full, 'utf8')
-        } catch (error) {
-          throw new Error(`读不到文件：${full}`)
-        }
-        const ext = path.extname(full).toLowerCase()
-        return { path: full, symbols: extractSymbols(ext, content) }
+        return outlineFor(path.resolve(cwd ?? process.cwd(), raw))
       },
     }),
   )
@@ -484,7 +611,7 @@ export function apply(ctx, config) {
         if (wanted === '') throw new Error('repo_find_symbol 需要 name。')
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 100) : 20
         const root = await resolveRoot(exec, args?.path)
-        const { files } = scanCached(root)
+        const { files } = scanner.scan(root)
         const matches = []
         for (const file of files) {
           for (const symbol of file.symbols) {

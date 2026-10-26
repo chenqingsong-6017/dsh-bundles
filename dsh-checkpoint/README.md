@@ -17,6 +17,7 @@ DSH bundle（Host 侧插件）：在 agent **写/改/删文件之前**把原内�
 | `checkpoint_diff` | **回滚前先看**：先给"会恢复/会删除/会重建各几个"的摘要，再按文件给 `+A/-R 行` 与行级 diff（`@@` 行号 + 2 行上下文）；`path` 支持文件名片段（输入 `hermes-lessons` 就能命中 `hermes-lessons-for-dsh.md`） |
 | `checkpoint_restore` | `path` 回滚单个/整个目录（支持唯一路径后缀）；`all: true` 回滚全部，**必须同时传 `confirm: true`**；修改过的恢复内容，创建过的删除 |
 | `checkpoint_forget` | **只丢快照、不动文件**（`path` 或 `all: true`），用来清掉过时/失效目标 |
+| `checkpoint_prune` | **按会话 / 按时间清理快照记录**（`sessionId` / `olderThanDays`，可组合）：默认 `dryRun: true` 只报告"会清几条"，真删必须 `dryRun: false` + `confirm: true`；只丢记录、**永不读写用户文件**；受保护目录里的快照永远跳过 |
 | `checkpoint_status` | 诊断：存档路径、钩子计数、捕获/跳过统计、加载时丢弃的失效快照数 |
 
 ## 机制
@@ -32,7 +33,18 @@ DSH bundle（Host 侧插件）：在 agent **写/改/删文件之前**把原内�
    - **采集排除**（v1.3）：受保护目录 + 本插件自己的数据目录**根本不进账本**——改插件源码或插件写数据都不会污染列表（`checkpoint_status` 的 `skipped.excluded` 可核对）；
    - 加载时自动丢弃"文件不存在且父目录也不存在"的失效快照（目录迁移/删除留下的旧路径），避免误回滚时按旧路径重建目录（例如写回 C 盘）；丢弃数量见 `checkpoint_status`。
 5. **预览**：`checkpoint_diff` 用行级 LCS 算 diff，输出带 `@@ -a,b +c,d @@` 的 hunk（各 2 行上下文）；任一侧超过 600 行退化为"只给行数统计"；渲染超过 200 行会截断。状态分 `modified` / `created`（回滚即删）/ `missing`（快照后文件被删）/ `unchanged`。
-6. **预算**：单文件 1 MiB、最多 200 个目标、总量 64 MiB，超了淘汰最旧的。
+6. **预算**：单文件 1 MiB、最多 200 个目标、总量 64 MiB，超了淘汰最旧的；更主动的清理见第 7 条。
+7. **清理（v1.3+ → v1.5，`checkpoint_prune`）**：两个可选过滤条件，同时传时取交集——
+   - `sessionId`：只清该会话产生的快照（会话 id 取自 `exec.agent.id`，v1.5 起随每条记录落盘；旧存档没有这个字段，按"未知会话"处理）；
+   - `olderThanDays`：只清 `capturedAt` 早于 N 天的快照（时间戳缺失/坏掉按"未知时间"处理）。
+
+   安全设计（红线）：
+   - **默认 `dryRun: true`**：只返回 `matched` / `wouldForget` / `protected` / `unknown`，不改内存、不改存档；
+   - **真删必须 `dryRun: false` 且 `confirm: true`**，否则直接报错；
+   - 不带任何过滤条件直接报错，不会"手滑清空全部"（想丢弃全部仍用 `checkpoint_forget` 的 `all: true`）；
+   - 执行体只做 `records.delete` + 现有原子落盘，**从不调用任何文件删除/写入接口**——清理永远不碰用户工作区文件；
+   - `protectDirs` 里的快照**永不清理**（保护逻辑对清理同样生效，受保护目标即使会话+时间都命中也会被跳过）；
+   - 旧存档向后兼容：缺 `sessionId` / 缺 `capturedAt` 不报错，且这类记录不会被清理命中（宁可留着也不误删）。
 
 ## 剩下的边界（不是实现问题）
 
@@ -66,11 +78,33 @@ DSH bundle（Host 侧插件）：在 agent **写/改/删文件之前**把原内�
 
 以上测试的临时目录与旧存档均已清理；`checkpoint_status` 复核快照数为 0。
 
+## 验证记录（2026-10-26，v1.5 清理策略）
+
+先判断现状：快照记录**已有 `capturedAt` 时间戳**，但**没有 `sessionId`**。所以先补记录字段（v1.5 起从 `exec.agent.id` 写入，存档 version=3），旧存档缺字段按"未知"兼容；按时间清理直接基于 `capturedAt`。
+
+真实验证（`node D:\AI\dsh-bundles\_selftest\tests\checkpoint.test.mjs`，退出码 0，21 项通过；原 7 项 diff/hunk 用例全部保留）：
+
+| 场景 | 结果 |
+|---|---|
+| **旧存档兼容**：v2 存档缺 `sessionId` / 缺 `capturedAt` | 正常加载 6 条，不报错 ✅ |
+| **dryRun 默认**：`olderThanDays: 30` | 报 3 条待清、受保护跳过 1 条；存档未改写、6 条记录仍在、6 个用户文件全在 ✅ |
+| **按会话**：`sessionId: "sess-a"` | 命中 2 条；受保护跳过 1 条；缺 sessionId 的旧记录按 unknown 跳过 ✅ |
+| **交集**：sess-a 且 >30 天 | 仅命中 old-a ✅ |
+| **confirm 红线**：`dryRun: false` 无 `confirm` | 报错，记录不变 ✅ |
+| **真清理**：`dryRun: false` + `confirm: true` | 丢弃 3 条、剩余 3 条；**所有用户文件仍存在** ✅ |
+| **原子落盘** | 350ms 后存档只剩 3 条，受保护记录在内 ✅ |
+| **protectDirs**：会话+时间双命中 | `matched: 0` / `protected: 1`，受保护快照保留；即使它是唯一命中项也不清 ✅ |
+| **原工具行为不变** | `restore all` 无 confirm 仍拒绝；`forget all` 仍只丢快照、不动文件 ✅ |
+| **采集字段** | 新记录写入 `sessionId`（取自 `exec.agent.id`）、`capturedAt` 可解析、存档 `version: 3` ✅ |
+| **schema 自检** | `node _selftest/schema-check.mjs` → 18 个工具全 PASS（含 `checkpoint_prune`）✅ |
+
+测试临时目录统一用 `D:\AI\dsh-data\_selftest-checkpoint-*`，跑完自动删除，不落 C 盘。
+
 ## 安装 / 卸载
 
 ```powershell
 # 安装（当前 profile）
-plugin_manager action=install_bundle target=D:\AI-date\dsh-date\dsh-创建\checkpoint
+plugin_manager action=install_bundle target=D:\AI\dsh-bundles\dsh-checkpoint
 
 # 卸载
 plugin_manager action=remove_bundle target=@local/dsh-checkpoint
