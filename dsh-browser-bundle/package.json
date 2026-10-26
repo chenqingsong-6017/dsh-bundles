@@ -1,0 +1,26 @@
+{
+  "name": "@local/dsh-browser-bundle",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Mounts browser-use with the Playwright MCP backend riding the local Edge/Chromium.",
+  "exports": {
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-browser-use": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp": "0.2.1-rc.3"
+  }
+}

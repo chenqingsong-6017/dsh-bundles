@@ -1,0 +1,26 @@
+{
+  "name": "@local/dsh-computer-bundle",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Mounts computer-use with the Cua Driver native backend for desktop window, mouse and keyboard control.",
+  "exports": {
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-computer-use": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-experimental-computer-use-cua-driver-native": "0.2.1-rc.3"
+  }
+}

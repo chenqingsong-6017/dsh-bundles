@@ -1,0 +1,6 @@
+- insert:
+    - id: skill-usage
+      name: '@local/dsh-skill-usage'
+      config:
+        # 用量数据放 D 盘，不落 C 盘
+        storeDir: 'D:\AI\dsh-data\skill-usage'

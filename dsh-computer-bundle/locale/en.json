@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Computer Use",
+    "description": "Mounts computer-use with the Cua Driver native backend, so the agent can inspect and drive local desktop windows: screenshot, click, type and key."
+  }
+}

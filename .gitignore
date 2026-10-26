@@ -1,0 +1,12 @@
+# 本地依赖与产物
+node_modules/
+*.log
+.DS_Store
+Thumbs.db
+
+# 自检临时产物
+_selftest/.tmp/
+_selftest/out/
+
+# 第三方插件，自带独立 git 仓库（v0.51.2 上游版本管理），外层不重复跟踪
+dsh-plugin-eva-theme/

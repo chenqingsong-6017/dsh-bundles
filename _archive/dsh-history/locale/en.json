@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session History",
+    "description": "Full-text search and reading over past local session logs, with titles, workspaces and snippets (history_search / history_read / history_status)."
+  }
+}

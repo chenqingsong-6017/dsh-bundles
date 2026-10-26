@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "写前快照",
+    "description": "在 agent 写入或修改文件之前捕获它的原内容，并提供 checkpoint_list / checkpoint_restore 两个工具一键回滚。"
+  }
+}

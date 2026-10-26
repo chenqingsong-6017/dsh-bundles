@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "持久记忆",
+    "description": "跨会话保存用户级事实，并注入到每个会话的系统提示里；用 memory_list / memory_add / memory_update / memory_remove 维护。"
+  }
+}

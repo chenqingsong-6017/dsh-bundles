@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Checkpoint",
+    "description": "Captures a file's previous content before the agent writes or edits it, and restores it with one call (checkpoint_list / checkpoint_restore)."
+  }
+}

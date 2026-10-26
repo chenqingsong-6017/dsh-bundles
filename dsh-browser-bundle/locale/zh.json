@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "浏览器使用",
+    "description": "挂载 browser-use 与 Playwright MCP 后端（跑在本机 Edge/Chromium 上），让 agent 能实际操作浏览器页面：导航、点击、填表、抓取。"
+  }
+}

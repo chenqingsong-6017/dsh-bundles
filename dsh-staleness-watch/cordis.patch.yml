@@ -1,0 +1,13 @@
+# Staleness watch: a bundle that carries its own plugin code.
+#
+# `name` 用相对路径时按本 patch 所在目录解析 —— 不需要先把包发布到 npm,
+# 也不需要构建步骤。
+- insert:
+    - id: staleness-watch
+      name: './index.js'
+      # 默认即 warn:只告警,从不打断。
+      #
+      # 需要"强制先快照"时改成:
+      # config:
+      #   mode: block          # block | warn
+      #   maxBlindActions: 3   # 连续多少次输入操作后拦截下一次

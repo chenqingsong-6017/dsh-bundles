@@ -1,0 +1,7 @@
+- insert:
+    - id: history
+      name: '@local/dsh-history'
+      config:
+        # 默认读 $DSH_HOME/sessions（本机 ~/.dsh/sessions）；留空则自动解析
+        maxResults: 8
+        maxSnippet: 120

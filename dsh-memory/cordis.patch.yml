@@ -1,0 +1,7 @@
+- insert:
+    - id: memory
+      name: '@local/dsh-memory'
+      config:
+        # 记忆数据放 D 盘
+        storeDir: 'D:\AI\dsh-data\memory'
+        maxBytes: 4000

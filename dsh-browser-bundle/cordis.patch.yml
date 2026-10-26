@@ -1,0 +1,11 @@
+# Browser-use bundle: mounts the shared provider registry plus the
+# Playwright MCP backend backing onto the local Edge (Chromium 155).
+- insert:
+    - id: browser-use
+      name: '@deepseek-ai/dsh-browser-use'
+    - id: browser-use-playwright
+      name: '@deepseek-ai/dsh-experimental-browser-use-playwright-mcp'
+      config:
+        mode: launch
+        headless: false
+        executablePath: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'

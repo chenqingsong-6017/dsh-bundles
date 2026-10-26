@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Staleness Watch",
+    "description": "Turns \"re-observe after acting\" into an event-level policy: consecutive blind input on one target gets a warning, and block mode refuses the next action until a fresh snapshot."
+  }
+}

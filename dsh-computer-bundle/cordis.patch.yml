@@ -1,0 +1,7 @@
+# Computer-use bundle: mounts the shared provider registry plus the
+# native Cua Driver runtime (win32-x64-msvc binary from @trycua/cua-driver).
+- insert:
+    - id: computer-use
+      name: '@deepseek-ai/dsh-computer-use'
+    - id: computer-use-cua-native
+      name: '@deepseek-ai/dsh-experimental-computer-use-cua-driver-native'

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Memory",
+    "description": "Keeps user-level facts across sessions and injects them into every session's system prompt. Edit with memory_list / memory_add / memory_update / memory_remove."
+  }
+}

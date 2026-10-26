@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Browser Use",
+    "description": "Mounts the shared browser-use registry plus the Playwright MCP backend riding the local Edge/Chromium, so the agent can navigate, click and scrape real pages."
+  }
+}

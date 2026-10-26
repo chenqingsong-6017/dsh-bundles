@@ -1,0 +1,6 @@
+- insert:
+    - id: repomap
+      name: '@local/dsh-repomap'
+      config:
+        maxChars: 8000
+        maxFiles: 4000

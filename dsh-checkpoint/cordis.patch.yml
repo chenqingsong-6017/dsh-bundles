@@ -1,0 +1,10 @@
+- insert:
+    - id: checkpoint
+      name: '@local/dsh-checkpoint'
+      config:
+        # 快照数据放 D 盘，不落 C 盘
+        storeDir: 'D:\AI\dsh-data\checkpoint'
+        # 受保护目录：对这里的回滚/删除必须显式传 confirm: true
+        # （防止误把正在运行的插件源码当成"agent 新建文件"删掉）
+        protectDirs:
+          - 'D:\AI\dsh-bundles'

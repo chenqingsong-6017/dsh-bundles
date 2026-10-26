@@ -1,0 +1,25 @@
+{
+  "name": "@local/dsh-staleness-watch",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "Runtime staleness detection for desktop/browser tools: warns or blocks consecutive blind input on the same target.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
