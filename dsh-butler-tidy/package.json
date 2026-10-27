@@ -1,0 +1,27 @@
+{
+  "name": "@local/dsh-butler-tidy",
+  "version": "0.10.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "description": "Butler file organizer for C:/D:: classify loose files into folders by type or month, preview first, apply on confirm, undo anytime. Also reports safe-to-clean junk separately.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

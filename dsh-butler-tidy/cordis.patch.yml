@@ -1,0 +1,19 @@
+# dsh-butler-tidy bundle patch.
+#
+# 不写死任何绝对路径：数据默认落 D:\AI\dsh-data\tidy（本机约定不落 C 盘），
+# 换机器时自动退到 DSH_PROFILE_DIR 或 ~/.dsh/dsh-butler-tidy。
+#
+# 想改数据目录、或加自己的红线目录 / 分类映射，在 profile 的 cordis.patch.yml 里覆盖：
+#
+#   - id: butler-tidy
+#     name: "@local/dsh-butler-tidy"
+#     config:
+#       storeDir: 'D:\AI\dsh-data\tidy'
+#       protectDirs:
+#         - 'E:\某个不许动的目录'
+#       typeMap:
+#         '.log': '日志'
+#         '.dxf': '图纸'
+- insert:
+    - id: butler-tidy
+      name: '@local/dsh-butler-tidy'

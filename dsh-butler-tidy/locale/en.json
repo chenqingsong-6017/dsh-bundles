@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Butler File Tidy",
+    "description": "Classify loose files into folders by type or month: preview the plan first, move only after confirmation, undo any time. Also reports safe-to-clean temp junk on C:/D:. System dirs, plugin sources and protected trees are never touched."
+  }
+}

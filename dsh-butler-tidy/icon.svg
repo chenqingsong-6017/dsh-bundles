@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Butler file tidy">
+  <rect x="2" y="2" width="44" height="44" rx="10" fill="#1f2937"/>
+  <path d="M9 17.5a2.5 2.5 0 0 1 2.5-2.5h7.2l2.6 2.8h14.2A2.5 2.5 0 0 1 38 20.3v13.2a2.5 2.5 0 0 1-2.5 2.5h-24A2.5 2.5 0 0 1 9 33.5z" fill="#f4c542"/>
+  <path d="M9 22h29v11.5a2.5 2.5 0 0 1-2.5 2.5h-24A2.5 2.5 0 0 1 9 33.5z" fill="#e8b429"/>
+  <g stroke="#1f2937" stroke-width="1.8" stroke-linecap="round">
+    <path d="M14 26.5h7"/>
+    <path d="M14 30h5"/>
+  </g>
+  <g fill="none" stroke="#fdf6e3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M27 27.5l3.2-3.2 3.2 3.2"/>
+    <path d="M30.2 24.3v9.4"/>
+  </g>
+</svg>
