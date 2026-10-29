@@ -1,0 +1,406 @@
+{
+  "metrics": {
+    "positives": 23,
+    "retired": 0,
+    "negatives": 4,
+    "recallAt1": 1,
+    "recallAt3": 1,
+    "mrr": 1,
+    "injectedCoverage": 1,
+    "fullTextRelevance": 1,
+    "negativeInjectionRate": 0,
+    "avgInjectedChars": 1471,
+    "budget": 1500
+  },
+  "positives": [
+    {
+      "query": "收工前谁拦着我别提交",
+      "expected": [
+        "m70"
+      ],
+      "top3": [
+        "m70",
+        "m84",
+        "m74"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1478
+    },
+    {
+      "query": "插件装完怎么让它跑起来",
+      "expected": [
+        "m74",
+        "m69"
+      ],
+      "top3": [
+        "m74",
+        "m69",
+        "m4"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1487
+    },
+    {
+      "query": "我的回复要带什么称呼",
+      "expected": [
+        "m11"
+      ],
+      "top3": [
+        "m76"
+      ],
+      "rank": 0,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1460
+    },
+    {
+      "query": "哪些东西不许放 C 盘",
+      "expected": [
+        "m1",
+        "m80"
+      ],
+      "top3": [
+        "m15",
+        "m80",
+        "m24"
+      ],
+      "rank": 2,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1460
+    },
+    {
+      "query": "桌面图标被接管了怎么退回去",
+      "expected": [
+        "m67"
+      ],
+      "top3": [
+        "m67",
+        "m69",
+        "m68"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1457
+    },
+    {
+      "query": "搬家之后哪六处引用要重扫",
+      "expected": [
+        "m22"
+      ],
+      "top3": [
+        "m22",
+        "m4",
+        "m67"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1459
+    },
+    {
+      "query": "归档区能不能顺手清一下",
+      "expected": [
+        "m24"
+      ],
+      "top3": [
+        "m24",
+        "m66",
+        "m65"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1473
+    },
+    {
+      "query": "记忆插件坏了怎么救",
+      "expected": [
+        "m62"
+      ],
+      "top3": [
+        "m62",
+        "m65",
+        "m69"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1437
+    },
+    {
+      "query": "学习空间那片能不能动",
+      "expected": [
+        "m65"
+      ],
+      "top3": [
+        "m65",
+        "m83",
+        "m74"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1478
+    },
+    {
+      "query": "Linux 虚拟机搬走会报什么错",
+      "expected": [
+        "m66"
+      ],
+      "top3": [
+        "m66",
+        "m76",
+        "m77"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1479
+    },
+    {
+      "query": "短视频客户端用管理员权限打不开",
+      "expected": [
+        "m68"
+      ],
+      "top3": [
+        "m68",
+        "m78",
+        "m67"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1484
+    },
+    {
+      "query": "技能是怎么生成的",
+      "expected": [
+        "m69"
+      ],
+      "top3": [
+        "m69",
+        "m23",
+        "m24"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1485
+    },
+    {
+      "query": "跑分和耗时对比结果",
+      "expected": [
+        "m71"
+      ],
+      "top3": [
+        "m71",
+        "m82",
+        "m75"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1470
+    },
+    {
+      "query": "Hermes 起不来怎么办",
+      "expected": [
+        "m72"
+      ],
+      "top3": [
+        "m72",
+        "m69"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1465
+    },
+    {
+      "query": "官方自带的插件怎么启用",
+      "expected": [
+        "m73"
+      ],
+      "top3": [
+        "m73",
+        "m69",
+        "m74"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1472
+    },
+    {
+      "query": "竞品那篇调研的结论",
+      "expected": [
+        "m75"
+      ],
+      "top3": [
+        "m75",
+        "m83",
+        "m23"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1444
+    },
+    {
+      "query": "两个工作区各管什么",
+      "expected": [
+        "m76"
+      ],
+      "top3": [
+        "m76",
+        "m75",
+        "m78"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1483
+    },
+    {
+      "query": "装完软件要不要登记",
+      "expected": [
+        "m77"
+      ],
+      "top3": [
+        "m77",
+        "m74",
+        "m70"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1497
+    },
+    {
+      "query": "评测套件推到哪个仓库",
+      "expected": [
+        "m78"
+      ],
+      "top3": [
+        "m78",
+        "m71",
+        "m80"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1494
+    },
+    {
+      "query": "我是不是处女座有什么要求",
+      "expected": [
+        "m40"
+      ],
+      "top3": [
+        "m76",
+        "m34",
+        "m73"
+      ],
+      "rank": 0,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1460
+    },
+    {
+      "query": "这两个工作区才用的礼仪",
+      "expected": [
+        "m10"
+      ],
+      "top3": [
+        "m76",
+        "m75",
+        "m22"
+      ],
+      "rank": 0,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1483
+    },
+    {
+      "query": "大肥鱼这个称呼是什么",
+      "expected": [
+        "m12"
+      ],
+      "top3": [
+        "m76",
+        "m24",
+        "m81"
+      ],
+      "rank": 0,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1460
+    },
+    {
+      "query": "修过的东西能信吗",
+      "expected": [
+        "m23"
+      ],
+      "top3": [
+        "m23",
+        "m81",
+        "m24"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1467
+    }
+  ],
+  "negatives": [
+    {
+      "query": "今天上海天气怎么样",
+      "relevant": 0,
+      "chars": 1460
+    },
+    {
+      "query": "帮我写个 Python 快排",
+      "relevant": 0,
+      "chars": 1460
+    },
+    {
+      "query": "推荐一部好看的电影",
+      "relevant": 0,
+      "chars": 1460
+    },
+    {
+      "query": "MySQL 索引优化怎么做",
+      "relevant": 0,
+      "chars": 1460
+    }
+  ]
+}
