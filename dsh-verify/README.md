@@ -18,11 +18,12 @@ DSH bundle（Host 侧插件）：识别并运行项目自己的检查命令（�
 ## 识别顺序
 
 1. bundle patch 的 `customCommand`（字符串走 shell，数组直接 argv）
-2. `package.json` 的 `scripts`：按 `test` → `lint` → `typecheck` → `check` 取第一个存在的；包管理器由锁文件判断（`pnpm-lock.yaml` → pnpm，`yarn.lock` → yarn，否则 npm）
-3. `go.mod` → `go test ./...`；`Cargo.toml` → `cargo test`
-4. `pyproject.toml` / `pytest.ini` / `tests` 目录 → `python -m pytest -q`
-5. `*.sln` → `dotnet test`
-6. 都没有 → 明确说"没检测到"，并提示怎么配 `customCommand`
+2. `package.json` 的 `scripts`：按 `test` → `lint` → `typecheck` → `check` 取第一个存在的；包管理器由锁文件判断（`pnpm-lock.yaml` → pnpm，`yarn.lock` → yarn，`bun.lockb`/`bun.lock` → bun，否则 npm）
+3. 有 `tsconfig.json` 却没配 `typecheck` 脚本 → `<包管理器> tsc --noEmit`（只查类型、不产文件；`npm` 用 `npx`、`pnpm` 用 `pnpm exec`、`bun` 用 `bunx`）
+4. `go.mod` → `go test ./...`；`Cargo.toml` → `cargo test`
+5. `pyproject.toml` / `pytest.ini` / `tests` 目录 → `python -m pytest -q`
+6. `*.sln` → `dotnet test`
+7. 都没有 → 明确说"没检测到"，并提示怎么配 `customCommand`
 
 ## 配置
 

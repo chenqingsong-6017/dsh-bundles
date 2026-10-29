@@ -13,7 +13,11 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 | `tidy_plan` | 出方案：按类型/月份分类文件、列子目录归并候选、校验改名 | 否 |
 | `tidy_apply` | 执行（`confirm:true` 才动）：整理 / 目录归并 / 改名 / 清理 | 是 |
 | `tidy_undo` | 撤销上一次操作（按清单反向搬回） | 是 |
-| `tidy_status` | 诊断：数据目录、记录数、红线数、限额 | 否 |
+| `tidy_status` | 诊断：数据目录、记录数、红线数、限额、**台账统计** | 否 |
+| `inventory_add` | 登记一条安装记录（名称 / 类型 / 路径 / 版本 / 来源 / 卸载命令 / 数据目录），可选自动扫六类关联引用；写 `inventory.json` 并重生成 `inventory.md` | 只写台账 |
+| `inventory_list` | 列出台账条目（默认只在用，可按类型 / 状态过滤；有截断提示） | 否 |
+| `plan_uninstall` | 卸前只读预演：按名称或路径找条目，列出六类受影响引用、目标与数据目录体积、运行中进程、红线提醒、建议步骤；**不删任何东西** | 否 |
+| `inventory_check` | 卸后只读复核：逐条查路径 / 数据目录是否还在、引用是否残留，分「记录有但已不在 / 引用残留 / 正常」；可标 `stale` 或收进 `removed` 历史 | 只改台账 |
 
 ### 四种动作（`tidy_plan` / `tidy_apply` 的 `kind`）
 
@@ -26,6 +30,86 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 | `dupes` | 查重复文件：先按大小分组，再「部分哈希 → 全量哈希」两段筛；确认后多余副本移入隔离区（`_dupes/`），可 `tidy_undo` 取回 | ✅ 移入隔离区 |
 | `residue` | 应用残留处置：**只动用户级**（用户 PATH 失效项与重复项、HKCU 自启失效项），写清单可 `tidy_undo` 恢复；系统级（幽灵服务、系统任务、系统 PATH）只报告，需管理员 | ✅ 用户级可撤 |
 | `clean` | 只删白名单里的临时文件/更新缓存/崩溃转储（回收站需点名） | ❌ 不可恢复 |
+
+## 安装 / 卸载台账（v0.11.0）
+
+> 目的：几个月后还能干净卸载。装完顺手登记，卸前先预演，卸后核对残留。全程只写台账文件，不动用户文件、不改注册表、不停服务。
+
+**固定流程**：
+
+1. 装完 → `inventory_add`：记名称 / 类型 / 路径 / 版本 / 来源 / 卸载命令 / 数据目录，顺带扫出六类关联引用；
+2. 卸前 → `plan_uninstall`：只读预演，列出会被影响的引用、目标与数据目录体积、运行中的进程、红线提醒和建议步骤；
+3. 卸后 → `inventory_check`：逐条对账，分「记录有但已不在 / 引用残留 / 正常」，失联条目标 `stale` 待核对，确认干净的用 `markRemoved` 收进历史；
+4. 平时 → `inventory_list` 看台账（`tidy_status` 里也有一行台账统计）。
+
+### 台账结构（`inventory.json`）
+
+```json
+{
+  "version": 1,
+  "nextId": 2,
+  "entries": [
+    {
+      "id": "inv-0001",
+      "name": "某便携软件",
+      "kind": "portable",
+      "path": "D:\\Tools\\某某",
+      "version": "1.2.3",
+      "source": "官网下载",
+      "uninstallCmd": "",
+      "installedAt": "2026-10-29T05:00:00.000Z",
+      "updatedAt": "2026-10-29T05:00:00.000Z",
+      "dataDirs": ["D:\\Tools\\某某\\data"],
+      "refs": {
+        "services": [], "startup": [], "tasks": [],
+        "shortcuts": [{ "name": "某某", "detail": "D:\\Tools\\某某\\app.exe" }],
+        "pathEntries": [], "registryKeys": []
+      },
+      "notes": "",
+      "status": "active",
+      "removedAt": "",
+      "stale": false
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 自动编号，`inv-0001` 起 |
+| `kind` | `installer` 安装包 / `portable` 便携版 / `dsh-plugin` DSH 插件 / `dev-tool` 开发工具 |
+| `path` | 安装目录或主程序（登记时必须存在） |
+| `uninstallCmd` | 卸载命令或卸载器路径（便携版可留空） |
+| `dataDirs` | 卸载时要一起处理的配置 / 存档 / 数据目录 |
+| `refs` | 六类关联引用：服务 / 开机自启 / 计划任务 / 开始菜单 / PATH / 注册表键 |
+| `status` | `active` 在用 / `removed` 已卸载（历史保留，不物理删记录） |
+| `stale` | 记录与磁盘对不上，待人工核对 |
+
+同名重复登记视为**更新**（只覆盖本次给的可选字段，保留首次登记时间）；同一路径换个名字登记会被拒绝。
+
+### 引用扫描范围
+
+- 服务（`Win32_Service` 的 PathName）、开机自启（`Win32_StartupCommand`）、计划任务（`Get-ScheduledTask` 的 Actions）、开始菜单快捷方式（用户 + 全局 `.lnk`）；
+- PATH：用户级与系统级里包含该路径的段；
+- 注册表键：三个 Uninstall 根（HKLM 64 / HKLM WOW6432Node / HKCU）的 `InstallLocation` / `UninstallString` / `DisplayIcon` / `InstallPath`，以及 `App Paths`。**不扫** CLSID / 文件关联 / COM 注册——那类残留靠 `tidy_scan residue:true` 兜底。
+
+系统级引用（服务、系统 PATH、HKLM 键、全局任务）**只报告不动手**，需要管理员权限的动作由人执行。
+
+### 数据位置
+
+- `<storeDir>/inventory.json` —— 程序用（原子写：同目录临时文件 + rename）；
+- `<storeDir>/inventory.md` —— 人读视图，每次写台账后重新生成；
+- 默认 `storeDir` 仍是 `D:\AI\dsh-data\tidy`。
+
+台账解析失败（JSON 坏了 / 缺 `entries` / 文件为空）时，四个工具一律**拒绝写入**并报出文件路径，不会静默清空。
+
+### 边界
+
+- `inventory_check` 每次最多重扫 8 条已失联条目的引用（25 秒总预算），量大时分批或用 `name` 指定；
+- `markRemoved` 默认关闭：要显式传 `true`，且只在「路径与数据目录都没了、也没有引用残留」时才会标；
+- 复核默认只改 `stale` 标记（`markStale` 默认 `true`，只在 inventory.json 里打标记，不删记录）；想完全只读就传 `markStale:false`，想跳过后台扫描再传 `scanRefs:false`；
+- 数据目录体积按「最多量 8 个、每个 1.5 秒」有界估算，超预算标「只量了一部分」；
+- 只登记「已经存在」的路径；还没装的东西不能先记。
 
 ## 分类规则
 
@@ -68,8 +152,24 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 
 - `manifests/organize-*.json` / `folders-*.json` / `rename-*.json` —— 撤销依据
 - `tidy.log.jsonl` —— 操作流水
+- `inventory.json` —— 安装 / 卸载台账（程序用）
+- `inventory.md` —— 台账人读视图（每次写台账后重新生成）
 
 ## 验证记录
+
+### v0.11.0（2026-10-29）安装 / 卸载台账
+
+`_selftest/tests/butler-tidy.test.mjs`（结构冒烟 + 台账行为），**12 项检查、80 余条断言全过**：
+
+- 4 个新工具注册齐全；9 个工具的输出 schema 与返回值逐字段核对通过（含 render 冒烟）；
+- `inventory_add` → `inventory_list` 往返：编号 `inv-0001` 递增、同名再登记变「更新」、类型过滤生效；
+- `inventory.json` 原子写、`inventory.md` 每次重生成、无临时文件残留；
+- `plan_uninstall` 只读：执行前后目标目录还在、台账内容一字未改，输出六类引用结构 + 体积 + 进程 + 红线 + 建议步骤；
+- `inventory_check` 识别「记录有但已不在」与「引用残留」，失联条目标 `stale`，确认后 `markRemoved` 进历史；
+- 台账写坏时 `inventory_add` / `inventory_check` 报错且原文件一字未动；
+- `tidy_status` 台账统计（条目 / 在用 / 已卸载 / 待核对）与台账一致。
+
+示例（自测数据，非实机安装）：登记「测试应用」（`inv-0001` · 便携版 · 1 个数据目录）→ `plan_uninstall` 给出「便携版直接删目录 / 数据目录去留 / 卸后复核」3 步 → 删掉目录后 `inventory_check` 报「安装路径与数据目录都已不在，也没有关联引用」→ `markRemoved:true` 标为已卸载，历史仍可查。
 
 ### v0.2.0 → v0.3.0（2026-10-27）
 
@@ -109,3 +209,5 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 - `Windows.old` 需要管理员权限，插件只提示，不执行。
 - 回收站按当前用户可见范围删除，别的账户的会跳过并计入「跳过」。
 - 大目录体积受每目录 20,000 项 / 1.5 秒上限约束，超出标「体积未量全」。
+- 台账引用扫描只覆盖上面列的六类；CLSID / 文件关联 / COM 注册不在其中，卸载后建议再跑一次 `tidy_scan residue:true` 补扫孤儿引用。
+- `inventory_check` 的复核只对「路径已不在」的条目重扫引用；路径还在的条目只核对存在性与数据目录缺项。

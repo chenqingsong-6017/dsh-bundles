@@ -7,11 +7,13 @@
  *
  * 识别顺序（root = 会话工作目录或 path 参数）：
  *   1. bundle patch 里的 `customCommand`（字符串走 shell，数组直接 argv）
- *   2. package.json 的 scripts：test / lint / typecheck / check（包管理器按锁文件判断 npm/pnpm/yarn）
- *   3. go.mod → `go test ./...`；Cargo.toml → `cargo test`
- *   4. pyproject.toml / pytest.ini / tests 目录 → `python -m pytest -q`
- *   5. *.sln → `dotnet test`
- *   6. 都没有 → 明确告诉用户"没检测到"，并列出可用的 scripts
+ *   2. package.json 的 scripts：test / lint / typecheck / check
+ *      （包管理器按锁文件判断 pnpm / yarn / bun / npm）
+ *   3. 有 tsconfig.json 但没配 typecheck 脚本 → `<包管理器> tsc --noEmit`
+ *   4. go.mod → `go test ./...`；Cargo.toml → `cargo test`
+ *   5. pyproject.toml / pytest.ini / tests 目录 → `python -m pytest -q`
+ *   6. *.sln → `dotnet test`
+ *   7. 都没有 → 明确告诉用户"没检测到"，并列出可用的 scripts
  *
  * 执行：走官方的 `ctx.subprocess`（collect 模式），超时先 terminate 再报告。
  * 输出：先结论（通过/失败 + 命令 + 用时），再给失败片段（默认最后 40 行），并说明省略了多少行。
@@ -51,14 +53,29 @@ export function detectCheck(root, kind = 'auto', customCommand) {
   const pkg = readPkg()
   const scripts = pkg && typeof pkg.scripts === 'object' && pkg.scripts !== null ? pkg.scripts : {}
   const has = (name) => typeof scripts[name] === 'string'
+  // 包管理器按锁文件判断。bun 有新旧两种锁文件：bun.lockb（二进制）与 bun.lock（Bun 1.2+ 文本）。
   const packageManager = existsSync(path.join(root, 'pnpm-lock.yaml'))
     ? 'pnpm'
     : existsSync(path.join(root, 'yarn.lock'))
       ? 'yarn'
-      : 'npm'
+      : existsSync(path.join(root, 'bun.lockb')) || existsSync(path.join(root, 'bun.lock'))
+        ? 'bun'
+        : 'npm'
   const wanted = kind === 'auto' ? ['test', 'lint', 'typecheck', 'check'] : [kind]
   for (const name of wanted) {
     if (has(name)) return { kind: name, argv: [packageManager, 'run', name], label: `${packageManager} run ${name}` }
+  }
+
+  // 有 tsconfig.json 却没配 typecheck 脚本：用 tsc --noEmit 兜底（只查类型、不产文件）。
+  // 只认 auto / typecheck 两种 kind —— 显式要 test 时不该跑去查类型。
+  if ((kind === 'auto' || kind === 'typecheck') && existsSync(path.join(root, 'tsconfig.json'))) {
+    const runner = {
+      npm: { argv: ['npx', 'tsc', '--noEmit'], label: 'npx tsc --noEmit' },
+      pnpm: { argv: ['pnpm', 'exec', 'tsc', '--noEmit'], label: 'pnpm exec tsc --noEmit' },
+      yarn: { argv: ['yarn', 'tsc', '--noEmit'], label: 'yarn tsc --noEmit' },
+      bun: { argv: ['bunx', 'tsc', '--noEmit'], label: 'bunx tsc --noEmit' },
+    }[packageManager]
+    return { kind: 'typecheck', argv: runner.argv, label: runner.label }
   }
 
   const fallbackAllowed = kind === 'auto' || kind === 'test'
@@ -147,7 +164,15 @@ export function apply(ctx, config) {
     }
 
     if (raw !== undefined) {
-      return { root: path.resolve(sessionCwd ?? process.cwd(), raw) }
+      // 相对 path 必须有一个可信的基准目录；拿不到会话目录时不要用 Host 的
+      // process.cwd()（桌面版那是 profile 目录）冒充，否则会在错的目录里跑检查。
+      if (!sessionCwd && !path.isAbsolute(raw)) {
+        return {
+          root: undefined,
+          error: `未取到会话工作目录（${sessionError ?? '未提供会话身份'}），无法解析相对 path: ${raw}`,
+        }
+      }
+      return { root: path.resolve(sessionCwd ?? raw, raw) }
     }
     if (sessionCwd) return { root: sessionCwd }
     return {
@@ -426,9 +451,11 @@ export function apply(ctx, config) {
           ? 'pnpm'
           : existsSync(path.join(root, 'yarn.lock'))
             ? 'yarn'
-            : existsSync(path.join(root, 'package.json'))
-              ? 'npm'
-              : '—'
+            : existsSync(path.join(root, 'bun.lockb')) || existsSync(path.join(root, 'bun.lock'))
+              ? 'bun'
+              : existsSync(path.join(root, 'package.json'))
+                ? 'npm'
+                : '—'
         const detected = detectCheck(root, 'auto', customCommand)
         return {
           root,

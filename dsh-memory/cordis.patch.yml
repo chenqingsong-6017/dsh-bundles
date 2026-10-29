@@ -6,6 +6,16 @@
         storeDir: 'D:\AI\dsh-data\memory'
         # 存储预算：记忆总量上限（字符），超了拒绝写入而不是悄悄淘汰
         maxBytes: 8000
-        # 注入预算：每轮系统提示里最多花多少字符。pinned 优先全文，
-        # 其余从新到旧填充，装不下的降级成索引行（用 memory_search 取全文）。
-        maxInjectChars: 1200
+        # 注入预算：每轮系统提示里最多花多少字符。
+        # v1.2：pinned 全文常驻；其余一律出「id + tag + 日期 + 摘要」索引行，
+        # 装不下的条目在块尾「⚠ 另有 N 条未注入」里逐条点名（不再静默丢弃）。
+        maxInjectChars: 1500
+        # v2.2：scope 加分（cwd 命中条目在召回时加权 ×1.4；对不上不加分、不过滤）
+        # 映射表可覆盖，默认 plugin-dev→D:\AI\dsh-bundles / data-infra→D:\AI\dsh-data / dsh-date→D:\AI-date\dsh-date
+        # scopeRoots:
+        #   plugin-dev: ['D:\AI\dsh-bundles']
+        # v2.2：自动沉淀候选（影子模式，只写 candidates.json，不直接入库；false 可关）
+        captureCandidates: true
+        # v2.3：相关性覆盖率下限（top 分数 ÷ 查询 idf 总和，0-1，语料规模无关）；低于它宁可不注入相关全文
+        # 默认 0.15（用 36 题微基准校准：正例最低 0.186、负例最高 0.128）；想更保守可调 0.18-0.2
+        # relevanceFloor: 0.15
