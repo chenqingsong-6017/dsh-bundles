@@ -11,6 +11,8 @@ import {
   recencyOf,
   renderMemory,
   scoreEntries,
+  scoreEntriesStrict,
+  expandQuery,
   scoreMemory,
   textSimilarity,
   tokenize,
@@ -807,6 +809,62 @@ ok('v3.3 口径统一：review / audit / list 对 deprecated 的处理一致')
   rmSync(tmp, { recursive: true, force: true })
 }
 ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不越界')
+
+// ---- v3.5 检索桥接：aliases + 同义扩展（2026-10-29 P0） ----
+{
+  // 1) 规范化：aliases 去空白、丢空串，且能过 schema
+  const normalized = normalizeEntry({ id: 'm1', text: '给插件更新流程', aliases: [' 生效 ', '', '装完'] })
+  assert.deepEqual(normalized.aliases, ['生效', '装完'])
+  assert.ok(Object.keys(memoryEntrySchema.properties).includes('aliases'), 'schema 未声明 aliases')
+  assert.equal(normalizeEntry({ id: 'm1', text: 'x' }).aliases, undefined)
+  ok('v3.5 normalizeEntry 保留 aliases（去空白/丢空串），未知字段不落')
+}
+
+{
+  // 2) 别名是跨词面桥：问法里没有一个字出现在原文里，靠 aliases 排第一
+  const entries = [
+    { id: 'a1', text: '用户说给插件更新 = 去 GitHub 找实现再改', aliases: ['装完', '跑起来', '生效'] },
+    { id: 'a2', text: '验证门由 dsh-proof 负责，收工前跑 check' },
+    { id: 'a3', text: '竞品调研结论写在 dsh-创建 工作区' },
+  ]
+  const ranked = scoreEntries(entries, '插件装完怎么让它跑起来').sort((x, y) => y.score - x.score)
+  assert.equal(ranked[0].entry.id, 'a1')
+  ok('v3.5 aliases 命中权重最高：纯换皮问法也能排到第一')
+}
+
+{
+  // 3) 同义扩展：只桥接词组，不产生单字（单字会灌噪声）
+  const extra = expandQuery('记忆插件坏了怎么救')
+  assert.ok(extra.size > 0)
+  assert.ok([...extra.keys()].every((term) => term.length >= 2), '扩展词里出现了单字')
+  assert.equal(expandQuery('今天上海天气怎么样').size, 0)
+  ok('v3.5 expandQuery 只扩展词组、无关问题不扩展')
+}
+
+{
+  // 4) 严格打分不吃别名：别名里的字不能把无关问题判成相关
+  // 原文里不含查询词；只有别名里有 —— 严格分必须为 0，宽松分必须 > 0
+  const entries = [
+    { id: 'b1', text: 'SKILL.md 由 skill-forge 写入技能目录', aliases: ['怎么生成', '索引'] },
+    { id: 'b2', text: 'MySQL 无关条目占位' },
+  ]
+  const strict = scoreEntriesStrict(entries, 'MySQL 索引优化怎么做')
+  assert.equal(strict.find((item) => item.entry.id === 'b1').score, 0, '严格分被别名污染了')
+  const loose = scoreEntries(entries, 'MySQL 索引优化怎么做')
+  assert.ok(loose.find((item) => item.entry.id === 'b1').score > 0, '宽松分应该被别名抬起来')
+  ok('v3.5 scoreEntriesStrict 不看 aliases：无关问题严格分为 0、宽松分 > 0')
+}
+
+{
+  // 5) 门槛用严格分：无关问题即使有别名也不注入全文
+  const entries = [
+    { id: 'c1', text: 'SKILL.md 由 skill-forge 写入技能目录', aliases: ['怎么生成', '索引'] },
+    { id: 'c2', text: '用户要求回答用中文' },
+  ]
+  const block = renderMemory(entries, { maxInjectChars: 1500, query: 'MySQL 索引优化怎么做' })
+  assert.equal(Number((block.match(/相关 (\d+)/) ?? [])[1] ?? 0), 0, '无关问题被注入了全文')
+  ok('v3.5 相关性门槛用严格分：别名不能把无关问题抬过门槛')
+}
 
 console.log(`memory: ${passed} 项通过`)
 

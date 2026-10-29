@@ -284,6 +284,10 @@ export function normalizeEntry(input) {
     const tags = input.tags.filter((tag) => typeof tag === 'string' && tag !== '')
     if (tags.length > 0) out.tags = tags
   }
+  if (Array.isArray(input.aliases)) {
+    const aliases = input.aliases.map((alias) => (typeof alias === 'string' ? alias.trim() : '')).filter((alias) => alias !== '')
+    if (aliases.length > 0) out.aliases = aliases
+  }
   if (Array.isArray(input.paths)) {
     const paths = input.paths.filter((item) => typeof item === 'string' && item !== '')
     if (paths.length > 0) out.paths = paths
@@ -414,8 +418,12 @@ export function renderMemory(allEntries, options) {
     const floor = Number.isFinite(options?.relevanceFloor) ? options.relevanceFloor : RELEVANCE_FLOOR
     const topRaw = scored.length > 0 ? scored[0].raw : 0
     // 覆盖率门：top 分数 ÷ 查询 idf 总和。语料无关，弱匹配宁可一条都不给全文（治负例误注入）。
+    // ⚠ 分子的 topRaw 必须用**严格分**（不含 alias 加权 / 同义扩展）：
+    //   否则「帮我写个 Python 快排」这类无关问题会被同义词抬过门槛 —— 2026-10-29 实测负例误注入 0%→75%。
+    const strictScored = scoreEntriesStrict(entries.filter((item) => !item.pinned), queryText)
+    const strictTop = strictScored.reduce((max, item) => (item.score > max ? item.score : max), 0)
     const idfTotal = queryIdfSum(entries.filter((item) => !item.pinned), queryText)
-    const coverage = idfTotal > 0 ? topRaw / idfTotal : 0
+    const coverage = idfTotal > 0 ? strictTop / idfTotal : 0
     if (coverage >= floor) {
       const now = Date.now()
       const ranked = scored
@@ -534,18 +542,109 @@ export function tokenize(input) {
 const BM25_K1 = 1.2
 const BM25_B = 0.75
 const BM25_TAG_WEIGHT = 2
+/** aliases 是人工写的「跨词面桥」，命中权重应高于 tag（tag 是分类，alias 是等同词）。 */
+const BM25_ALIAS_WEIGHT = 2.5
+/** 同义词扩展的权重：低于原词，避免扩展词把噪声顶上来。 */
+const EXPANSION_WEIGHT = 0.5
 
 function bm25Doc(entry) {
   const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
-  const terms = tokenize(`${entry.text} ${tagText}`)
+  const aliasText = Array.isArray(entry.aliases) ? entry.aliases.join(' ') : ''
+  const terms = tokenize(`${entry.text} ${tagText} ${aliasText}`)
   let length = 0
   for (const count of terms.values()) length += count
-  return { entry, terms, length, tagText: tagText.toLowerCase() }
+  return { entry, terms, length, tagText: tagText.toLowerCase(), aliasTerms: new Set(tokenize(aliasText).keys()) }
 }
 
-/** BM25 检索：IDF 压常见词、长度归一压长条目，中文用 unigram+bigram；tag 命中加权。 */
+/**
+ * 领域同义组：用户提问用一种说法，记忆里存的是另一种说法。
+ * 命中任意成员 → 同组其余成员的低权重词加入查询（EXPANSION_WEIGHT）。
+ * 只收「高精度」同义，宁可少收，别把噪声词灌进来。
+ */
+const SYNONYM_GROUPS = [
+  ['生效', '重载', 'reload', '跑起来', '应用改动', '装完'],
+  ['验证门', '门禁', 'dsh-proof', '收工前', '拦'],
+  ['记忆', 'memory', '记忆库'],
+  ['坏了', '故障', '崩了', '救', '修复'],
+  ['归档', 'archive', '冷存', '备份区'],
+  ['评测', 'bench', '跑分', '基准'],
+  ['工作区', 'workspace', '项目目录'],
+  ['虚拟机', 'virtualbox', 'vbox', 'vm'],
+  ['抖音', 'douyin', '短视频'],
+  ['桌面图标', 'dock', '图标被接管'],
+  ['管理员权限', '提权', 'elevate', 'uac'],
+  ['注册表', 'registry', 'hklm', 'hkcu'],
+  ['快捷方式', 'lnk', 'shortcut', '快捷图标'],
+  ['礼仪', '君臣', '称呼', '自称'],
+]
+
+/**
+ * 查询扩展：返回「扩展词 → 权重」。单字不扩展（太泛，会灌噪声）。
+ * 只做词面层面的桥接，不调模型。
+ */
+export function expandQuery(query) {
+  const text = String(query ?? '').toLowerCase()
+  const extra = new Map()
+  for (const group of SYNONYM_GROUPS) {
+    if (!group.some((word) => text.includes(word.toLowerCase()))) continue
+    for (const word of group) {
+      for (const term of tokenize(word).keys()) {
+        if (term.length < 2) continue
+        if ((extra.get(term) ?? 0) < EXPANSION_WEIGHT) extra.set(term, EXPANSION_WEIGHT)
+      }
+    }
+  }
+  return extra
+}
+
+/**
+ * BM25 检索：IDF 压常见词、长度归一压长条目，中文用 unigram+bigram。
+ * 加权：aliases 命中 ×2.5（人工写的跨词面桥）> tag 命中 ×2 > 原词 ×1 > 同义扩展词 ×0.5。
+ */
 export function scoreEntries(entries, query) {
   const docs = (Array.isArray(entries) ? entries : []).map(bm25Doc)
+  if (docs.length === 0) return []
+  const queryTerms = tokenize(query)
+  const expansion = expandQuery(query)
+  if (queryTerms.size === 0 && expansion.size === 0) return docs.map((doc) => ({ entry: doc.entry, score: 0 }))
+  const weights = new Map()
+  for (const term of queryTerms.keys()) weights.set(term, 1)
+  for (const [term, weight] of expansion) if (!weights.has(term)) weights.set(term, weight)
+  let totalLength = 0
+  for (const doc of docs) totalLength += doc.length
+  const avgLength = totalLength / docs.length || 1
+  const df = new Map()
+  for (const term of weights.keys()) df.set(term, docs.filter((doc) => doc.terms.has(term)).length)
+  return docs.map((doc) => {
+    let score = 0
+    for (const [term, weight] of weights) {
+      const frequency = doc.terms.get(term) ?? 0
+      if (frequency === 0) continue
+      const hit = df.get(term) ?? 0
+      const idf = Math.log(1 + (docs.length - hit + 0.5) / (hit + 0.5))
+      const tagBoost = doc.tagText.includes(term) ? BM25_TAG_WEIGHT : 1
+      const aliasBoost = doc.aliasTerms.has(term) ? BM25_ALIAS_WEIGHT : 1
+      score += weight * tagBoost * aliasBoost * idf * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgLength)))
+    }
+    return { entry: doc.entry, score }
+  })
+}
+
+/**
+ * 严格打分：只用原查询词，**不加** alias 权重、**不做**同义扩展。
+ * 用途：判「这句话跟这条记忆到底相不相关」——扩展词可以帮排序，但绝不能帮它越过相关性门槛，
+ * 否则负例（无关问题）会因为同义词被误判相关并注入全文。
+ */
+export function scoreEntriesStrict(entries, query) {
+  // 文档侧只取 text + tag，**不取 aliases**：aliases 是查询桥，不是原文内容。
+  // 早期版本把它们算进文档，导致「怎么生成」这种别名里的「怎么」把「MySQL 索引优化怎么做」判成相关。
+  const docs = (Array.isArray(entries) ? entries : []).map((entry) => {
+    const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
+    const terms = tokenize(`${entry.text} ${tagText}`)
+    let length = 0
+    for (const count of terms.values()) length += count
+    return { entry, terms, length }
+  })
   if (docs.length === 0) return []
   const terms = tokenize(query)
   if (terms.size === 0) return docs.map((doc) => ({ entry: doc.entry, score: 0 }))
@@ -561,8 +660,7 @@ export function scoreEntries(entries, query) {
       if (frequency === 0) continue
       const hit = df.get(term) ?? 0
       const idf = Math.log(1 + (docs.length - hit + 0.5) / (hit + 0.5))
-      const tagBoost = doc.tagText.includes(term) ? BM25_TAG_WEIGHT : 1
-      score += tagBoost * idf * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgLength)))
+      score += idf * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgLength)))
     }
     return { entry: doc.entry, score }
   })
@@ -606,6 +704,7 @@ export const memoryEntrySchema = {
     sources: { type: 'array', items: { type: 'string' } },
     paths: { type: 'array', items: { type: 'string' } },
     workspaces: { type: 'array', items: { type: 'string' } },
+    aliases: { type: 'array', items: { type: 'string' } },
   },
   required: ['id', 'text', 'addedAt', 'updatedAt'],
   additionalProperties: false,
@@ -1124,6 +1223,11 @@ export function apply(ctx, config) {
           text: { type: 'string', description: `The fact to remember (<= ${MAX_TEXT_CHARS} chars).` },
           tag: { type: 'string', description: 'Optional short tag, e.g. "preference", "env", "project".' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Optional tags; used for retrieval weighting.' },
+          aliases: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional synonyms/aliases the user might use instead of the stored wording (e.g. 生效, reload). They are retrieval-only bridges and are scored higher than tags.',
+          },
           scope: {
             type: 'string',
             description: 'Optional scope: global | plugin-dev | data-infra | dsh-date | machine. Unmatched scopes get no boost, never filtered out.',
@@ -1248,6 +1352,7 @@ export function apply(ctx, config) {
           text: raw,
           ...(typeof args?.tag === 'string' && args.tag.trim() !== '' ? { tag: args.tag.trim() } : {}),
           ...(Array.isArray(args?.tags) ? { tags: args.tags } : {}),
+          ...(Array.isArray(args?.aliases) ? { aliases: args.aliases } : {}),
           ...(typeof args?.scope === 'string' ? { scope: args.scope.trim() } : {}),
           ...(typeof args?.kind === 'string' ? { kind: args.kind.trim() } : {}),
           ...(Number.isFinite(args?.importance) ? { importance: args.importance } : {}),
@@ -1301,6 +1406,11 @@ export function apply(ctx, config) {
           text: { type: 'string', description: `New text (<= ${MAX_TEXT_CHARS} chars).` },
           tag: { type: 'string', description: 'Optional new tag; omit to keep the current one.' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Optional new tags; omit to keep the current ones.' },
+          aliases: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Optional new aliases (synonyms) for retrieval; omit to keep the current ones, empty array clears them.',
+          },
           scope: { type: 'string', description: 'Optional new scope (global | plugin-dev | data-infra | dsh-date | machine).' },
           kind: { type: 'string', description: 'Optional new kind (rule | preference | fact | note).' },
           importance: { type: 'integer', minimum: 1, maximum: 10, description: 'Optional new importance 1-10.' },
@@ -1385,6 +1495,11 @@ export function apply(ctx, config) {
           const tags = args.tags.filter((tag) => typeof tag === 'string' && tag !== '')
           if (tags.length > 0) entry.tags = tags
           else delete entry.tags
+        }
+        if (Array.isArray(args?.aliases)) {
+          const aliases = args.aliases.map((alias) => (typeof alias === 'string' ? alias.trim() : '')).filter((alias) => alias !== '')
+          if (aliases.length > 0) entry.aliases = aliases
+          else delete entry.aliases
         }
         if (typeof args?.scope === 'string' && args.scope.trim() !== '') entry.scope = args.scope.trim()
         if (typeof args?.kind === 'string' && args.kind.trim() !== '') entry.kind = args.kind.trim()

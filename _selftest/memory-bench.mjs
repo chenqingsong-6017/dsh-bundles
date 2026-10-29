@@ -17,16 +17,42 @@ const entries = store.entries
 const active = entries.filter((entry) => typeof entry.supersededBy !== 'string')
 const scorable = active.filter((entry) => entry.pinned !== true)
 const pinnedIds = new Set(active.filter((entry) => entry.pinned === true).map((entry) => entry.id))
+const byId = new Map(entries.map((entry) => [entry.id, entry]))
+const RETIRED = new Set(['deprecated', 'archived'])
+
+/**
+ * 期望 id 可能已经被合并/取代（supersededBy 链），也可能彻底废弃。
+ * 沿链解析到「当前生效」的那条；链尾已废弃 → 返回 null，该用例作废。
+ * 2026-10-29：在此之前基准不跟随取代链，36 条正例里有 27 条目标指向已取代/废弃 id，
+ * 永远不可能命中——把 recall 报成 30.6%，是基准过期，不是检索差。
+ */
+function resolveExpected(id) {
+  const seen = new Set()
+  let current = byId.get(id)
+  while (current && current.supersededBy && !seen.has(current.id)) {
+    seen.add(current.id)
+    current = byId.get(current.supersededBy)
+  }
+  if (!current) return null
+  if (RETIRED.has(current.status)) return null
+  return current.id
+}
 
 const rows = []
 let recall1 = 0, recall3 = 0, reciprocal = 0, injectedHit = 0, chars = 0
+let retired = 0
 for (const item of cases.positives) {
+  const expected = [...new Set(item.expected.map(resolveExpected).filter(Boolean))]
+  if (expected.length === 0) {
+    retired += 1
+    continue
+  }
   const scored = scoreEntries(scorable, item.query)
     .filter((hit) => hit.score > 0.0001)
     .sort((a, b) => b.score - a.score)
   const ids = scored.slice(0, 3).map((hit) => hit.entry.id)
-  const pinnedExpected = item.expected.filter((id) => pinnedIds.has(id))
-  const rank = ids.findIndex((id) => item.expected.includes(id)) + 1
+  const pinnedExpected = expected.filter((id) => pinnedIds.has(id))
+  const rank = ids.findIndex((id) => expected.includes(id)) + 1
   const hit = pinnedExpected.length > 0 || rank > 0
   if (pinnedExpected.length > 0) { recall1 += 1; recall3 += 1; reciprocal += 1 }
   else {
@@ -35,9 +61,9 @@ for (const item of cases.positives) {
   }
   const block = renderMemory(entries, { maxInjectChars: BUDGET, query: item.query })
   chars += block.length
-  const injected = pinnedExpected.length > 0 || item.expected.some((id) => block.includes(`(${id})`) || block.includes(` ${id} `));
+  const injected = pinnedExpected.length > 0 || expected.some((id) => block.includes(`(${id})`) || block.includes(` ${id} `));
   if (injected) injectedHit += 1
-  rows.push({ query: item.query, expected: item.expected, top3: ids, rank, pinnedExpected: pinnedExpected.length > 0, injected, chars: block.length });
+  rows.push({ query: item.query, expected, top3: ids, rank, pinnedExpected: pinnedExpected.length > 0, injected, chars: block.length });
 }
 
 let negativeInjected = 0
@@ -51,9 +77,10 @@ for (const query of cases.negatives) {
   negativeRows.push({ query, relevant, chars: block.length });
 }
 
-const total = cases.positives.length
+const total = rows.length
 const metrics = {
   positives: total,
+  retired,
   negatives: cases.negatives.length,
   recallAt1: +(recall1 / total).toFixed(3),
   recallAt3: +(recall3 / total).toFixed(3),
@@ -69,7 +96,7 @@ if (jsonOut) {
   process.exit(0)
 }
 
-console.log('记忆微基准（' + store.entries.length + ' 条存储 / ' + active.length + ' 条生效 / 预算 ' + BUDGET + '）')
+console.log('记忆微基准（' + store.entries.length + ' 条存储 / ' + active.length + ' 条生效 / 预算 ' + BUDGET + '）' + (retired > 0 ? ' —— 作废 ' + retired + ' 条（目标记忆已废弃）' : ''))
 console.log('')
 for (const row of rows) {
   const mark = row.rank > 0 || row.pinnedExpected ? '✅' : '❌'
