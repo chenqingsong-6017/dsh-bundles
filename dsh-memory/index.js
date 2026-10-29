@@ -390,6 +390,11 @@ export function renderMemory(allEntries, options) {
   const full = []
   const indexed = []
   const dropped = []
+  // v3.6 有效性硬门控：staleAfter 已过的条目降级为「只进索引、不给全文」。
+  // 依据 2026-10 的 Obsolete-Facts 论文：过时证据进了上下文反而拉低准确率（45%→32%）。
+  const todayStr = new Date().toISOString().slice(0, 10)
+  const isExpired = (entry) =>
+    typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < todayStr
 
   // 第一优先级：pinned 全文（硬规则永远在场；真装不下也要进诊断行，不静默消失）
   for (const entry of entries.filter((item) => item.pinned)) {
@@ -441,6 +446,7 @@ export function renderMemory(allEntries, options) {
       let spent = 0
       for (const item of ranked) {
         if (relevant.length >= MAX_RELEVANT) break
+        if (isExpired(item.entry)) continue
         if (relevant.length > 0 && item.composite * RELEVANT_COMPOSITE_MARGIN < topComposite) break
         const cost = lineRelevant(item.entry).length + 1
         if (spent + cost > cap) break
@@ -462,7 +468,18 @@ export function renderMemory(allEntries, options) {
     entry.scope !== currentScope &&
     entry.scope !== 'global'
   const compact = []
-  const ordered = [...rest].reverse()
+  // v3.6：索引层不再「新→旧」，改按 importance（含遗忘曲线衰减）+ recency 排序。
+  // 理由：预算装不下所有条目时，先被挤出去的应该是「旧且不重要」的，而不是「旧的」。
+  const nowForRank = Date.now()
+  const indexRank = (entry) =>
+    0.6 * (effectiveImportance(entry, nowForRank) / 10) + 0.4 * recencyOf(entry, nowForRank)
+  const orderIndex = new Map(rest.map((entry, position) => [entry.id, position]))
+  const ordered = [...rest].sort((a, b) => {
+    const diff = indexRank(b) - indexRank(a)
+    if (Math.abs(diff) > 0.05) return diff
+    // 同档时按写入顺序倒排（数组越靠后越新）——没有时间戳的老条目也有确定顺序。
+    return (orderIndex.get(b.id) ?? 0) - (orderIndex.get(a.id) ?? 0)
+  })
   for (const entry of ordered) {
     if (isCrossScope(entry)) continue
     const cost = lineIndex(entry).length + 1
@@ -486,22 +503,48 @@ export function renderMemory(allEntries, options) {
 
   // 诊断：被挤出预算的条目必须留痕（列出 id，不列正文），否则又是「悄悄丢」。
   const MAX_DIAGNOSTIC_IDS = 24
-  const ids = dropped.slice(0, MAX_DIAGNOSTIC_IDS).map((entry) => entry.id)
-  let groupText = ''
-  if (dropped.length > ids.length) {
-    const groups = new Map()
-    for (const entry of dropped) {
-      const key = entry.scope ?? (Array.isArray(entry.tags) && entry.tags[0]) ?? entry.tag ?? 'other'
-      groups.set(key, (groups.get(key) ?? 0) + 1)
+  const buildBlock = () => {
+    const ids = dropped.slice(0, MAX_DIAGNOSTIC_IDS).map((entry) => entry.id)
+    let groupText = ''
+    if (dropped.length > ids.length) {
+      const groups = new Map()
+      for (const entry of dropped) {
+        const key = entry.scope ?? (Array.isArray(entry.tags) && entry.tags[0]) ?? entry.tag ?? 'other'
+        groups.set(key, (groups.get(key) ?? 0) + 1)
+      }
+      const summary = [...groups.entries()].sort((a, b) => b[1] - a[1]).map(([key, count]) => `${key} ${count}`).join(' / ')
+      groupText = ` …（按 scope：${summary}）`
     }
-    const summary = [...groups.entries()].sort((a, b) => b[1] - a[1]).map(([key, count]) => `${key} ${count}`).join(' / ')
-    groupText = ` …（按 scope：${summary}）`
+    const diagnostic =
+      dropped.length > 0
+        ? `⚠ 另有 ${dropped.length} 条未注入：${ids.join(' ')}${groupText}（用 memory_search 按 id 或关键词取全文）`
+        : ''
+    const footer = `（全文 ${full.length}${relevant.length > 0 ? ` · 相关 ${relevant.length}` : ''} · 索引 ${indexed.length}${compact.length > 0 ? ` · 跨域 ${compact.length}` : ''}${dropped.length > 0 ? ` · 未注入 ${dropped.length}` : ''}；跨域或更早的记忆用 memory_search 按 id / 关键词取）`
+    const block = [
+      '<memory>',
+      MEMORY_HEADER,
+      ...(hasMarks ? [TRUST_LEGEND] : []),
+      ...full.map(lineFull),
+      ...relevant.map(lineRelevant),
+      ...indexed.map(lineIndex),
+      ...compact.map(lineIndexCompact),
+      ...(diagnostic ? [diagnostic] : []),
+      footer,
+      '</memory>',
+    ].join('\n')
+    return { block, footer }
   }
-  const diagnostic =
-    dropped.length > 0
-      ? `⚠ 另有 ${dropped.length} 条未注入：${ids.join(' ')}${groupText}（用 memory_search 按 id 或关键词取全文）`
-      : ''
-  const footer = `（全文 ${full.length}${relevant.length > 0 ? ` · 相关 ${relevant.length}` : ''} · 索引 ${indexed.length}${compact.length > 0 ? ` · 跨域 ${compact.length}` : ''}${dropped.length > 0 ? ` · 未注入 ${dropped.length}` : ''}；跨域或更早的记忆用 memory_search 按 id / 关键词取）`
+
+  // v3.6 预算自洽：头部只做了**预留**，页脚与诊断行是**动态**的，之前没算进 used ——
+  // 实测 1631 字符 / 预算 1500，「略超」其实一直超 131。做法：先按优先级分配，
+  // 再拿真实长度回削最低优先级（跨域 → 索引尾部），削到装得下为止。
+  let built = buildBlock()
+  for (let guard = 0; guard < entries.length + 8 && built.block.length > maxInjectChars; guard += 1) {
+    const sink = compact.length > 0 ? compact : indexed
+    if (sink.length === 0) break
+    dropped.push(sink.pop())
+    built = buildBlock()
+  }
 
   const statsOut = options?.stats
   if (statsOut !== undefined && statsOut !== null && typeof statsOut === 'object') {
@@ -512,18 +555,7 @@ export function renderMemory(allEntries, options) {
     statsOut.dropped = dropped.map((entry) => entry.id)
   }
 
-  return [
-    '<memory>',
-    MEMORY_HEADER,
-    ...(hasMarks ? [TRUST_LEGEND] : []),
-    ...full.map(lineFull),
-    ...relevant.map(lineRelevant),
-    ...indexed.map(lineIndex),
-    ...compact.map(lineIndexCompact),
-    ...(diagnostic ? [diagnostic] : []),
-    footer,
-    '</memory>',
-  ].join('\n')
+  return built.block
 }
 
 /** 分词：英文/数字按词，中文按 unigram + bigram（无空格语言只能这样切）。 */
@@ -718,6 +750,73 @@ export function apply(ctx, config) {
       ? Math.min(config.maxInjectChars, 32 * 1024)
       : DEFAULT_MAX_INJECT_CHARS
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
+  // v3.6：别名放**旁路文件**，不跟条目混存。
+  // 起因：运行中的旧版本在做 load→normalizeEntry 时不认识 aliases，一次 memory_update 落盘就把 32 条别名全洗掉了。
+  // 旁路文件对旧版本完全不可见，天然免疫这种「未知字段被丢弃」的破坏。
+  const aliasesFile = path.join(storeDir, 'aliases.json')
+  let aliasesSidecar = {}
+
+  function loadAliases() {
+    try {
+      const parsed = JSON.parse(readFileSync(aliasesFile, 'utf8'))
+      const map = parsed && typeof parsed === 'object' && parsed.aliases && typeof parsed.aliases === 'object' ? parsed.aliases : null
+      if (map === null) return
+      const clean = {}
+      for (const [id, list] of Object.entries(map)) {
+        if (!Array.isArray(list)) continue
+        const items = list.map((item) => (typeof item === 'string' ? item.trim() : '')).filter((item) => item !== '')
+        if (items.length > 0) clean[id] = items
+      }
+      aliasesSidecar = clean
+    } catch (error) {
+      // 没有旁路文件：从空开始，不影响记忆主体
+    }
+  }
+
+  function saveAliases() {
+    try {
+      mkdirSync(storeDir, { recursive: true })
+      const body = JSON.stringify(
+        {
+          version: 1,
+          note: '别名旁路文件：改这里不会动 memory.json；插件启动时按 id 合并进条目，用于检索的跨词面桥接。',
+          aliases: aliasesSidecar,
+        },
+        null,
+        2,
+      )
+      const temp = `${aliasesFile}.tmp`
+      writeFileSync(temp, body, 'utf8')
+      try {
+        renameSync(temp, aliasesFile)
+      } catch (error) {
+        writeFileSync(aliasesFile, body, 'utf8')
+      }
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
+  /** 把旁路别名合并进内存里的条目（条自带的 aliases 优先，旁路只补缺失）。 */
+  function applyAliases() {
+    for (const entry of state.entries) {
+      const fromSidecar = aliasesSidecar[entry.id]
+      if (!Array.isArray(fromSidecar) || fromSidecar.length === 0) continue
+      if (Array.isArray(entry.aliases) && entry.aliases.length > 0) continue
+      entry.aliases = fromSidecar
+    }
+  }
+
+  /** 落盘后把内存里的 aliases 同步回旁路文件（唯一真相源 = 条目；旁路只是防丢副本）。 */
+  function syncAliases() {
+    const next = {}
+    for (const entry of state.entries) {
+      if (Array.isArray(entry.aliases) && entry.aliases.length > 0) next[entry.id] = entry.aliases
+    }
+    aliasesSidecar = next
+    saveAliases()
+  }
   const tools = ctx.tools
   const scopeRoots =
     config?.scopeRoots !== undefined && config.scopeRoots !== null && typeof config.scopeRoots === 'object'
@@ -827,6 +926,7 @@ export function apply(ctx, config) {
       } catch (error) {
         writeFileSync(storeFile, body, 'utf8')
       }
+      syncAliases()
       return true
     } catch (error) {
       return false
@@ -866,6 +966,8 @@ export function apply(ctx, config) {
   }
 
   load()
+  loadAliases()
+  applyAliases()
   loadCandidates()
 
   // v2.9：候选池 TTL——过期未确认的自动标记 expired（保留记录，不删）。

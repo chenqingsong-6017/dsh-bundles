@@ -55,7 +55,9 @@ const bulk = Array.from({ length: 12 }, (_, i) => ({
   text: `记忆条目内容 ${i} ${'填充'.repeat(12)}`,
 }))
 
-const layered = renderMemory([...bulk, pinnedEntry], { maxInjectChars: 260 })
+// v3.6 起预算把页脚与诊断行也算进去（之前「略超」其实是超），所以这里给足以放下索引行的预算
+const layered = renderMemory([...bulk, pinnedEntry], { maxInjectChars: 420 })
+assert.ok(layered.length <= 420, `v3.6 预算自洽：总长 ${layered.length} 不应超过 420`)
 assert.ok(layered.includes('PINNED-HARD-RULE'), 'pinned 条目必须全文注入')
 assert.ok(layered.includes('📌'), 'pinned 条目带置顶标记')
 ok('分层注入：pinned 优先全文')
@@ -864,6 +866,43 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const block = renderMemory(entries, { maxInjectChars: 1500, query: 'MySQL 索引优化怎么做' })
   assert.equal(Number((block.match(/相关 (\d+)/) ?? [])[1] ?? 0), 0, '无关问题被注入了全文')
   ok('v3.5 相关性门槛用严格分：别名不能把无关问题抬过门槛')
+}
+
+// ---- v3.6 注入预算自洽 + 三因子索引 + 过期硬降级 ----
+{
+  // 1) 预算自洽：页脚/诊断行也计入预算，总长必须装得下（给足头部的预算区间）
+  const many = Array.from({ length: 20 }, (_, i) => ({ id: `e${i}`, text: `条目 ${i} ${'填充'.repeat(8)}` }))
+  for (const budget of [600, 900, 1500]) {
+    const block = renderMemory(many, { maxInjectChars: budget })
+    assert.ok(block.length <= budget, `预算 ${budget} 实际 ${block.length}，超了`)
+  }
+  ok('v3.6 预算自洽：页脚与诊断行计入预算，总长不超过 maxInjectChars')
+}
+
+{
+  // 2) 索引层按三因子排序：重要度高、更近的优先占索引位（旧的但重要不该先被挤掉）
+  const low = { id: 'l1', text: '低重要条目 填充填充', importance: 1, addedAt: '2026-10-28T00:00:00Z' }
+  const high = { id: 'h1', text: '高重要条目 填充填充', importance: 10, addedAt: '2026-10-28T00:00:00Z' }
+  const stats = {}
+  renderMemory([low, high], { maxInjectChars: 900, stats })
+  const posHigh = stats.indexed.indexOf('h1')
+  const posLow = stats.indexed.indexOf('l1')
+  assert.ok(posHigh >= 0, '高重要条目应进索引')
+  if (posLow >= 0) assert.ok(posHigh < posLow, '高重要条目应排在低重要之前')
+  ok('v3.6 索引层三因子排序：重要度高的优先占索引位')
+}
+
+{
+  // 3) 过期硬降级：staleAfter 已过的条目即使 query 命中也不给全文（只进索引并带 ⏰）
+  const expired = { id: 'x1', text: '过期的旧事实 关于部署地址', staleAfter: '2020-01-01' }
+  const fresh = { id: 'x2', text: '新鲜的部署事实 关于部署地址' }
+  const stats = {}
+  const block = renderMemory([expired, fresh], { maxInjectChars: 1200, query: '部署地址', stats })
+  assert.ok(!stats.full.includes('x1'), '过期条目不应给全文')
+  assert.ok(!stats.relevant.includes('x1'), '过期条目不应进相关层')
+  assert.ok(stats.indexed.includes('x1') || stats.dropped.includes('x1'), '过期条目应降级到索引或未注入')
+  assert.ok(block.includes('⏰'), '过期条目应带「待重验」标记')
+  ok('v3.6 过期条目硬降级：命中也不给全文，只留索引与待重验标记')
 }
 
 console.log(`memory: ${passed} 项通过`)
