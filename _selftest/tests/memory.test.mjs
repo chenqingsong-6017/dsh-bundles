@@ -21,6 +21,7 @@ import {
   deriveStaleAfter,
   effectiveImportance,
   applicableAt,
+  suggestAliases,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -903,6 +904,51 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(stats.indexed.includes('x1') || stats.dropped.includes('x1'), '过期条目应降级到索引或未注入')
   assert.ok(block.includes('⏰'), '过期条目应带「待重验」标记')
   ok('v3.6 过期条目硬降级：命中也不给全文，只留索引与待重验标记')
+}
+
+// ---- v3.7 写入侧闭环：别名候选提示 + 合并继承 ----
+{
+  const tips = suggestAliases('用户要求插件更新后必须重启 DSH 才生效，这条要记住')
+  assert.ok(tips.length >= 2 && tips.length <= 4, `候选数应在 2-4，实际 ${tips.length}`)
+  assert.ok(tips.every((term) => term.length >= 2), '候选不应有单字')
+  assert.deepEqual(suggestAliases(''), [])
+  ok('v3.7 suggestAliases：给 2-4 个内容词候选，无单字')
+}
+
+{
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-alias-hint-'))
+  const h = host(tmp)
+  const bare = await h.defs.get('memory_add').execute({ text: '插件更新后要重启才生效' })
+  assert.ok(bare.aliasHint !== undefined, '没写别名时应返回 aliasHint')
+  assert.ok(bare.aliasHint.suggestion.length > 0, 'aliasHint 应给候选词')
+  const withAlias = await h.defs.get('memory_add').execute({ text: '重启才会换模块代际', aliases: ['重载', '生效'] })
+  assert.equal(withAlias.aliasHint, undefined, '写了别名就不该再提示')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.7 memory_add：缺别名时给候选提示，已带别名则不提示')
+}
+
+{
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-merge-alias-'))
+  const h = host(tmp)
+  const a = await h.defs.get('memory_add').execute({ text: '第一条关于部署的说法', aliases: ['上线', 'deploy'] })
+  const b = await h.defs.get('memory_add').execute({ text: '第二条关于部署的说法', aliases: ['发布', 'deploy'] })
+  const merged = await h.defs.get('memory_merge').execute({ ids: [a.entry.id, b.entry.id] })
+  assert.deepEqual([...merged.entry.aliases].sort(), ['deploy', '上线', '发布'].sort(), '合并应取并集')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.7 memory_merge：合并继承别名（取并集），桥不会随合并变稀')
+}
+
+{
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-audit-alias-'))
+  const h = host(tmp)
+  await h.defs.get('memory_add').execute({ text: '有别名的一条', aliases: ['同义'] })
+  await h.defs.get('memory_add').execute({ text: '没别名的一条' })
+  const audit = await h.defs.get('memory_audit').execute({})
+  assert.equal(audit.aliases.withAliases, 1)
+  assert.equal(audit.aliases.missing, 1)
+  assert.equal(audit.aliases.missingIds.length, 1)
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.7 memory_audit：别名覆盖率可见（有/缺/缺的 id）')
 }
 
 console.log(`memory: ${passed} 项通过`)

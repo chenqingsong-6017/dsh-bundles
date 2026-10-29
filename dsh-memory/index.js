@@ -571,6 +571,40 @@ export function tokenize(input) {
   return terms
 }
 
+/**
+ * 别名候选：从文本里挑 2–4 个「内容词」当**提示**，让人/agent 围绕它们补同义、缩写、中英对照。
+ * 注意：它只给候选，不自动写别名 —— 自动写的同义词会污染相关性门槛（v3.5 的教训）。
+ */
+const ALIAS_STOP = new Set([
+  '今天', '现在', '这个', '那个', '我们', '你们', '他们', '可以', '需要', '一个', '什么', '怎么',
+  '如果', '因为', '所以', '但是', '而且', '还是', '就是', '不是', '没有', '已经', '一直', '这些',
+  '那些', '时候', '地方', '问题', '东西', '事情', '使用', '进行', '通过', '以及', '等等', '一下',
+  '一点', '比较', '非常', '真的', '其实', '然后', '之后', '之前', '起来', '出来', '过来', '同时',
+])
+
+export function suggestAliases(text, limit = 4) {
+  const counts = tokenize(text)
+  const scored = []
+  for (const [term, count] of counts) {
+    if (term.length < 2) continue
+    if (ALIAS_STOP.has(term)) continue
+    const isLatin = /^[a-z0-9]/.test(term)
+    // 中文只取 bigram（更长的是跨词拼接，质量差）；英文/代码词整词保留
+    if (!isLatin && term.length !== 2) continue
+    scored.push({ term, score: (isLatin ? 2 : 1) + count })
+  }
+  scored.sort((a, b) => b.score - a.score || a.term.localeCompare(b.term))
+  const seen = new Set()
+  const out = []
+  for (const item of scored) {
+    if (seen.has(item.term)) continue
+    seen.add(item.term)
+    out.push(item.term)
+    if (out.length >= limit) break
+  }
+  return out
+}
+
 const BM25_K1 = 1.2
 const BM25_B = 0.75
 const BM25_TAG_WEIGHT = 2
@@ -1371,6 +1405,15 @@ export function apply(ctx, config) {
             deduped: { type: 'boolean' },
             usedChars: { type: 'integer' },
             maxBytes: { type: 'integer' },
+            aliasHint: {
+              type: 'object',
+              properties: {
+                suggestion: { type: 'array', items: { type: 'string' } },
+                tip: { type: 'string' },
+              },
+              required: ['suggestion', 'tip'],
+              additionalProperties: false,
+            },
             similar: {
               type: 'array',
               items: {
@@ -1398,7 +1441,12 @@ export function apply(ctx, config) {
                   .map((item) => `  - ${item.id}（相似 ${Math.round(item.similarity * 100) / 100}）${item.text.slice(0, 60)}`)
                   .join('\n')}`
               : ''
-          return [text(`${head}\n${entry?.text ?? ''}\n（占用 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，下一条模型请求起生效）${hint}`)]
+          const aliasHint = value?.aliasHint
+          const aliasLine =
+            aliasHint && Array.isArray(aliasHint.suggestion) && aliasHint.suggestion.length > 0
+              ? `\n💡 没写别名：${aliasHint.suggestion.join('、')}（围绕这些词补 3–5 个同义/缩写/中英对照，用 memory_update {id:"${entry?.id}", aliases:[...]}；别名是「用户换种说法时」的召回桥）`
+              : ''
+          return [text(`${head}\n${entry?.text ?? ''}\n（占用 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，下一条模型请求起生效）${hint}${aliasLine}`)]
         },
       },
       async execute(args) {
@@ -1492,6 +1540,14 @@ export function apply(ctx, config) {
                 })),
               }
             : {}),
+          ...(Array.isArray(entry.aliases) && entry.aliases.length > 0
+            ? {}
+            : {
+                aliasHint: {
+                  suggestion: suggestAliases(entry.text),
+                  tip: '别名是检索的跨词面桥：用户换一种说法时靠它召回。建议用 memory_update {id, aliases:[同义/缩写/中英对照 3-5 个]} 补上。',
+                },
+              }),
         }
       },
     }),
@@ -1580,6 +1636,7 @@ export function apply(ctx, config) {
             ...(entry.pinned ? { pinned: true } : {}),
             ...(typeof entry.migratedFrom === 'string' ? { migratedFrom: entry.migratedFrom } : {}),
             ...(Array.isArray(entry.sources) ? { sources: entry.sources } : {}),
+            ...(Array.isArray(entry.aliases) ? { aliases: entry.aliases } : {}),
             addedAt: now,
             updatedAt: now,
           })
@@ -1737,9 +1794,12 @@ export function apply(ctx, config) {
           throw new Error(`合并后超预算（上限 ${maxBytes} 字符）。请先精简或删掉别的条目。`)
         }
         const now = new Date().toISOString()
+        // 别名继承：合并时把各来源的别名并起来，否则每合并一次「桥」就淡一次（v3.6 发现的稀疏化根因）。
+        const unionAliases = [...new Set(sources.flatMap((item) => (Array.isArray(item.aliases) ? item.aliases : [])))]
         const merged = normalizeEntry({
           id: `m${state.nextId}`,
           text: mergedText,
+          ...(unionAliases.length > 0 ? { aliases: unionAliases } : {}),
           ...(typeof args?.tag === 'string' && args.tag.trim() !== '' ? { tag: args.tag.trim() } : first.tag ? { tag: first.tag } : {}),
           ...(Array.isArray(args?.tags) ? { tags: args.tags } : Array.isArray(first.tags) ? { tags: first.tags } : {}),
           ...(typeof args?.scope === 'string' && args.scope.trim() !== '' ? { scope: args.scope.trim() } : typeof first.scope === 'string' ? { scope: first.scope } : {}),
@@ -1830,8 +1890,18 @@ export function apply(ctx, config) {
               required: ['usedChars', 'maxBytes', 'injectedChars'],
               additionalProperties: false,
             },
+            aliases: {
+              type: 'object',
+              properties: {
+                withAliases: { type: 'integer' },
+                missing: { type: 'integer' },
+                missingIds: { type: 'array', items: { type: 'string' } },
+              },
+              required: ['withAliases', 'missing', 'missingIds'],
+              additionalProperties: false,
+            },
           },
-          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'duplicates', 'stale', 'mostUsed', 'budget'],
+          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -1845,6 +1915,7 @@ export function apply(ctx, config) {
             `重复候选 ${duplicates.length} 组：${duplicates.map((item) => `${item.ids.join('~')}(${item.similarity})`).join(' ') || '无'}`,
             `过期候选 ${stale.length} 条：${stale.map((item) => `${item.id}(${item.days}天)`).join(' ') || '无'}`,
             `信任状态：未证实 ${value?.draft ?? 0} 条 / 过期待重验 ${value?.recheck ?? 0} 条`,
+            `别名覆盖：${value?.aliases?.withAliases ?? 0} 条有 / ${value?.aliases?.missing ?? 0} 条缺${(value?.aliases?.missingIds ?? []).length > 0 ? ' —— ' + value.aliases.missingIds.join(' ') : ''}（缺别名的条目在换皮问法下召回不到，用 memory_update 补）`,
             `（未证实条目在注入时带 ❓，过期待重验带 ⏰；复核后用 memory_update verified:true 清除标记）`,
             `最常用：${mostUsed.map((item) => `${item.id}×${item.usedCount}`).join(' ') || '（还没有使用记录）'}`,
           ]
@@ -1914,6 +1985,17 @@ export function apply(ctx, config) {
             (entry) => typeof entry.staleAfter === 'string' && entry.staleAfter < new Date().toISOString().slice(0, 10),
           ).length,
           byScope,
+          // v3.7：别名缺口要可见。索引层排序/检索都在用别名，没别名 = 换皮问法召回不到，
+          // 但不能因此拒绝写入（会把正常记忆写入卡死），所以只统计 + 在 memory_add 返回候选。
+          aliases: (() => {
+            const withAliases = active.filter((entry) => Array.isArray(entry.aliases) && entry.aliases.length > 0)
+            const missing = active.filter((entry) => !(Array.isArray(entry.aliases) && entry.aliases.length > 0))
+            return {
+              withAliases: withAliases.length,
+              missing: missing.length,
+              missingIds: missing.slice(0, limit).map((entry) => entry.id),
+            }
+          })(),
           duplicates: duplicates.slice(0, limit),
           stale: stale.slice(0, limit),
           mostUsed,
