@@ -40,6 +40,8 @@ function resolveExpected(id) {
 
 const rows = []
 let recall1 = 0, recall3 = 0, reciprocal = 0, injectedHit = 0, chars = 0
+// v3.8：注入覆盖分不清「给了全文」和「索引行里露个 id」，单列一个全文相关指标，避免门槛收紧时被索引行掩盖。
+let fullTextHit = 0
 let retired = 0
 for (const item of cases.positives) {
   const expected = [...new Set(item.expected.map(resolveExpected).filter(Boolean))]
@@ -59,11 +61,15 @@ for (const item of cases.positives) {
     if (rank === 1) recall1 += 1
     if (rank > 0) { recall3 += 1; reciprocal += 1 / rank }
   }
-  const block = renderMemory(entries, { maxInjectChars: BUDGET, query: item.query })
+  const stats = {}
+  const block = renderMemory(entries, { maxInjectChars: BUDGET, query: item.query, stats })
   chars += block.length
   const injected = pinnedExpected.length > 0 || expected.some((id) => block.includes(`(${id})`) || block.includes(` ${id} `));
   if (injected) injectedHit += 1
-  rows.push({ query: item.query, expected, top3: ids, rank, pinnedExpected: pinnedExpected.length > 0, injected, chars: block.length });
+  // 「相关层」= 插件判定相关并给全文的那批；索引行不算。
+  const fullText = pinnedExpected.length > 0 || (Array.isArray(stats.relevant) && stats.relevant.some((id) => expected.includes(id)))
+  if (fullText) fullTextHit += 1
+  rows.push({ query: item.query, expected, top3: ids, rank, pinnedExpected: pinnedExpected.length > 0, injected, fullText, chars: block.length });
 }
 
 let negativeInjected = 0
@@ -86,6 +92,7 @@ const metrics = {
   recallAt3: +(recall3 / total).toFixed(3),
   mrr: +(reciprocal / total).toFixed(3),
   injectedCoverage: +(injectedHit / total).toFixed(3),
+  fullTextRelevance: +(fullTextHit / total).toFixed(3),
   negativeInjectionRate: +(negativeInjected / cases.negatives.length).toFixed(3),
   avgInjectedChars: Math.round(chars / total),
   budget: BUDGET,
@@ -100,7 +107,7 @@ console.log('记忆微基准（' + store.entries.length + ' 条存储 / ' + acti
 console.log('')
 for (const row of rows) {
   const mark = row.rank > 0 || row.pinnedExpected ? '✅' : '❌'
-  console.log(`${mark} ${row.query.padEnd(26)} top3=${(row.top3.join(',') || '-').padEnd(14)} rank=${row.rank || (row.pinnedExpected ? 'P' : '-')} 注入=${row.injected ? 'Y' : 'N'} ${row.chars}字`)
+  console.log(`${mark} ${row.query.padEnd(26)} top3=${(row.top3.join(',') || '-').padEnd(14)} rank=${row.rank || (row.pinnedExpected ? 'P' : '-')} 注入=${row.injected ? 'Y' : 'N'} 全文=${row.fullText ? 'Y' : 'N'} ${row.chars}字`)
 }
 console.log('')
 for (const row of negativeRows) {
@@ -109,4 +116,4 @@ for (const row of negativeRows) {
 }
 console.log('')
 console.log(`recall@1 ${(metrics.recallAt1 * 100).toFixed(1)}% | recall@3 ${(metrics.recallAt3 * 100).toFixed(1)}% | MRR ${metrics.mrr}`)
-console.log(`注入覆盖 ${(metrics.injectedCoverage * 100).toFixed(1)}% | 负例误注入 ${(metrics.negativeInjectionRate * 100).toFixed(1)}% | 平均 ${metrics.avgInjectedChars} 字符`)
+console.log(`注入覆盖 ${(metrics.injectedCoverage * 100).toFixed(1)}%（含索引行） | 全文相关 ${(metrics.fullTextRelevance * 100).toFixed(1)}% | 负例误注入 ${(metrics.negativeInjectionRate * 100).toFixed(1)}% | 平均 ${metrics.avgInjectedChars} 字符`)

@@ -22,6 +22,9 @@ import {
   effectiveImportance,
   applicableAt,
   suggestAliases,
+  contentUnitsOf,
+  relevanceCoverage,
+  queryIdfSum,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -949,6 +952,58 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(audit.aliases.missingIds.length, 1)
   rmSync(tmp, { recursive: true, force: true })
   ok('v3.7 memory_audit：别名覆盖率可见（有/缺/缺的 id）')
+}
+
+// ---- v3.8 相关性门槛：只数内容单元（治片段三重计数 / 虚词算分）----
+{
+  assert.deepEqual(contentUnitsOf('的是'), [], '两个虚词拼的 bigram 不该算内容单元')
+  assert.deepEqual(contentUnitsOf('会议'), ['会议'], '含一个虚词字的真词要保留')
+  const units = contentUnitsOf('推荐一部好看的电影')
+  assert.ok(units.includes('推荐'), '应保留内容 bigram')
+  assert.ok(!units.some((unit) => unit.length === 1), '中文不再出 unigram（片段是三重计数的根）')
+  assert.deepEqual(contentUnitsOf('dsh-memory v3.7 别名').filter((unit) => /[a-z]/.test(unit)), ['dsh-memory', 'v3.7'])
+  ok('v3.8 contentUnitsOf：拉丁整词 + 中文 bigram，丢虚词 bigram 与单字片段')
+}
+
+{
+  // 回归：一条含「推荐」的记忆会把「推荐一部好看的电影」送过旧门槛（实测真实库里 0.169、注入 1475 字符）。
+  const fillers = Array.from({ length: 8 }, (_, i) => ({ id: `z${i}`, text: `填充条目${i} 关于磁盘清理与服务自启的杂项记录` }))
+  const corpus = [...fillers, { id: 'poison', text: '已推荐未批准', tags: ['handover'] }]
+  const query = '推荐一部好看的电影'
+  const idfTotal = queryIdfSum(corpus, query)
+  const oldTop = scoreEntriesStrict(corpus, query).sort((a, b) => b.score - a.score)[0]
+  const oldCoverage = idfTotal > 0 ? oldTop.score / idfTotal : 0
+  const now = relevanceCoverage(corpus, query)
+  assert.ok(oldCoverage >= 0.15, `旧口径应误判过门，实际 ${oldCoverage.toFixed(3)}`)
+  assert.ok(now.coverage < 0.16, `新口径不该过门，实际 ${now.coverage.toFixed(3)}`)
+  assert.deepEqual(now.matchedUnits, ['推荐'])
+  assert.equal(now.topId, 'poison')
+  ok('v3.8 相关性门槛：一个「推荐」不再把「推荐一部好看的电影」送过门槛')
+}
+
+{
+  // 反向：真的在讲同一件事的换皮问法，必须仍然过门（收紧门槛不能把召回一起砍掉）。
+  const fillers = Array.from({ length: 8 }, (_, i) => ({ id: `y${i}`, text: `填充条目${i} 关于磁盘清理与服务自启的杂项记录` }))
+  const corpus = [...fillers, { id: 'plug', text: '插件更新后必须重启 DSH 才会换模块代际', tags: ['plugin'] }]
+  const now = relevanceCoverage(corpus, '插件更新后要重启吗')
+  assert.equal(now.topId, 'plug')
+  assert.ok(now.coverage >= 0.16, `真相关应过门，实际 ${now.coverage.toFixed(3)}`)
+  ok('v3.8 相关性门槛：换皮但真相关的问法仍进相关层')
+}
+
+{
+  // 端到端：渲染层的「相关 N」必须跟门槛一致（负例 0 条、正例 1 条）。
+  const fillers = Array.from({ length: 8 }, (_, i) => ({ id: `w${i}`, text: `填充条目${i} 关于磁盘清理与服务自启的杂项记录` }))
+  const store = [...fillers, { id: 'poison', text: '已推荐未批准', tags: ['handover'] }, { id: 'plug', text: '插件更新后必须重启 DSH 才会换模块代际', tags: ['plugin'] }]
+  const negStats = {}
+  const negBlock = renderMemory(store, { maxInjectChars: 1200, query: '推荐一部好看的电影', stats: negStats })
+  assert.deepEqual(negStats.relevant, [], '负例不该进相关层')
+  assert.ok(!/相关 \d/.test(negBlock), '负例不该出现「相关 N」字样')
+  assert.ok(negStats.relevanceCoverage < 0.16, '诊断字段应记录本轮覆盖率')
+  const posStats = {}
+  renderMemory(store, { maxInjectChars: 1200, query: '插件更新后要重启吗', stats: posStats })
+  assert.deepEqual(posStats.relevant, ['plug'])
+  ok('v3.8 renderMemory：门槛与「相关 N」口径一致，stats 带覆盖率便于排查')
 }
 
 console.log(`memory: ${passed} 项通过`)

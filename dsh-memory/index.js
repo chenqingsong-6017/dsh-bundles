@@ -42,8 +42,11 @@ const MAX_RELEVANT = 2
 const RELEVANT_CONFIDENCE = 1.5
 const MAX_QUERY_CHARS = 400
 const SCOPE_BOOST = 1.4
-// v2.3 检索：相关性覆盖率下限（score / 查询 idf 总和，语料规模无关）+ 三因子加权（Generative Agents 思路）
-const RELEVANCE_FLOOR = 0.15
+// v2.3 检索：相关性覆盖率下限（命中内容单元的信息量 ÷ 查询内容单元的信息量，与语料规模无关）
+// + 三因子加权（Generative Agents 思路）。
+// v3.8：0.15 → 0.16。口径换了（见 relevanceCoverage），阈值按实测重定：
+//   21 条负例里最高的「电脑为什么会蓝屏」= 0.147，换皮正例里最低的保住全文的是 0.161，0.16 落在缝里。
+const RELEVANCE_FLOOR = 0.16
 const COMPOSITE_IMPORTANCE_WEIGHT = 0.5
 const COMPOSITE_RECENCY_WEIGHT = 0.3
 const RELEVANT_COMPOSITE_MARGIN = 1.15
@@ -145,7 +148,10 @@ export function effectiveImportance(entry, now = Date.now()) {
 
 const idfOf = (total, hit) => Math.log(1 + (total - hit + 0.5) / (hit + 0.5))
 
-/** 查询词的 idf 总和：作为「相关覆盖率」的分母，使下限阈值与语料规模无关（小库/大库同一把尺）。 */
+/**
+ * 查询词的 idf 总和：v2.3–v3.7 的「相关覆盖率」分母（含 unigram，片段会三重计数）。
+ * v3.8 起门槛不再用它（改用 relevanceCoverage 的内容单元口径），保留给旧测试与对照分析。
+ */
 export function queryIdfSum(entries, query) {
   const docs = (Array.isArray(entries) ? entries : []).map((entry) =>
     tokenize(`${entry.text} ${Array.isArray(entry.tags) ? entry.tags.join(' ') : entry.tag ?? ''}`),
@@ -410,6 +416,8 @@ export function renderMemory(allEntries, options) {
   // 第二优先级：本轮相关（有 query 时）。相关条目给**全文**——多花 3 倍字符，但省掉一次工具调用，
   // 正好覆盖「相关却没进索引」的那批（v1.1 实测有 10 条完全不可见）。
   const relevant = []
+  // v3.8 诊断：把本轮的覆盖率塞进 stats，出问题时一眼能看出是「没匹配上」还是「匹配上但没过门」。
+  let relevanceSeen = 0
   const queryText = typeof options?.query === 'string' ? options.query.trim() : ''
   const currentScope = typeof options?.scope === 'string' ? options.scope : ''
   if (queryText !== '') {
@@ -422,13 +430,13 @@ export function renderMemory(allEntries, options) {
       .sort((a, b) => b.raw - a.raw)
     const floor = Number.isFinite(options?.relevanceFloor) ? options.relevanceFloor : RELEVANCE_FLOOR
     const topRaw = scored.length > 0 ? scored[0].raw : 0
-    // 覆盖率门：top 分数 ÷ 查询 idf 总和。语料无关，弱匹配宁可一条都不给全文（治负例误注入）。
-    // ⚠ 分子的 topRaw 必须用**严格分**（不含 alias 加权 / 同义扩展）：
+    // 覆盖率门：弱匹配宁可一条都不给全文（治负例误注入）。语料无关，阈值不随库大小漂。
+    // ⚠ 分子分母都不用带 alias 加权 / 同义扩展的分数：
     //   否则「帮我写个 Python 快排」这类无关问题会被同义词抬过门槛 —— 2026-10-29 实测负例误注入 0%→75%。
-    const strictScored = scoreEntriesStrict(entries.filter((item) => !item.pinned), queryText)
-    const strictTop = strictScored.reduce((max, item) => (item.score > max ? item.score : max), 0)
-    const idfTotal = queryIdfSum(entries.filter((item) => !item.pinned), queryText)
-    const coverage = idfTotal > 0 ? strictTop / idfTotal : 0
+    // v3.8：改数「内容单元」（relevanceCoverage），治片段三重计数与虚词算分 ——
+    //   旧算法下一个「推荐」就能把一个无关问题送过 0.15（实测 0.169），见 relevanceCoverage 的注释。
+    const { coverage } = relevanceCoverage(entries.filter((item) => !item.pinned), queryText)
+    relevanceSeen = coverage
     if (coverage >= floor) {
       const now = Date.now()
       const ranked = scored
@@ -551,6 +559,7 @@ export function renderMemory(allEntries, options) {
     statsOut.full = full.map((entry) => entry.id)
     statsOut.relevant = relevant.map((entry) => entry.id)
     statsOut.indexed = indexed.map((entry) => entry.id)
+    statsOut.relevanceCoverage = Number(relevanceSeen.toFixed(4))
     statsOut.compact = compact.map((entry) => entry.id)
     statsOut.dropped = dropped.map((entry) => entry.id)
   }
@@ -698,6 +707,7 @@ export function scoreEntries(entries, query) {
 
 /**
  * 严格打分：只用原查询词，**不加** alias 权重、**不做**同义扩展。
+ * v3.8 起**相关性门槛不再用它**（改用 relevanceCoverage 的内容单元口径）；保留给排序对照与单测。
  * 用途：判「这句话跟这条记忆到底相不相关」——扩展词可以帮排序，但绝不能帮它越过相关性门槛，
  * 否则负例（无关问题）会因为同义词被误判相关并注入全文。
  */
@@ -730,6 +740,100 @@ export function scoreEntriesStrict(entries, query) {
     }
     return { entry: doc.entry, score }
   })
+}
+
+/**
+ * v3.8 内容单元：判断「这句话跟这条记忆有没有共同主题」时，只数真正的信息词。
+ *
+ * 两条修正，都是 2026-10-29 实测踩出来的：
+ *
+ * 1) **片段不再三重计数**。以前 tokenize 会给中文同时出 unigram 和 bigram，命中「推荐」这一处，
+ *    分子里算 推 + 荐 + 推荐 三次。一条含「已推荐未批准」的交接记忆，让「推荐一部好看的电影」
+ *    的覆盖率从 0.036 直接抬到 0.169，越过 0.15 门槛、注入 1475 字符。
+ *
+ * 2) **虚词不算分**。的/一/是/我 这类字跟主题无关，两个虚词拼成的 bigram（「的是」「一个」）也无关；
+ *    实测在同一个负例里，虚词贡献了分子 27% 的分数（一 1.52 + 的 1.15 / 合计 9.83）。
+ *
+ * 拉丁词/数字仍是整词（长度 ≥2），中文单字 run 只有在它不是虚词时才保留。
+ */
+const CJK_STOP_CHARS = new Set(
+  [...'的了是在不有和就都也我你他她它这那什么怎么吗呢吧啊哦个上下中之与及或等很更最太再还被把给让从到对为以所而且但如因为所以一二三四五六七八九十每各某多没要会可才又已经并'],
+)
+
+export function contentUnitsOf(input) {
+  const value = String(input ?? '').toLowerCase()
+  const units = []
+  for (const word of value.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) units.push(word)
+  for (const run of value.match(/[\u4e00-\u9fff]+/g) ?? []) {
+    if (run.length === 1) {
+      if (!CJK_STOP_CHARS.has(run)) units.push(run)
+      continue
+    }
+    for (let index = 0; index + 2 <= run.length; index += 1) {
+      const bigram = run.slice(index, index + 2)
+      // 两个都是虚词才丢：保住「会议」「不是」这类含虚词字的真词。
+      if (CJK_STOP_CHARS.has(bigram[0]) && CJK_STOP_CHARS.has(bigram[1])) continue
+      units.push(bigram)
+    }
+  }
+  return units
+}
+
+/**
+ * 相关性覆盖率 = 最相关那条记忆覆盖了多少查询的「信息量」。
+ *
+ * 分母：查询全部内容单元的 idf 之和（含语料里没出现的词，按最大 idf 计）—— 一句话里
+ *   只有一小部分词能对上时，覆盖率自然低，跟语料规模无关。
+ * 分子：单条记忆命中的那些内容单元的 idf 之和，带 BM25 的 tf 饱和与长度归一
+ *   （否则短条目靠长度优势虚高：一句话的记忆只要含一个稀罕词就能独占鳌头）。
+ *
+ * 判据是 v2.3 的 RELEVANCE_FLOOR；v3.8 换的是算法，不是阈值。
+ */
+export function relevanceCoverage(entries, query) {
+  const list = Array.isArray(entries) ? entries : []
+  const docs = list.map((entry) => {
+    const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
+    const terms = new Map()
+    let length = 0
+    for (const unit of contentUnitsOf(`${entry.text ?? ''} ${tagText}`)) {
+      terms.set(unit, (terms.get(unit) ?? 0) + 1)
+      length += 1
+    }
+    return { entry, terms, length }
+  })
+  const queryUnits = [...new Set(contentUnitsOf(query))]
+  if (docs.length === 0 || queryUnits.length === 0) return { coverage: 0, topId: null, matchedUnits: [] }
+  let totalLength = 0
+  for (const doc of docs) totalLength += doc.length
+  const avgLength = totalLength / docs.length || 1
+  const df = new Map()
+  let denominator = 0
+  for (const unit of queryUnits) {
+    const hit = docs.filter((doc) => doc.terms.has(unit)).length
+    df.set(unit, hit)
+    denominator += idfOf(docs.length, hit)
+  }
+  let best = 0
+  let topId = null
+  let matchedUnits = []
+  for (const doc of docs) {
+    let score = 0
+    const matched = []
+    for (const unit of queryUnits) {
+      const frequency = doc.terms.get(unit) ?? 0
+      if (frequency === 0) continue
+      matched.push(unit)
+      score +=
+        idfOf(docs.length, df.get(unit)) *
+        ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgLength)))
+    }
+    if (score > best) {
+      best = score
+      topId = doc.entry.id
+      matchedUnits = matched
+    }
+  }
+  return { coverage: denominator > 0 ? best / denominator : 0, topId, matchedUnits }
 }
 
 /** 单条打分（兼容旧签名）；传 options.entries 就能用上跨条目的 IDF。 */
