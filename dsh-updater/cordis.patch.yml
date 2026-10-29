@@ -1,0 +1,29 @@
+# dsh-updater bundle patch.
+#
+# 数据一律落 D 盘。storeDir 里存三样东西：
+#   sources.json   每个插件的更新源登记（repo / ref / 本地目录 / 已应用提交）
+#   backups\<名字>\ 每次 apply 之前的整目录备份，回滚用
+#   staging\       克隆暂存区，用完即清
+#   learn\         从 GitHub 克隆下来的学习用源码副本
+#
+# allowedRoots 是硬闸门：updater_apply / updater_rollback 只允许写这些根目录下的
+# 已登记 localDir，绝不允许写到 profile、DSH_HOME 或系统目录。
+#
+# 想改配置就在 profile 的 cordis.patch.yml 里覆盖：
+#
+#   - id: updater
+#     name: "@local/dsh-updater"
+#     config:
+#       storeDir: 'D:\AI\dsh-data\updater'
+#       allowedRoots: ['D:\AI\dsh-bundles', 'D:\AI\my-plugins']
+#       backupsToKeep: 5
+#       gitTimeoutMs: 120000
+- insert:
+    - id: updater
+      name: '@local/dsh-updater'
+      config:
+        storeDir: 'D:\AI\dsh-data\updater'
+        allowedRoots:
+          - 'D:\AI\dsh-bundles'
+        backupsToKeep: 5
+        gitTimeoutMs: 120000

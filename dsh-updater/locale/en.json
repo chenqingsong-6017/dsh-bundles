@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plugin Updater",
+    "description": "Track upstream commits for local plugins with git: check, validate, and stage updates with backup and one-call rollback. Also clones public GitHub repos locally as study material."
+  }
+}

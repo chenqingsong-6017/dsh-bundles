@@ -1,0 +1,13 @@
+- insert:
+    - id: cost
+      name: '@local/dsh-cost'
+      config:
+        # 每轮注入一行摘要；maxLine 是硬上限（超出截断）
+        maxLine: 220
+        # 默认不报钱（只报 token）。要报钱就填每百万 token 单价：
+        # currency: '¥'
+        # prices:
+        #   input: 0.5
+        #   output: 8
+        #   cacheRead: 0.05
+        #   cacheWrite: 0.5

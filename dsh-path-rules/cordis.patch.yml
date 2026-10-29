@@ -1,0 +1,6 @@
+- insert:
+    - id: path-rules
+      name: '@local/dsh-path-rules'
+      config:
+        # 每轮最多往系统提示里注入多少字符（超出按触发顺序截断并提示）
+        maxChars: 3000

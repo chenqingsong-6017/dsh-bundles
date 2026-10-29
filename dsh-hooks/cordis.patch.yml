@@ -1,0 +1,18 @@
+# 把用户级 hooks 挂进 profile。
+#
+# 配置优先级（见 index.js 的 candidateFiles）：
+#   1. 本行的 file（显式指定后不再读别的文件，可预期优先）
+#   2. $DSH_HOOKS_FILE
+#   3. <会话工作目录>/.dsh/hooks.json（工作区级，随项目走）
+#   4. $DSH_HOME/hooks.json（全局）
+#   5. $DSH_PROFILE_DIR/hooks.json（本 profile）
+#
+# 这里故意把 file 留空：不写死任何本机路径，用户想固定就改这一行。
+- insert:
+    - id: hooks
+      name: '@local/dsh-hooks'
+      config:
+        enabled: true
+        file: ''
+        maxHooks: 50
+        timeoutMs: 60000

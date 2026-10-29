@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Path Rules",
+    "description": "Splits rules by file path: a rule enters the system prompt only after the agent touches a matching file. Rules live in .dsh/rules/*.md with a paths glob header."
+  }
+}

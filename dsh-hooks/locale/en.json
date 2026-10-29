@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "User-level Hooks",
+    "description": "Turn discipline into a hooks.json: deny, ask, or allow before a tool runs, and feed post-run check output back to the model — without writing a plugin."
+  }
+}

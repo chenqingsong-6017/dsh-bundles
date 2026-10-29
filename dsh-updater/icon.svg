@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Plugin Updater">
+  <g fill="none" stroke="#3D7EFF" stroke-width="1.9" stroke-linecap="round">
+    <path d="M20.4 12a8.4 8.4 0 0 1-8.4 8.4 8.4 8.4 0 0 1-6.08-2.6" />
+    <path d="M3.6 12A8.4 8.4 0 0 1 12 3.6c2.42 0 4.62 1.02 6.2 2.67" />
+  </g>
+  <g fill="none" stroke="#3D7EFF" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M18.6 3.2v3.9h-3.9" />
+    <path d="M5.4 20.8v-3.9h3.9" />
+  </g>
+  <path d="M12 7.9 14.75 11h-1.8v4.3h-1.9V11h-1.8z" fill="#3D7EFF" />
+</svg>

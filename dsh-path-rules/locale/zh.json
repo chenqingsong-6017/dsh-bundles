@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "路径规则",
+    "description": "把规则按文件路径分片：只有 agent 触及匹配的文件时，对应规则才进入系统提示。规则放 .dsh/rules/*.md，头部写 paths 通配符。"
+  }
+}
