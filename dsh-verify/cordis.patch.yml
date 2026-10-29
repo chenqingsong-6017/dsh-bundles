@@ -1,8 +1,0 @@
-- insert:
-    - id: verify
-      name: '@local/dsh-verify'
-      config:
-        # 单次检查最多跑多久（毫秒），超时先 terminate 再报告
-        timeoutMs: 300000
-        # 主输出最多展示多少行失败信息
-        maxOutputLines: 40

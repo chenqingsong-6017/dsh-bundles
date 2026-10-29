@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Verify",
-    "description": "Runs the workspace's own checks (test / lint / typecheck, auto-detected) and reports pass/fail with the failing lines (verify / verify_status)."
-  }
-}

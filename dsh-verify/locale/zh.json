@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "改完自检",
-    "description": "自动识别并运行项目自己的检查命令（测试 / lint / 类型检查），返回通过与否和失败行（verify / verify_status）。"
-  }
-}
