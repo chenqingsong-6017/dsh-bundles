@@ -1,0 +1,242 @@
+{
+  "version": 1,
+  "createdAt": "2026-10-29T04:51:38.606Z",
+  "note": "真实库微基准（2026-10-29 第 1 版）：正例 30 + 负例 6。expected 为空数组表示应为「无相关」。",
+  "positives": [
+    {
+      "query": "改完插件怎么让它生效",
+      "expected": [
+        "m35",
+        "m39"
+      ]
+    },
+    {
+      "query": "验证门是做什么的",
+      "expected": [
+        "m47",
+        "m48"
+      ]
+    },
+    {
+      "query": "测试失败会被拦吗",
+      "expected": [
+        "m48"
+      ]
+    },
+    {
+      "query": "本机评测套件在哪",
+      "expected": [
+        "m54"
+      ]
+    },
+    {
+      "query": "评测结果怎么样",
+      "expected": [
+        "m55"
+      ]
+    },
+    {
+      "query": "headless profile 能跑进程隔离吗",
+      "expected": [
+        "m57"
+      ]
+    },
+    {
+      "query": "三路对照的耗时是多少",
+      "expected": [
+        "m58"
+      ]
+    },
+    {
+      "query": "评测套件发布到哪了",
+      "expected": [
+        "m59"
+      ]
+    },
+    {
+      "query": "抖音打不开先杀什么进程",
+      "expected": [
+        "m32"
+      ]
+    },
+    {
+      "query": "抖音为什么提权就退出",
+      "expected": [
+        "m31"
+      ]
+    },
+    {
+      "query": "VirtualBox 虚拟机报路径找不到",
+      "expected": [
+        "m25",
+        "m26"
+      ]
+    },
+    {
+      "query": "迁移虚拟机怎么改注册信息",
+      "expected": [
+        "m27"
+      ]
+    },
+    {
+      "query": "GlassBoard 接管桌面图标怎么恢复",
+      "expected": [
+        "m29"
+      ]
+    },
+    {
+      "query": "Hermes 构建报证书错误",
+      "expected": [
+        "m16"
+      ]
+    },
+    {
+      "query": "Hermes 在终端里启动就秒退",
+      "expected": [
+        "m17"
+      ]
+    },
+    {
+      "query": "DeepSeek API 支持哪些模型",
+      "expected": [
+        "m15"
+      ]
+    },
+    {
+      "query": "Hermes 的配置和密钥在哪",
+      "expected": [
+        "m13",
+        "m14"
+      ]
+    },
+    {
+      "query": "文件夹改名后要复核哪些引用",
+      "expected": [
+        "m22"
+      ]
+    },
+    {
+      "query": "tidy 数据在哪、能回滚吗",
+      "expected": [
+        "m21"
+      ]
+    },
+    {
+      "query": "归档区能不能清理",
+      "expected": [
+        "m24",
+        "m26"
+      ]
+    },
+    {
+      "query": "工作区地图的权威来源",
+      "expected": [
+        "m41"
+      ]
+    },
+    {
+      "query": "dsh-亲爱的管家是干什么的",
+      "expected": [
+        "m42"
+      ]
+    },
+    {
+      "query": "dsh-创建这个工作区负责什么",
+      "expected": [
+        "m43"
+      ]
+    },
+    {
+      "query": "default-workspace 还在用吗",
+      "expected": [
+        "m44"
+      ]
+    },
+    {
+      "query": "dsh-acl-recovery 是什么",
+      "expected": [
+        "m45"
+      ]
+    },
+    {
+      "query": "能不能跨工作区干活",
+      "expected": [
+        "m46"
+      ]
+    },
+    {
+      "query": "给插件更新的流程是什么",
+      "expected": [
+        "m33",
+        "m35"
+      ]
+    },
+    {
+      "query": "skill-forge 有哪些工具",
+      "expected": [
+        "m38"
+      ]
+    },
+    {
+      "query": "竞品调研的核心结论",
+      "expected": [
+        "m51",
+        "m52",
+        "m53"
+      ]
+    },
+    {
+      "query": "会话搜索要不要自己写",
+      "expected": [
+        "m9"
+      ]
+    },
+    {
+      "query": "官方可选 bundle 怎么装",
+      "expected": [
+        "m7",
+        "m8"
+      ]
+    },
+    {
+      "query": "插件 UX 规范放哪了",
+      "expected": [
+        "m4"
+      ]
+    },
+    {
+      "query": "WorkBuddy 学习空间能不能删",
+      "expected": [
+        "m5",
+        "m6"
+      ]
+    },
+    {
+      "query": "插件代码和数据放哪个盘",
+      "expected": [
+        "m1",
+        "m3"
+      ]
+    },
+    {
+      "query": "快捷方式能不能改名",
+      "expected": [
+        "m19"
+      ]
+    },
+    {
+      "query": "文件改英文名的规矩",
+      "expected": [
+        "m20"
+      ]
+    }
+  ],
+  "negatives": [
+    "今天上海天气怎么样",
+    "帮我写个 Python 快排",
+    "推荐一部好看的电影",
+    "React useEffect 的依赖数组怎么理解",
+    "MySQL 索引优化怎么做",
+    "如何练习英语口语"
+  ]
+}
