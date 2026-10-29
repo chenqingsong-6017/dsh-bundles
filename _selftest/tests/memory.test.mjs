@@ -1030,7 +1030,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   // B01：写盘失败必须报错，不能报「已记住」
   const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-writefail-'))
   const h = host(tmp)
-  mkdirSync(path.join(tmp, 'memory.json.tmp')) // 让原子写的目标路径变成目录 → rename 必失败
+  mkdirSync(path.join(tmp, 'memory.json')) // 把目标路径做成目录 → rename 必失败（等价于磁盘/权限出错）
   let threw = false
   try {
     await h.defs.get('memory_add').execute({ text: '这条永远不落盘' })
@@ -1180,6 +1180,64 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(typeof block === 'string')
   assert.ok(block.includes('正常一条'))
   ok('v3.9 renderMemory 对非字符串 text 不再抛错')
+}
+
+// ---- v3.10 并发与长句检索（B02 / A3）----
+{
+  // B02：两个宿主 = 两个进程各自 load 后各自整库覆盖写 —— 后写者不能把前写者的条目抹掉
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-multiproc-'))
+  const a = host(tmp)
+  const b = host(tmp) // 先建好 = b 拿到的是空库快照
+  const ra = await a.defs.get('memory_add').execute({ text: 'A 进程写的：回答用中文' })
+  const rb = await b.defs.get('memory_add').execute({ text: 'B 进程写的：插件放 D 盘' })
+  assert.notEqual(ra.entry.id, rb.entry.id, '两个进程分到了同一个 id')
+  const listed = await host(tmp).defs.get('memory_list').execute({})
+  assert.equal(listed.total, 2, '后写者把前写者的条目覆盖掉了：total=' + listed.total)
+  assert.ok(!existsSync(path.join(tmp, 'memory.json.lock')), '写完没释放锁文件')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.10 两进程并发写不丢条目、不抢 id、锁会释放（B02）')
+}
+
+{
+  // B02：陈旧锁（进程崩了没清）不能把后续写入永久卡死
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-stalelock-'))
+  const h = host(tmp)
+  const lockFile = path.join(tmp, 'memory.json.lock')
+  writeFileSync(lockFile, '999999', 'utf8')
+  const old = new Date(Date.now() - 60000)
+  utimesSync(lockFile, old, old)
+  const added = await h.defs.get('memory_add').execute({ text: '陈旧锁也要能写进去' })
+  assert.ok(added.entry.id)
+  assert.ok(!existsSync(lockFile), '抢到锁后应释放')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.10 陈旧锁会被抢占（B02）')
+}
+
+{
+  // A3：长自然句按分句取最大覆盖率 —— 同一意图不该因为"话变长"就掉出相关层
+  const cases = [
+    { short: '插件更新后要重启吗', long: '先别管别的，我想确认一件事，插件更新后要重启吗' },
+    { short: '验证门跑几个门', long: '对了顺便问一句，另外还有个老问题一直没弄明白，验证门跑几个门' },
+  ]
+  const store = [
+    { id: 'm74', text: '用户说「给插件更新」= 去 GitHub 找实现、学习、再对自研插件做真实改进；改完要重启 DSH 换模块代际', tags: ['plugin-update'] },
+    { id: 'm70', text: '验证门：dsh-proof + 自写适配器，靠 npm run check 在收工前跑三道门（语法/结构/测试）', tags: ['verify-gate'] },
+    { id: 'unrelated', text: '房产税政策与首套房的关系备忘', tags: ['misc'] },
+  ]
+  for (const item of cases) {
+    const shortStats = {}
+    const longStats = {}
+    renderMemory(store, { maxInjectChars: 1200, query: item.short, stats: shortStats })
+    renderMemory(store, { maxInjectChars: 1200, query: item.long, stats: longStats })
+    assert.ok((shortStats.relevant ?? []).length > 0, '短问法本身该进相关层：' + item.short)
+    // 长句里只要**包含**这句意图，覆盖率不应低于单独问这句（铺垫词不该稀释它）
+    assert.ok(
+      relevanceCoverage(store, item.long).coverage >= relevanceCoverage(store, item.short).coverage - 1e-9,
+      '长句被铺垫词稀释了：' + item.long + ' => ' + relevanceCoverage(store, item.long).coverage.toFixed(3) + ' < ' + relevanceCoverage(store, item.short).coverage.toFixed(3),
+    )
+    assert.ok((longStats.relevant ?? []).length > 0, '长句里的意图没进相关层：' + item.long)
+  }
+  ok('v3.10 长自然句按分句取最大覆盖率，不再被铺垫词稀释（A3）')
 }
 
 {

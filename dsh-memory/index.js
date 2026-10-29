@@ -24,7 +24,7 @@
  *   - `memory_search` 是子串 + 分词计分的轻量检索，不是语义检索（记忆体量小，够用）。
  */
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
@@ -469,7 +469,9 @@ export function renderMemory(allEntries, options) {
     const coverageReport = relevanceCoverage(entries.filter((item) => !item.pinned), queryText)
     const { coverage } = coverageReport
     relevanceSeen = coverage
-    if (coverage >= floor) {
+    // v3.10：scored 为空（query 里没有任何能进 tokenize 的词）时不能往下走，
+    // 否则 ranked[0].composite 直接抛错 —— 宁可这一轮不给全文。
+    if (coverage >= floor && scored.length > 0) {
       const now = Date.now()
       const ranked = scored
         .map((item) => ({
@@ -813,7 +815,13 @@ const CJK_STOP_CHARS = new Set(
 export function contentUnitsOf(input) {
   const value = String(input ?? '').toLowerCase()
   const units = []
-  for (const word of value.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) units.push(word)
+  // v3.10（A5）：去掉拉丁词尾的 . _ -（原来 `chrome.` 和 `chrome` 是两个不同的词，实测导致漏召回）。
+  // 注意仍是 {1,}：单字符拉丁（C 盘 / D 盘里的 c、d）刻意不算内容单元 —— 它们跟排序层 tokenize 的口径不一致，
+  // 硬塞进来会出现「门槛过、排序层没候选」的错位（A9 试过，会直接抛错，已回退）。
+  for (const word of value.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) {
+    const trimmed = word.replace(/[._-]+$/, '')
+    if (trimmed !== '') units.push(trimmed)
+  }
   for (const run of value.match(/[\u4e00-\u9fff]+/g) ?? []) {
     if (run.length === 1) {
       if (!CJK_STOP_CHARS.has(run)) units.push(run)
@@ -840,8 +848,36 @@ export function contentUnitsOf(input) {
  *
  * 判据是 v2.3 的 RELEVANCE_FLOOR；v3.8 换的是算法，不是阈值。
  */
+const CLAUSE_SPLIT = /[，。！？；、,.!?;\n\r]+/
+
+/**
+ * v3.10（A3）：真实用户消息是长句，整句算覆盖率会被大量铺垫词稀释 ——
+ * 实测 15 条长自然句只有 5 条（33.3%）进得了相关层，而短问法基准是 73.9–100%。
+ * 做法：按标点切成分句，取「最相关那一句」的覆盖率（多句各自算，取最大）。
+ * 短问法只有一句，行为完全不变。
+ */
+export function queryClauses(query) {
+  const text = String(query ?? '').trim()
+  if (text === '') return []
+  const parts = text.split(CLAUSE_SPLIT).map((part) => part.trim()).filter((part) => contentUnitsOf(part).length > 0)
+  if (parts.length <= 1) return text === '' ? [] : [text]
+  return parts
+}
+
 export function relevanceCoverage(entries, query) {
   const list = Array.isArray(entries) ? entries : []
+  const clauses = queryClauses(query)
+  if (clauses.length > 1) {
+    // 分句取最大：每句单独算，谁最相关用谁（并合并 byId，供相关层同尺判断）。
+    let best = { coverage: 0, topId: null, matchedUnits: [], byId: new Map() }
+    const merged = new Map()
+    for (const clause of clauses) {
+      const part = relevanceCoverage(list, clause)
+      for (const [id, value] of part.byId) merged.set(id, Math.max(merged.get(id) ?? 0, value))
+      if (part.coverage > best.coverage) best = { ...part, byId: merged }
+    }
+    return { ...best, byId: merged }
+  }
   const docs = list.map((entry) => {
     const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
     const terms = new Map()
@@ -962,8 +998,14 @@ export function apply(ctx, config) {
   let aliasesSidecar = {}
 
   function loadAliases() {
+    let raw = ''
     try {
-      const parsed = JSON.parse(readFileSync(aliasesFile, 'utf8'))
+      raw = readFileSync(aliasesFile, 'utf8')
+    } catch (error) {
+      return // 没有旁路文件：从空开始
+    }
+    try {
+      const parsed = JSON.parse(raw)
       const map = parsed && typeof parsed === 'object' && parsed.aliases && typeof parsed.aliases === 'object' ? parsed.aliases : null
       if (map === null) return
       const clean = {}
@@ -974,7 +1016,12 @@ export function apply(ctx, config) {
       }
       aliasesSidecar = clean
     } catch (error) {
-      // 没有旁路文件：从空开始，不影响记忆主体
+      // v3.10（B08）：坏 JSON 不能静默当空 —— 否则下一次 saveAliases 就把原文覆盖没了。先另存一份留证。
+      try {
+        copyFileSync(aliasesFile, `${aliasesFile}.corrupt-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`)
+      } catch (inner) {
+        // 留证失败也不阻断启动
+      }
     }
   }
 
@@ -990,12 +1037,26 @@ export function apply(ctx, config) {
         null,
         2,
       )
-      const temp = `${aliasesFile}.tmp`
+      // v3.10（B17 同款）：唯一临时名 + 重试 rename，不再「失败就直接覆盖」（非原子，崩了留半截）。
+      tmpCounter += 1
+      const temp = `${aliasesFile}.tmp-${process.pid}-${tmpCounter}`
       writeFileSync(temp, body, 'utf8')
-      try {
-        renameSync(temp, aliasesFile)
-      } catch (error) {
-        writeFileSync(aliasesFile, body, 'utf8')
+      let renamed = false
+      for (let attempt = 0; attempt < 3 && !renamed; attempt += 1) {
+        try {
+          renameSync(temp, aliasesFile)
+          renamed = true
+        } catch (error) {
+          // 重试
+        }
+      }
+      if (!renamed) {
+        try {
+          unlinkSync(temp)
+        } catch (error) {
+          // 留着下次覆盖
+        }
+        return false
       }
       return true
     } catch (error) {
@@ -1028,7 +1089,8 @@ export function apply(ctx, config) {
       ? config.scopeRoots
       : DEFAULT_SCOPE_ROOTS
   const captureCandidates = config?.captureCandidates !== false
-  const relevanceFloor = Number.isFinite(config?.relevanceFloor) ? config.relevanceFloor : undefined
+  // v3.10（A11）：relevanceFloor <= 0 等于把相关性门槛关掉（会把无关记忆当相关注入），忽略这种配置。
+  const relevanceFloor = Number.isFinite(config?.relevanceFloor) && config.relevanceFloor > 0 ? config.relevanceFloor : undefined
   const candidateFile = path.join(storeDir, 'candidates.json')
 
   let state = { version: 1, nextId: 1, entries: [] }
@@ -1123,14 +1185,183 @@ export function apply(ctx, config) {
     }
   }
 
+  let lastSignature = ''
+  let tmpCounter = 0
+
+  /** 磁盘上 memory.json 的指纹（mtime + size）：用来判断「别的进程写过了没有」。 */
+  function storeSignature() {
+    try {
+      const info = statSync(storeFile)
+      return `${info.mtimeMs}:${info.size}`
+    } catch (error) {
+      return ''
+    }
+  }
+
+  /** 读磁盘上的库；文件不存在返回 null；JSON/形状不对则抛错（由调用方决定是隔离还是忽略）。 */
+  function readDiskState() {
+    let raw = ''
+    try {
+      raw = readFileSync(storeFile, 'utf8')
+    } catch (error) {
+      return null
+    }
+    const parsed = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) {
+      throw new Error('store shape is not {entries: []}')
+    }
+    const rawEntries = parsed.entries
+    const kept = rawEntries
+      .filter((entry) => entry && typeof entry.id === 'string' && typeof entry.text === 'string')
+      .map(normalizeEntry)
+    // v3.9：形状不合法的条目被丢弃时先留证，别让下一次 persist 把它彻底抹掉（B09）。
+    if (kept.length !== rawEntries.length) {
+      try {
+        const droppedCopy = `${storeFile}.dropped-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`
+        copyFileSync(storeFile, droppedCopy)
+        droppedCopyPath = droppedCopy
+      } catch (error) {
+        // 留证失败不阻断
+      }
+    }
+    // v3.9：nextId 不能只靠 entries.length —— 删过条目后它会落后、造成重复 id（B11）。
+    const maxIdNumber = kept.reduce((max, entry) => {
+      const match = /^m?(\d+)$/.exec(String(entry.id))
+      return match ? Math.max(max, Number(match[1])) : max
+    }, 0)
+    const storedNextId = Number.isInteger(parsed?.nextId) && parsed.nextId > 0 ? parsed.nextId : 0
+    return {
+      entries: kept,
+      version: Number.isInteger(parsed?.version) && parsed.version > 0 ? parsed.version : 1,
+      nextId: Math.max(storedNextId, maxIdNumber + 1),
+    }
+  }
+
+  /**
+   * v3.10（B02）：写前比对磁盘指纹，变了就把对方的条目合进来，再整库落盘。
+   * 原来每个进程各自 load、各自整库覆盖写 —— 后写者会把别人刚写的条目静默抹掉（实测两条只剩一条、还抢同一个 id）。
+   * 合并规则：按 id 取并集，updatedAt 新者胜；平手用本地（本次写入的意图）。
+   * 已知边界：并发「删除」没有墓碑，可能被另一进程的写复活（比丢新增轻，先这样）。
+   */
+  function mergeWithDisk() {
+    let disk
+    try {
+      disk = readDiskState()
+    } catch (error) {
+      return // 磁盘上那份坏了：不合并，保住内存里的（损坏保护由 load 负责）
+    }
+    if (disk === null) return
+    const signature = storeSignature()
+    if (signature === lastSignature) return
+    const byId = new Map()
+    for (const entry of disk.entries) byId.set(entry.id, entry)
+    for (const entry of state.entries) {
+      const existing = byId.get(entry.id)
+      if (existing === undefined) {
+        byId.set(entry.id, entry)
+        continue
+      }
+      const mine = Date.parse(entry.updatedAt ?? '') || 0
+      const theirs = Date.parse(existing.updatedAt ?? '') || 0
+      byId.set(entry.id, mine >= theirs ? entry : existing)
+    }
+    state.entries = [...byId.values()]
+    const maxIdNumber = state.entries.reduce((max, entry) => {
+      const match = /^m?(\d+)$/.exec(String(entry.id))
+      return match ? Math.max(max, Number(match[1])) : max
+    }, 0)
+    state.nextId = Math.max(state.nextId, maxIdNumber + 1)
+    state.version = Math.max(state.version, disk.version)
+    lastSignature = signature
+  }
+
+  /**
+   * v3.10（B02）：写工具在**分配 id / 查找条目之前**先跟磁盘对齐一次。
+   * 否则两个进程各自按自己的 nextId 发号，会分到同一个 id（实测 A、B 都是 m1）。
+   */
+  function refreshBeforeWrite() {
+    const release = acquireLock()
+    try {
+      mergeWithDisk()
+    } finally {
+      release()
+    }
+  }
+
+  const LOCK_WAIT_MS = 400
+  const LOCK_STALE_MS = 5000
+  function sleepSync(ms) {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+    } catch (error) {
+      const until = Date.now() + ms
+      while (Date.now() < until) {
+        // 忙等兜底（环境不支持 Atomics.wait 时）
+      }
+    }
+  }
+
+  /** 跨进程互斥：memory.json.lock 用 wx 原子创建；陈旧锁（进程崩了）超过 5 秒直接抢。 */
+  function acquireLock() {
+    const lockFile = `${storeFile}.lock`
+    const deadline = Date.now() + LOCK_WAIT_MS
+    for (;;) {
+      try {
+        writeFileSync(lockFile, String(process.pid), { flag: 'wx' })
+        return () => {
+          try {
+            unlinkSync(lockFile)
+          } catch (error) {
+            // 锁已经被别人清了也不影响
+          }
+        }
+      } catch (error) {
+        try {
+          const info = statSync(lockFile)
+          if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
+            try {
+              unlinkSync(lockFile)
+            } catch (inner) {
+              // 撞车了就让下一轮重试
+            }
+            continue
+          }
+        } catch (inner) {
+          continue
+        }
+        if (Date.now() > deadline) {
+          throw new Error('另一个 DSH 进程正在写记忆（memory.json.lock 被占），等它写完重试一次即可。')
+        }
+        sleepSync(25)
+      }
+    }
+  }
+
   function persist() {
     if (storeHealth === 'corrupt') return false
     ensureDailyBackup()
+    // v3.10（B02）：跨进程互斥 + 写前合并。见 acquireLock / mergeWithDisk 的注释。
+    const releaseLock = acquireLock()
     try {
+      mergeWithDisk()
       mkdirSync(storeDir, { recursive: true })
       const body = JSON.stringify(state, null, 2)
-      const temp = `${storeFile}.tmp`
+      // 学 write-file-atomic：临时文件名必须**每进程唯一**（pid + 序号）。
+      // 原来固定用 `memory.json.tmp`，两个进程同时写会共用同一个临时文件互相踩 —— 比整库覆盖更隐蔽。
+      tmpCounter += 1
+      const temp = `${storeFile}.tmp-${process.pid}-${tmpCounter}`
       writeFileSync(temp, body, 'utf8')
+      // 学 write-file-atomic 的 fsync 默认行为：先把内容压到盘再 rename，断电不至于留下半截。
+      try {
+        const fd = openSync(temp, 'r')
+        try {
+          fsyncSync(fd)
+        } finally {
+          closeSync(fd)
+        }
+      } catch (error) {
+        // 个别文件系统不支持 fsync：退化成不 fsync，但不因此失败
+      }
       // v3.9：两处修正
       // 1) 删掉「rename 失败就直接覆盖目标文件」的兜底 —— 那是非原子写，崩在中间会留下半截 JSON（B17）。
       // 2) rename 失败重试几次，仍失败就**抛错**：原来只 return false，六个写工具全当成功，
@@ -1156,12 +1387,15 @@ export function apply(ctx, config) {
           `记忆落盘失败（${lastError?.message ?? 'rename failed'}）。本次写入没有生效，别当成已保存；先用 memory_list 确认，修好磁盘/权限后重载插件。`,
         )
       }
+      lastSignature = storeSignature()
       syncAliases()
       return true
     } catch (error) {
-      if (error instanceof Error && error.message.startsWith('记忆落盘失败')) throw error
+      if (error instanceof Error && (error.message.startsWith('记忆落盘失败') || error.message.includes('memory.json.lock'))) throw error
       storeHealth = 'readonly'
       throw new Error(`记忆落盘失败（${error?.message ?? 'unknown'}）。本次写入没有生效，别当成已保存。`)
+    } finally {
+      releaseLock()
     }
   }
 
@@ -1202,6 +1436,8 @@ export function apply(ctx, config) {
         version: Number.isInteger(parsed?.version) && parsed.version > 0 ? parsed.version : 1,
         entries: kept,
       }
+      // v3.10（B02）：记下这次的磁盘指纹，persist 据此判断「别的进程写过了没有」。
+      lastSignature = storeSignature()
     } catch (error) {
       // 损坏：把原文件改名留证，进入只读保护态；绝不静默覆盖。
       storeHealth = 'corrupt'
@@ -1256,6 +1492,9 @@ export function apply(ctx, config) {
   // ---- 使用计数（给冷热/淘汰提供依据）----
   let usageDirty = false
   let lastUsageFlush = 0
+  // v3.10（B14）：缓存最近一次装配系统提示时的 cwd。memory_list / audit / review 拿不到会话上下文，
+  // 原来用空 cwd 渲染 → 带 workspaces 的条目永远被算成「没注入」，报的字数也偏小。
+  let lastKnownCwd = ''
   let lastCountedQuery = ''
   const countUsage = (ids) => {
     if (!Array.isArray(ids) || ids.length === 0) return
@@ -1362,9 +1601,11 @@ export function apply(ctx, config) {
     const query = currentQuery(context)
     const scope = currentScopeOf(context)
     const stats = {}
+    const cwd = currentCwdOf(context)
+    if (typeof cwd === 'string' && cwd !== '') lastKnownCwd = cwd
     let block = ''
     try {
-      block = renderOnce(query, stats, scope, currentCwdOf(context))
+      block = renderOnce(query, stats, scope, cwd)
     } catch (error) {
       // v3.9：渲染异常绝不能连累系统提示装配 —— 一条脏数据不该让每个会话都起不来。
       return ''
@@ -1382,7 +1623,7 @@ export function apply(ctx, config) {
     return block.replace('</memory>', `${reminder}\n</memory>`)
   }
   const listOutput = () => {
-    const block = renderOnce('')
+    const block = renderOnce('', undefined, undefined, lastKnownCwd)
     const entries = activeEntries()
     return {
       total: state.entries.length,
@@ -1678,6 +1919,7 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         requireWritable()
+        refreshBeforeWrite()
         const raw = typeof args?.text === 'string' ? args.text.trim() : ''
         if (raw === '') throw new Error('memory_add 需要 text。')
         if (raw.length > MAX_TEXT_CHARS) {
@@ -1867,6 +2109,7 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         requireWritable()
+        refreshBeforeWrite()
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
         const next = typeof args?.text === 'string' ? args.text.trim() : ''
         if (id === '') throw new Error('memory_update 需要 id。')
@@ -1995,6 +2238,7 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         requireWritable()
+        refreshBeforeWrite()
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
         if (id === '') throw new Error('memory_remove 需要 id。')
         const before = state.entries.length
@@ -2044,6 +2288,7 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         requireWritable()
+        refreshBeforeWrite()
         // v3.9：先把重复 id 去掉再判「至少两个」。原来 [m1, m1] 能通过校验，把同一条合并两次（B16）。
         const ids = [...new Set(Array.isArray(args?.ids) ? args.ids.filter((id) => typeof id === 'string' && id !== '') : [])]
         if (ids.length < 2) throw new Error('memory_merge 需要至少两个不同的 id。')
@@ -2289,7 +2534,7 @@ export function apply(ctx, config) {
           duplicates: duplicates.slice(0, limit),
           stale: stale.slice(0, limit),
           mostUsed,
-          budget: { usedChars: usedChars(), maxBytes, injectedChars: renderOnce('').length },
+          budget: { usedChars: usedChars(), maxBytes, injectedChars: renderOnce('', undefined, undefined, lastKnownCwd).length },
         }
       },
     }),
@@ -2324,7 +2569,7 @@ export function apply(ctx, config) {
         : list.map((entry) => '- ' + entry.id + (entry.scope ? ' <' + entry.scope + '>' : '') + ' ' + brief(entry))),
       '',
     ]
-    const block = renderOnce('')
+    const block = renderOnce('', undefined, undefined, lastKnownCwd)
     const overBudget = block.length > maxInjectChars
     const md = [
       '# 记忆概览',
@@ -2510,6 +2755,7 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         requireWritable()
+        refreshBeforeWrite()
         const action = typeof args?.action === 'string' ? args.action : 'list'
         const slim = (item) => ({
           id: item.id,
