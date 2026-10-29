@@ -40,7 +40,10 @@ const MAX_ALIASES = 8
 const MAX_ALIAS_CHARS = 60
 const CONTEXT_ORDER = 900
 const INDEX_SUMMARY_CHARS = 44
-const RELEVANT_SHARE = 0.3
+// v3.13：0.3 → 0.4。相关层（给全文的那层）预算占比。0.3 时两条全文经常装不下第二条：
+// 实测「这个评测套件发到 GitHub 上了吗」covTop=m78 0.61，但 m71（更长的全文）先占满 450 字符额度，
+// m78 被预算挡在门外。0.4 后短问法/换皮都不掉，长句 13/15 → 14/15。
+const RELEVANT_SHARE = 0.4
 const MAX_RELEVANT = 2
 const RELEVANT_CONFIDENCE = 1.5
 const MAX_QUERY_CHARS = 400
@@ -486,12 +489,20 @@ export function renderMemory(allEntries, options) {
     // 「电脑为什么会蓝屏」这类单字假命中；再加「命中≥2 单元」正好 60/72 且负例 0 —— 拿 4 个真命中、不进口子。
     const coverageTopId = coverageReport.topId
     const agreeWithRanking = coverageTopId !== null && scored.length > 0 && scored[0].entry.id === coverageTopId
+    const rankTopId = scored.length > 0 ? scored[0].entry.id : null
+    const rankDocMatched = rankTopId !== null ? coverageReport.docMatched?.get(rankTopId) : null
+    const rankEvidence = {
+      units: rankDocMatched ? rankDocMatched.units.length : 0,
+      matchedDf: rankDocMatched ? rankDocMatched.matchedDf : [],
+      coverage: rankTopId !== null ? coverageReport.byId?.get(rankTopId) ?? 0 : 0,
+    }
     const gate = gateDecision({
       coverage,
       matchedUnits: coverageReport.matchedUnits,
       matchedDf: coverageReport.matchedDf,
       unitCount: coverageReport.unitCount,
       agreeWithRanking,
+      rankEvidence,
       floor,
     })
     // v3.10：scored 为空（query 里没有任何能进 tokenize 的词）时不能往下走，
@@ -511,6 +522,11 @@ export function renderMemory(allEntries, options) {
       const topComposite = ranked[0].composite
       const cap = Math.min(Math.floor(maxInjectChars * RELEVANT_SHARE), maxInjectChars - used)
       let spent = 0
+      // v3.13：覆盖率 top 不再需要单独占位，也**不再用 break 跳过**后面的人 ——
+      // v3.11 的注释写着「覆盖率最高的那条天然有资格拿全文」，但旧实现靠循环里的 break 豁免：
+      // 只要排在它前面有 byId>0、复合分又够低的条目，就提前 break 掉，覆盖率 top 反而进不来
+      // （实测长句「这个评测套件发到 GitHub 上了吗」：covTop=m78 0.65，相关层却只有 m71）。
+      // 改成 continue 后，覆盖率 top 一定能走到，而且不会挤占正常排序所占的位置（试过「先占位」，短问法/换皮各掉 5 条）。
       for (const item of ranked) {
         if (relevant.length >= MAX_RELEVANT) break
         if (isExpired(item.entry)) continue
@@ -518,9 +534,11 @@ export function renderMemory(allEntries, options) {
         // 实测 query「python快排」过门 0.39，注入的却是跟 query 零内容单元重合的条目（只靠单字「快」）。
         // 这里要求被注入的条目自身至少有一个内容单元命中。
         if (!((coverageReport.byId?.get(item.entry.id) ?? 0) > 0)) continue
-        // v3.11：覆盖率最高的那条天然有资格拿全文，别被复合分（重要度/新鲜度）挤掉。
+        // v3.11：复合分差太多的不再补（避免第二条把第一条挤成噪音）。
+        // v3.13：覆盖率 top 例外 —— 它是「这两条真的相关」的最强证据，不因复合分低被跳过；
+        // 但仍受 MAX_RELEVANT 与预算约束。
         const isCoverageTop = item.entry.id === coverageTopId
-        if (!isCoverageTop && relevant.length > 0 && item.composite * RELEVANT_COMPOSITE_MARGIN < topComposite) break
+        if (!isCoverageTop && relevant.length > 0 && item.composite * RELEVANT_COMPOSITE_MARGIN < topComposite) continue
         const cost = lineRelevant(item.entry).length + 1
         if (spent + cost > cap) break
         relevant.push(item.entry)
@@ -630,6 +648,15 @@ export function renderMemory(allEntries, options) {
       built = buildBlock(diagLimit)
       continue
     }
+    // v3.13：相关层（全文）以前不参与回削 —— RELEVANT_SHARE 提到 0.4 后，600 字符的小预算会超 5 字符
+    // （不变量实测 budget=600 / q=技能是怎么生成的）。相关层是仅次于 pinned 的高价值内容，
+    // 但预算红线优先：削掉最后一条相关，让它落回索引行。
+    if (relevant.length > 0) {
+      const droppedEntry = relevant.pop()
+      if (!indexed.includes(droppedEntry)) indexed.push(droppedEntry)
+      built = buildBlock(diagLimit)
+      continue
+    }
     break
   }
 
@@ -733,7 +760,19 @@ function cacheGet(cache, key, compute) {
 }
 
 /**
- * 分词（排序层用）：英文/数字按整词，中文按词。
+ * 拉丁词拆子词（v3.13）：URL / 文件路径 / 连字符标识符里的分隔段也算词。
+ * 起因：记忆里写「https://github.com/...」，用户问「发到 GitHub 上了吗」—— 整词是 github.com、
+ * 查询是 github，词面永远对不上（实测这条长句因此排错）。拆开后 github / dsh / eval 都能命中。
+ * 只拆 ≥2 字符的段，避免 a / v1 这种碎片把分母灌满。
+ */
+function latinSubUnits(word) {
+  if (!/[._\-]/.test(word)) return [word]
+  const parts = word.split(/[._\-]+/).filter((part) => part.length >= 2)
+  return parts.length > 0 ? [word, ...parts] : [word]
+}
+
+/**
+ * 分词（排序层用）：英文/数字按整词（含路径/URL 子词），中文按词。
  * 注意：返回的 Map 由缓存共享，**调用方不得修改**。
  */
 export function tokenize(input) {
@@ -741,7 +780,7 @@ export function tokenize(input) {
   return cacheGet(TOKEN_CACHE, key, () => {
     const terms = new Map()
     const bump = (term) => terms.set(term, (terms.get(term) ?? 0) + 1)
-    for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) bump(word)
+    for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) for (const unit of latinSubUnits(word)) bump(unit)
     for (const run of key.match(/[\u4e00-\u9fff]+/g) ?? []) {
       for (const unit of segmentZhRun(run)) bump(unit)
     }
@@ -943,7 +982,7 @@ export function contentUnitsOf(input) {
     // 硬塞进来会出现「门槛过、排序层没候选」的错位（A9 试过，会直接抛错，已回退）。
     for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) {
       const trimmed = word.replace(/[._-]+$/, '')
-      if (trimmed !== '') units.push(trimmed)
+      if (trimmed !== '') for (const unit of latinSubUnits(trimmed)) units.push(unit)
     }
     // v3.12：中文按**词**（与排序层 tokenize 同一个 segmentZhRun），不再是 bigram。
     for (const run of key.match(/[\u4e00-\u9fff]+/g) ?? []) {
@@ -992,7 +1031,7 @@ export function queryClauses(query) {
  * 依据：72 正例 / 35 负例实测，单指标 56/72 且 0 负例；放宽到「只要求一致」64/72 但会放过
  * 「电脑为什么会蓝屏」这类单字假命中；再加「≥2 单元」正好 60/72 且负例 0 —— 白赚 4 个真命中。
  */
-export function gateDecision({ coverage, matchedUnits, matchedDf, unitCount, agreeWithRanking, floor = RELEVANCE_FLOOR }) {
+export function gateDecision({ coverage, matchedUnits, matchedDf, unitCount, agreeWithRanking, rankEvidence, floor = RELEVANCE_FLOOR }) {
   const units = Array.isArray(matchedUnits) ? matchedUnits.length : 0
   // v3.12：单单元匹配的「证据不足」护栏。
   // 词级切分让分母变小，单个词的命中就能把覆盖率顶到 0.3 以上 —— 实测负例
@@ -1008,7 +1047,15 @@ export function gateDecision({ coverage, matchedUnits, matchedDf, unitCount, agr
   //     被挡住；长句正例里单命中的真实命中都在 0.25 以上（只有 1 条 0.2046 的会掉，见 README v3.12）。
   const queryUnits = Number.isInteger(unitCount) ? unitCount : 99
   const singleWordFloor = queryUnits <= 2 ? RELEVANCE_SINGLE_WORD_FLOOR_SHORT : RELEVANCE_SINGLE_WORD_FLOOR_LONG
-  if (units === 1 && Array.isArray(matchedDf) && matchedDf[0] <= 1 && coverage < singleWordFloor) {
+  // v3.13：护栏判的是**实际要注入的那条**（排序层 top1）的证据，不是覆盖率 top 的证据。
+  // 起因：长句「做新插件之前…」的覆盖率 top 是无关条目（单命中「重复」），而排序 top 正是期望记忆（命中 2 个单元）——
+  // 按覆盖率 top 判会把整条查询挡掉。没传 rankEvidence 时退回覆盖率 top（纯函数单测仍按旧口径可测）。
+  const rankUnits = Number.isInteger(rankEvidence?.units) ? rankEvidence.units : units
+  const rankDf = Array.isArray(rankEvidence?.matchedDf) ? rankEvidence.matchedDf : matchedDf
+  // 覆盖率用整体 coverage（与主条件同一个数），只有「命中单元数/df」取排序 top 的 ——
+  // 别用 byId：它是另一套归一（实测 Hermes 那条 coverage 0.2757 而 byId 0.1538，会把真命中挡掉）。
+  const rankCoverage = coverage
+  if (rankUnits === 1 && Array.isArray(rankDf) && rankDf[0] <= 1 && rankCoverage < singleWordFloor) {
     return { pass: false, relaxed: false }
   }
   if (coverage >= floor) return { pass: true, relaxed: false }
@@ -1021,7 +1068,7 @@ export function relevanceCoverage(entries, query) {
   const clauses = queryClauses(query)
   if (clauses.length > 1) {
     // 分句取最大：每句单独算，谁最相关用谁（并合并 byId，供相关层同尺判断）。
-    let best = { coverage: 0, topId: null, matchedUnits: [], matchedDf: [], byId: new Map() }
+    let best = { coverage: 0, topId: null, matchedUnits: [], matchedDf: [], docMatched: new Map(), byId: new Map() }
     const merged = new Map()
     for (const clause of clauses) {
       const part = relevanceCoverage(list, clause)
@@ -1041,7 +1088,7 @@ export function relevanceCoverage(entries, query) {
     return { entry, terms, length }
   })
   const queryUnits = [...new Set(contentUnitsOf(query))]
-  if (docs.length === 0 || queryUnits.length === 0) return { coverage: 0, topId: null, matchedUnits: [], matchedDf: [] }
+  if (docs.length === 0 || queryUnits.length === 0) return { coverage: 0, topId: null, matchedUnits: [], matchedDf: [], docMatched: new Map() }
   let totalLength = 0
   for (const doc of docs) totalLength += doc.length
   const avgLength = totalLength / docs.length || 1
@@ -1056,6 +1103,8 @@ export function relevanceCoverage(entries, query) {
   let topId = null
   let matchedUnits = []
   let matchedDf = []
+  // v3.13：每条文档各自命中了哪些单元（供护栏按「要注入的那条」判证据，而不是只按覆盖率 top）。
+  const docMatched = new Map()
   for (const doc of docs) {
     let score = 0
     const matched = []
@@ -1067,6 +1116,7 @@ export function relevanceCoverage(entries, query) {
         idfOf(docs.length, df.get(unit)) *
         ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgLength)))
     }
+    if (matched.length > 0) docMatched.set(doc.entry.id, { units: matched, matchedDf: matched.map((unit) => df.get(unit) ?? 0) })
     if (score > best) {
       best = score
       topId = doc.entry.id
@@ -1091,7 +1141,7 @@ export function relevanceCoverage(entries, query) {
     }
     byId.set(doc.entry.id, denominator > 0 ? Math.min(1, own / denominator) : 0)
   }
-  return { coverage: Math.min(1, ratio), topId, matchedUnits, matchedDf, unitCount: queryUnits.length, byId }
+  return { coverage: Math.min(1, ratio), topId, matchedUnits, matchedDf, unitCount: queryUnits.length, docMatched, byId }
 }
 
 /** 单条打分（兼容旧签名）；传 options.entries 就能用上跨条目的 IDF。 */

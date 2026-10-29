@@ -972,7 +972,14 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const units = contentUnitsOf('推荐一部好看的电影')
   assert.ok(units.includes('推荐'), '应保留内容 bigram')
   assert.ok(!units.some((unit) => unit.length === 1), '中文不再出 unigram（片段是三重计数的根）')
-  assert.deepEqual(contentUnitsOf('dsh-memory v3.7 别名').filter((unit) => /[a-z]/.test(unit)), ['dsh-memory', 'v3.7'])
+  // v3.13：拉丁词按 . _ - 拆子词（URL / 路径 / 连字符标识符），所以 dsh-memory 也出 dsh / memory。
+  assert.deepEqual(contentUnitsOf('dsh-memory v3.7 别名').filter((unit) => /[a-z]/.test(unit)), [
+    'dsh-memory',
+    'dsh',
+    'memory',
+    'v3.7',
+    'v3',
+  ])
   // v3.12 的切分口径：词；3 字词额外保留词内 bigram（验证门 → 验证门/验证/证门），便于问半截。
   assert.deepEqual(contentUnitsOf('验证门'), ['验证门', '验证', '证门'])
   assert.deepEqual(contentUnitsOf('本地部署'), ['本地', '部署'], '两个词典词各自成单元，不再拼出跨词 bigram')
@@ -1325,6 +1332,42 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(r.topId, 'p', '词级切分应命中含「验证门」的条目')
   assert.ok(r.matchedUnits.includes('验证门'), '命中的单元里应出现整词「验证门」')
   ok('v3.12 词典词整词命中（验证门 / 收工前）')
+}
+
+// ---- v3.13 拉丁子词 + 护栏看「要注入的那条」 ----
+{
+  // 起因：记忆里写 https://github.com/...，用户问「发到 GitHub 上了吗」—— 整词 github.com 与查询 github 对不上，
+  // 长句基准里那条因此排错（m78 覆盖率 0.66 却进不了相关层）。
+  const urlUnits = contentUnitsOf('https://github.com/chenqingsong-6017/dsh-eval').filter((unit) => /[a-z]/.test(unit))
+  assert.ok(urlUnits.includes('github'), 'URL 里的 github.com 应拆出 github')
+  assert.ok(urlUnits.includes('eval'), 'dsh-eval 应拆出 eval')
+  assert.ok(tokenize('dsh-eval').has('dsh') && tokenize('dsh-eval').has('eval'), '排序层也要拆')
+  assert.deepEqual(contentUnitsOf('插件').filter((unit) => /[a-z]/.test(unit)), [], '纯中文不受影响')
+  ok('v3.13 拉丁子词：URL / 连字符标识符按分隔段拆（github.com → github）')
+}
+
+{
+  // 护栏判「实际要注入的那条」（排序 top）的证据，不是覆盖率 top 的：
+  // 覆盖率 top 可能是无关条目（单命中一个词），排序 top 才是要写进提示的那条。
+  const r1 = gateDecision({
+    coverage: 0.21,
+    matchedUnits: ['重复'],
+    matchedDf: [1],
+    unitCount: 5,
+    agreeWithRanking: false,
+    rankEvidence: { units: 2, matchedDf: [3, 2], coverage: 0.09 },
+  })
+  assert.equal(r1.pass, true, '排序 top 命中 2 个单元 → 不该被覆盖率 top 的单单元拖下水')
+  const r2 = gateDecision({
+    coverage: 0.21,
+    matchedUnits: ['重复'],
+    matchedDf: [1],
+    unitCount: 5,
+    agreeWithRanking: false,
+    rankEvidence: { units: 1, matchedDf: [1], coverage: 0.09 },
+  })
+  assert.equal(r2.pass, false, '排序 top 也只命中 1 个罕见词 → 仍然挡')
+  ok('v3.13 单单元护栏按「要注入的那条」判，不按覆盖率 top')
 }
 
 console.log(`memory: ${passed} 项通过`)

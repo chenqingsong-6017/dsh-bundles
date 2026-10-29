@@ -9,6 +9,9 @@ const store = JSON.parse(readFileSync('D:/AI/dsh-data/memory/memory.json', 'utf8
 const entries = store.entries
 const corp = entries.filter((e) => typeof e.supersededBy !== 'string' && e.pinned !== true)
 const byId = new Map(entries.map((e) => [e.id, e]))
+// v3.13：pinned 条目永远全文在场，不该算「没召回」。短问法基准一直是这样算的（pinnedExpected → 直接算命中），
+// 长句基准漏了这一条，实测把「快捷方式改名」(m19) 和「文件放哪个盘」(m1) 两条 pinned 目标误报成失败。
+const pinnedIds = new Set(entries.filter((e) => e.pinned === true).map((e) => e.id))
 const RETIRED = new Set(['deprecated', 'archived'])
 const resolve = (id) => {
   const seen = new Set()
@@ -32,7 +35,8 @@ for (const item of cases.positives) {
   const stats = {}
   renderMemory(entries, { maxInjectChars: 1500, query: item.query, stats })
   const r = relevanceCoverage(corp, item.query)
-  const hit = expected.some((id) => (stats.relevant ?? []).includes(id))
+  const pinnedExpected = expected.filter((id) => pinnedIds.has(id))
+  const hit = pinnedExpected.length > 0 || expected.some((id) => (stats.relevant ?? []).includes(id))
   if (hit) full += 1
   console.log(
     (hit ? '✅' : '❌') + ' cov=' + r.coverage.toFixed(4) + ' top=' + String(r.topId).padEnd(5) +
