@@ -27,6 +27,7 @@ import {
   queryIdfSum,
   cleanAliases,
   localDateOf,
+  gateDecision,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -1252,6 +1253,20 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok((stats.relevant ?? []).includes('py'), '真正含 python 的条目没进相关层')
   assert.ok(!(stats.relevant ?? []).includes('noise'), '零内容单元重合的条目被注入了相关层')
   ok('v3.9 相关层与门槛同尺：零重合条目不进相关层（A2）')
+}
+
+// ---- v3.11 双信号门槛（72 正例 / 35 负例实测出来的规则）----
+{
+  const pass = (coverage, matchedUnits, agreeWithRanking) =>
+    gateDecision({ coverage, matchedUnits, agreeWithRanking }).pass
+  assert.equal(pass(0.2, ['甲'], false), true, '覆盖率够就该过（主条件）')
+  assert.equal(pass(0.15, ['甲', '乙'], true), true, '双信号一致 + 命中 2 单元应放宽通过')
+  assert.equal(pass(0.15, ['甲'], true), false, '单命中不放宽 —— 真实负例「电脑为什么会蓝屏」就是这种')
+  assert.equal(pass(0.15, ['甲', '乙'], false), false, '两个信号不一致时不放宽')
+  assert.equal(pass(0.05, ['甲', '乙', '丙'], true), false, '低于 0.07 底线不放')
+  assert.equal(pass(0.147, ['电脑'], true), false, '电脑蓝屏（cov 0.147、单单元）必须挡住')
+  assert.equal(gateDecision({ coverage: 0.15, matchedUnits: ['甲', '乙'], agreeWithRanking: true }).relaxed, true)
+  ok('v3.11 gateDecision：主条件 / 双信号放宽 / 单命中不放 / 低于底线不放')
 }
 
 console.log(`memory: ${passed} 项通过`)

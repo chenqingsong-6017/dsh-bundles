@@ -50,6 +50,11 @@ const SCOPE_BOOST = 1.4
 // v3.8：0.15 → 0.16。口径换了（见 relevanceCoverage），阈值按实测重定：
 //   21 条负例里最高的「电脑为什么会蓝屏」= 0.147，换皮正例里最低的保住全文的是 0.161，0.16 落在缝里。
 const RELEVANCE_FLOOR = 0.16
+// v3.11：第二档放行条件。覆盖率单指标在正例长尾（0.07–0.16）跟负例（最高 0.147）是重叠的 ——
+// 只靠一条阈值必然二选一：要么漏掉 21% 的真命中，要么放进负例。
+// 于是加第二个独立信号：**覆盖率最高的那条记忆，跟排序层 top1 是不是同一条**。
+// 两个不同口径的检索都指向它，才允许在低覆盖率下放行。
+const RELEVANCE_FLOOR_AGREE = 0.07
 const COMPOSITE_IMPORTANCE_WEIGHT = 0.5
 const COMPOSITE_RECENCY_WEIGHT = 0.3
 const RELEVANT_COMPOSITE_MARGIN = 1.15
@@ -469,9 +474,20 @@ export function renderMemory(allEntries, options) {
     const coverageReport = relevanceCoverage(entries.filter((item) => !item.pinned), queryText)
     const { coverage } = coverageReport
     relevanceSeen = coverage
+    // v3.11：两个信号一致时放宽到 0.07，但要求**至少命中 2 个内容单元**。
+    // 实测（72 正例 / 35 负例）：单信号 0.16 过 56/72；放宽到 0.07 只加「双信号一致」能到 64/72 但会放过
+    // 「电脑为什么会蓝屏」这类单字假命中；再加「命中≥2 单元」正好 60/72 且负例 0 —— 拿 4 个真命中、不进口子。
+    const coverageTopId = coverageReport.topId
+    const agreeWithRanking = coverageTopId !== null && scored.length > 0 && scored[0].entry.id === coverageTopId
+    const gate = gateDecision({
+      coverage,
+      matchedUnits: coverageReport.matchedUnits,
+      agreeWithRanking,
+      floor,
+    })
     // v3.10：scored 为空（query 里没有任何能进 tokenize 的词）时不能往下走，
     // 否则 ranked[0].composite 直接抛错 —— 宁可这一轮不给全文。
-    if (coverage >= floor && scored.length > 0) {
+    if (gate.pass && scored.length > 0) {
       const now = Date.now()
       const ranked = scored
         .map((item) => ({
@@ -493,7 +509,9 @@ export function renderMemory(allEntries, options) {
         // 实测 query「python快排」过门 0.39，注入的却是跟 query 零内容单元重合的条目（只靠单字「快」）。
         // 这里要求被注入的条目自身至少有一个内容单元命中。
         if (!((coverageReport.byId?.get(item.entry.id) ?? 0) > 0)) continue
-        if (relevant.length > 0 && item.composite * RELEVANT_COMPOSITE_MARGIN < topComposite) break
+        // v3.11：覆盖率最高的那条天然有资格拿全文，别被复合分（重要度/新鲜度）挤掉。
+        const isCoverageTop = item.entry.id === coverageTopId
+        if (!isCoverageTop && relevant.length > 0 && item.composite * RELEVANT_COMPOSITE_MARGIN < topComposite) break
         const cost = lineRelevant(item.entry).length + 1
         if (spent + cost > cap) break
         relevant.push(item.entry)
@@ -862,6 +880,20 @@ export function queryClauses(query) {
   const parts = text.split(CLAUSE_SPLIT).map((part) => part.trim()).filter((part) => contentUnitsOf(part).length > 0)
   if (parts.length <= 1) return text === '' ? [] : [text]
   return parts
+}
+
+/**
+ * v3.11 门槛判定（纯函数，便于单测）。
+ * 主条件：覆盖率 ≥ floor（0.16，单指标）。
+ * 放宽条件：**双信号一致**（覆盖率 top1 == 排序层 top1）+ 至少命中 2 个内容单元 + 覆盖率 ≥ 0.07。
+ * 依据：72 正例 / 35 负例实测，单指标 56/72 且 0 负例；放宽到「只要求一致」64/72 但会放过
+ * 「电脑为什么会蓝屏」这类单字假命中；再加「≥2 单元」正好 60/72 且负例 0 —— 白赚 4 个真命中。
+ */
+export function gateDecision({ coverage, matchedUnits, agreeWithRanking, floor = RELEVANCE_FLOOR }) {
+  const units = Array.isArray(matchedUnits) ? matchedUnits.length : 0
+  if (coverage >= floor) return { pass: true, relaxed: false }
+  const relaxed = agreeWithRanking === true && units >= 2 && coverage >= RELEVANCE_FLOOR_AGREE
+  return { pass: relaxed, relaxed }
 }
 
 export function relevanceCoverage(entries, query) {
