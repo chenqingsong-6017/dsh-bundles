@@ -5,7 +5,7 @@
 // 用法：node _selftest/memory-eval.mjs            # 两块都跑
 //       node _selftest/memory-eval.mjs --fixture  # 只跑夹具
 import { existsSync, readFileSync } from 'node:fs'
-import { renderMemory, scoreEntries } from '../dsh-memory/index.js'
+import { applicableAt, renderMemory, scoreEntries } from '../dsh-memory/index.js'
 
 const STORE = 'D:/AI/dsh-data/memory/memory.json'
 const BUDGET = 1500
@@ -67,19 +67,25 @@ console.log(`  recall@3 = ${hits}/${cases.length} = ${(recall * 100).toFixed(0)}
 if (!fixtureOnly && existsSync(STORE)) {
   console.log('')
   console.log('B. 真实库卫生检查')
+  // v3.14b：以前这里不传 cwd，也不按 workspaces 过滤 —— v3.0 的工作区条件注入上线后，
+  // 条件不匹配的 pinned 条目本来就不该出现在块里，却被当成「硬规则缺失」（实测误报 m10/m11/m12）。
+  // 「失效漏注入」同理：m5→m65 这类合并会让新条目正文包含旧条目全文，按 30 字前缀查会把正常合并误判成泄漏。
+  const CWD = process.cwd()
   const entries = JSON.parse(readFileSync(STORE, 'utf8')).entries
-  const pinned = entries.filter((entry) => entry.pinned === true)
+  const pinned = entries.filter((entry) => entry.pinned === true && applicableAt(entry, CWD))
   const active = entries.filter((entry) => typeof entry.supersededBy !== 'string')
-  const block = renderMemory(entries, { maxInjectChars: BUDGET })
+  const stats = {}
+  const block = renderMemory(entries, { maxInjectChars: BUDGET, cwd: CWD, stats })
   const coreMissing = pinned.filter((entry) => !block.includes(entry.text))
-  const supersededLeak = entries.filter((entry) => typeof entry.supersededBy === 'string' && block.includes(entry.text.slice(0, 30)))
+  const injectedIds = new Set([...(stats.full ?? []), ...(stats.relevant ?? []), ...(stats.indexed ?? []), ...(stats.compact ?? [])])
+  const supersededLeak = entries.filter((entry) => typeof entry.supersededBy === 'string' && injectedIds.has(entry.id))
   const chars = block.length
   const limit = BUDGET + 250
   const coreOk = coreMissing.length === 0
   const leakOk = supersededLeak.length === 0
   const sizeOk = chars <= limit
   if (!coreOk || !leakOk || !sizeOk) ok = false
-  console.log(`  生效 ${active.length} / 失效 ${entries.length - active.length} / 硬规则 ${pinned.length}`)
+  console.log(`  生效 ${active.length} / 失效 ${entries.length - active.length} / 本工作区适用的硬规则 ${pinned.length}（cwd: ${CWD}）`)
   console.log(`  ${coreOk ? '✅' : '❌'} 硬规则全部注入（${pinned.length - coreMissing.length}/${pinned.length}）${coreOk ? '' : ' 缺失: ' + coreMissing.map((entry) => entry.id).join(',')}`)
   console.log(`  ${leakOk ? '✅' : '❌'} 失效条目未漏注入`)
   console.log(`  ${sizeOk ? '✅' : '❌'} 注入 ${chars} 字符（上限 ${limit}）`)
