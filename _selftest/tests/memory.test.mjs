@@ -136,8 +136,16 @@ const ranked = scoreEntries(rankedCorpus, '超预算 拒绝写入').filter((item
 assert.equal(ranked[0].entry.id, 'relevant', '最相关的条目必须排第一')
 assert.ok(ranked.every((item) => item.score > 0))
 ok('BM25：相关条目排序正确')
-assert.ok(tokenize('插件 都放 D 盘 memory').size >= 6, 'tokenize 应切出中文 unigram/bigram 与英文词')
-ok('tokenize：中文 bigram + 英文词')
+{
+  // v3.12：中文从 bigram 换成**词**（词典正向最大匹配）。这里锁住三条性质：
+  //   词典词整词出现、英文整词保留、词内不再拆出单字（片段三重计数的根）。
+  const terms = tokenize('插件 都放 D 盘 memory')
+  assert.ok(terms.has('插件'), '词典词应整词成单元')
+  assert.ok(terms.has('memory'), '英文整词保留')
+  assert.ok(!terms.has('插') && !terms.has('件'), '词内不应再出单字单元')
+  assert.equal(tokenize('验证门').get('验证门'), 1, '词典里的 3 字词整词命中')
+}
+ok('tokenize：中文按词（词典切分）+ 英文词')
 
 // ---- v1.3 按本轮消息召回（query）----
 const queryPool = [
@@ -965,7 +973,10 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(units.includes('推荐'), '应保留内容 bigram')
   assert.ok(!units.some((unit) => unit.length === 1), '中文不再出 unigram（片段是三重计数的根）')
   assert.deepEqual(contentUnitsOf('dsh-memory v3.7 别名').filter((unit) => /[a-z]/.test(unit)), ['dsh-memory', 'v3.7'])
-  ok('v3.8 contentUnitsOf：拉丁整词 + 中文 bigram，丢虚词 bigram 与单字片段')
+  // v3.12 的切分口径：词；3 字词额外保留词内 bigram（验证门 → 验证门/验证/证门），便于问半截。
+  assert.deepEqual(contentUnitsOf('验证门'), ['验证门', '验证', '证门'])
+  assert.deepEqual(contentUnitsOf('本地部署'), ['本地', '部署'], '两个词典词各自成单元，不再拼出跨词 bigram')
+  ok('contentUnitsOf：拉丁整词 + 中文按词，丢虚词单元')
 }
 
 {
@@ -978,10 +989,18 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const oldCoverage = idfTotal > 0 ? oldTop.score / idfTotal : 0
   const now = relevanceCoverage(corpus, query)
   assert.ok(oldCoverage >= 0.15, `旧口径应误判过门，实际 ${oldCoverage.toFixed(3)}`)
-  assert.ok(now.coverage < 0.16, `新口径不该过门，实际 ${now.coverage.toFixed(3)}`)
+  // v3.12：词级切分让覆盖率的分母变小（4 个内容单元而不是 8 个 bigram），这个合成用例的覆盖率
+  // 从 0.147 升到 0.2321 —— 靠「单单元护栏」挡住（单命中 + df≤1 + 长查询 < 0.25），
+  // 不是靠覆盖率阈值。护栏的实测依据见 README v3.12。
+  assert.ok(now.coverage >= 0.20 && now.coverage < 0.25, `覆盖率应在 [0.20,0.25)，实际 ${now.coverage.toFixed(4)}`)
   assert.deepEqual(now.matchedUnits, ['推荐'])
   assert.equal(now.topId, 'poison')
-  ok('v3.8 相关性门槛：一个「推荐」不再把「推荐一部好看的电影」送过门槛')
+  assert.equal(
+    gateDecision({ coverage: now.coverage, matchedUnits: now.matchedUnits, matchedDf: now.matchedDf, unitCount: now.unitCount, agreeWithRanking: true }).pass,
+    false,
+    '单单元护栏应挡住它',
+  )
+  ok('v3.12 单单元护栏：一个「推荐」不再把「推荐一部好看的电影」送过相关层')
 }
 
 {
@@ -990,7 +1009,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const corpus = [...fillers, { id: 'plug', text: '插件更新后必须重启 DSH 才会换模块代际', tags: ['plugin'] }]
   const now = relevanceCoverage(corpus, '插件更新后要重启吗')
   assert.equal(now.topId, 'plug')
-  assert.ok(now.coverage >= 0.16, `真相关应过门，实际 ${now.coverage.toFixed(3)}`)
+  assert.ok(now.coverage >= 0.20, `真相关应过门，实际 ${now.coverage.toFixed(3)}`)
   ok('v3.8 相关性门槛：换皮但真相关的问法仍进相关层')
 }
 
@@ -1002,7 +1021,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const negBlock = renderMemory(store, { maxInjectChars: 1200, query: '推荐一部好看的电影', stats: negStats })
   assert.deepEqual(negStats.relevant, [], '负例不该进相关层')
   assert.ok(!/相关 \d/.test(negBlock), '负例不该出现「相关 N」字样')
-  assert.ok(negStats.relevanceCoverage < 0.16, '诊断字段应记录本轮覆盖率')
+  assert.ok(negStats.relevanceCoverage < 0.25, '诊断字段应记录本轮覆盖率（且低于单单元护栏）')
   const posStats = {}
   renderMemory(store, { maxInjectChars: 1200, query: '插件更新后要重启吗', stats: posStats })
   assert.deepEqual(posStats.relevant, ['plug'])
@@ -1255,18 +1274,57 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   ok('v3.9 相关层与门槛同尺：零重合条目不进相关层（A2）')
 }
 
-// ---- v3.11 双信号门槛（72 正例 / 35 负例实测出来的规则）----
+// ---- v3.11 双信号门槛；v3.12 换词级口径后按 74 正例 / 35 负例重新标定 ----
 {
-  const pass = (coverage, matchedUnits, agreeWithRanking) =>
-    gateDecision({ coverage, matchedUnits, agreeWithRanking }).pass
-  assert.equal(pass(0.2, ['甲'], false), true, '覆盖率够就该过（主条件）')
-  assert.equal(pass(0.15, ['甲', '乙'], true), true, '双信号一致 + 命中 2 单元应放宽通过')
-  assert.equal(pass(0.15, ['甲'], true), false, '单命中不放宽 —— 真实负例「电脑为什么会蓝屏」就是这种')
+  const pass = (coverage, matchedUnits, agreeWithRanking, matchedDf, unitCount) =>
+    gateDecision({ coverage, matchedUnits, agreeWithRanking, matchedDf, unitCount }).pass
+  assert.equal(pass(0.25, ['甲'], false), true, '覆盖率过主条件（v3.12 下限 0.20）就该过')
+  assert.equal(pass(0.20, ['甲'], false), true, '压在 0.20 线上也算过')
+  assert.equal(pass(0.15, ['甲', '乙'], true), true, '双信号一致 + 命中 2 单元 → 0.12 以上放宽')
+  assert.equal(pass(0.15, ['甲'], true), false, '单命中不放宽（「电脑为什么会蓝屏」就是这种）')
   assert.equal(pass(0.15, ['甲', '乙'], false), false, '两个信号不一致时不放宽')
-  assert.equal(pass(0.05, ['甲', '乙', '丙'], true), false, '低于 0.07 底线不放')
-  assert.equal(pass(0.147, ['电脑'], true), false, '电脑蓝屏（cov 0.147、单单元）必须挡住')
-  assert.equal(gateDecision({ coverage: 0.15, matchedUnits: ['甲', '乙'], agreeWithRanking: true }).relaxed, true)
-  ok('v3.11 gateDecision：主条件 / 双信号放宽 / 单命中不放 / 低于底线不放')
+  assert.equal(pass(0.05, ['甲', '乙', '丙'], true), false, '低于 0.12 底线不放')
+  assert.equal(
+    gateDecision({ coverage: 0.15, matchedUnits: ['甲', '乙'], agreeWithRanking: true }).relaxed,
+    true,
+  )
+  // v3.12 单单元护栏：短查询（≤2 单元）0.40、长查询（≥3 单元）0.25
+  assert.equal(pass(0.3296, ['电脑'], true, [1], 2), false, '短查询单命中 + df≤1 + 0.3296 必须挡住')
+  assert.equal(pass(0.4379, ['技能'], true, [1], 2), true, '短查询单命中但覆盖率 0.4379 放行')
+  assert.equal(pass(0.2321, ['推荐'], true, [1], 4), false, '长查询单命中 0.2321（合成负例）挡住')
+  assert.equal(pass(0.30, ['技能'], true, [1], 5), true, '长查询单命中 0.30 放行')
+  assert.equal(pass(0.23, ['记忆', '插件'], true, [3, 5], 5), true, '两个单元命中不看单单元护栏')
+  ok('v3.11/v3.12 gateDecision：主条件 / 双信号放宽 / 单命中护栏 / 低于底线不放')
+}
+
+// ---- v3.12 词级切分：A6 跨词边界假命中 ----
+{
+  // A6：bigram 时代「基本地址」里会拼出「本地」，把无关记忆顶过门槛（真实库实测 0.2375 > 0.16）。
+  const corpus = [
+    { id: 'a', text: '基本地址栏里没别的，都是填充' },
+    { id: 'b', text: '填充用的无关记忆内容' },
+    { id: 'c', text: '另一条填充用的记录' },
+  ]
+  const r = relevanceCoverage(corpus, '本地部署要先看文档')
+  assert.deepEqual(r.matchedUnits, [], 'A6 用例不该有任何单元命中')
+  assert.equal(r.coverage, 0, '覆盖率应为 0，实际 ' + r.coverage.toFixed(4))
+  assert.ok(!contentUnitsOf('基本地址').includes('本地'), '「基本地址」里不应再产出跨词 bigram「本地」')
+  assert.deepEqual(contentUnitsOf('本地部署'), ['本地', '部署'], '「本地部署」应切成两个词典词')
+  ok('v3.12 A6：中文按词切分，跨词边界不再拼出假词（基本地址 ≠ 本地）')
+}
+
+// ---- v3.12 词级切分：词典词是一个单元，能直接命中 ----
+{
+  const corpus = [
+    { id: 'p', text: '验证门在收工前自动跑三道门', tags: ['verify-gate'] },
+    { id: 'q', text: '今天上海天气不错', tags: ['misc'] },
+  ]
+  assert.ok(tokenize('验证门').has('验证门'), '词典里的 3 字词应整词成单元')
+  assert.ok(contentUnitsOf('验证门在收工前').includes('验证门'), '收工前/验证门都该是整词单元')
+  const r = relevanceCoverage(corpus, '验证门跑几个门')
+  assert.equal(r.topId, 'p', '词级切分应命中含「验证门」的条目')
+  assert.ok(r.matchedUnits.includes('验证门'), '命中的单元里应出现整词「验证门」')
+  ok('v3.12 词典词整词命中（验证门 / 收工前）')
 }
 
 console.log(`memory: ${passed} 项通过`)

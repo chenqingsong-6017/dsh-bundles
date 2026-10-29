@@ -47,14 +47,21 @@ const MAX_QUERY_CHARS = 400
 const SCOPE_BOOST = 1.4
 // v2.3 检索：相关性覆盖率下限（命中内容单元的信息量 ÷ 查询内容单元的信息量，与语料规模无关）
 // + 三因子加权（Generative Agents 思路）。
-// v3.8：0.15 → 0.16。口径换了（见 relevanceCoverage），阈值按实测重定：
-//   21 条负例里最高的「电脑为什么会蓝屏」= 0.147，换皮正例里最低的保住全文的是 0.161，0.16 落在缝里。
-const RELEVANCE_FLOOR = 0.16
+// v3.8：0.15 → 0.16。v3.12：0.16 → 0.20 —— 中文单元从 bigram 换成词以后，查询的「分母」变小
+//   （一句话的单元数少了），覆盖率整体上移：旧阈值下短问法负例会漏进 3 条。
+//   v3.12 实测（74 正例 / 35 负例）：负例最高「电脑为什么会蓝屏」0.3296（由单单元护栏挡住），
+//   次高「MySQL 索引优化怎么做」0.1918，正例在 0.20 这条线上正好保住全部分数（见 README v3.12）。
+const RELEVANCE_FLOOR = 0.20
 // v3.11：第二档放行条件。覆盖率单指标在正例长尾（0.07–0.16）跟负例（最高 0.147）是重叠的 ——
 // 只靠一条阈值必然二选一：要么漏掉 21% 的真命中，要么放进负例。
 // 于是加第二个独立信号：**覆盖率最高的那条记忆，跟排序层 top1 是不是同一条**。
 // 两个不同口径的检索都指向它，才允许在低覆盖率下放行。
-const RELEVANCE_FLOOR_AGREE = 0.07
+// v3.12：0.07 → 0.12。同上：词级口径下偏低覆盖率更少见，0.12 才能只放「两个信号一致」的真命中。
+const RELEVANCE_FLOOR_AGREE = 0.12
+// v3.12：单单元匹配的两档更高下限（见 gateDecision 的护栏注释）。
+//   短查询（≤2 个内容单元）：0.40；长查询（≥3 个）：0.25。
+const RELEVANCE_SINGLE_WORD_FLOOR_SHORT = 0.40
+const RELEVANCE_SINGLE_WORD_FLOOR_LONG = 0.25
 const COMPOSITE_IMPORTANCE_WEIGHT = 0.5
 const COMPOSITE_RECENCY_WEIGHT = 0.3
 const RELEVANT_COMPOSITE_MARGIN = 1.15
@@ -482,6 +489,8 @@ export function renderMemory(allEntries, options) {
     const gate = gateDecision({
       coverage,
       matchedUnits: coverageReport.matchedUnits,
+      matchedDf: coverageReport.matchedDf,
+      unitCount: coverageReport.unitCount,
       agreeWithRanking,
       floor,
     })
@@ -637,17 +646,107 @@ export function renderMemory(allEntries, options) {
   return built.block
 }
 
-/** 分词：英文/数字按词，中文按 unigram + bigram（无空格语言只能这样切）。 */
-export function tokenize(input) {
-  const value = String(input ?? '').toLowerCase()
-  const terms = new Map()
-  const bump = (term) => terms.set(term, (terms.get(term) ?? 0) + 1)
-  for (const word of value.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) bump(word)
-  for (const run of value.match(/[\u4e00-\u9fff]+/g) ?? []) {
-    for (let index = 0; index < run.length; index += 1) bump(run[index])
-    for (let index = 0; index + 2 <= run.length; index += 1) bump(run.slice(index, index + 2))
+/* ───────────────────────── v3.12 中文分词 ─────────────────────────
+ *
+ * v3.11 及之前中文按 **bigram** 切（本地部署 → 本地/地部/部署），跨词边界会拼出假词：
+ * 「基**本地**址」里的「本地」被当成命中，把不相关记忆顶过门槛（A6，实测覆盖率 0.2375 > 0.16）。
+ * v3.12 换成**词**：词典正向最大匹配优先，词典外的片段退回 bigram 兜底。
+ *   - 词典在 zh-words.txt（跟插件一起版本化，一行一词，只收真词）；
+ *   - 排序层（tokenize）与门槛层（contentUnitsOf）**共用同一个切分函数** ——
+ *     v3.10 之前两者口径不同源，出现过「门槛过、排序层没候选」的错位；
+ *   - 3 字词额外保留**词典内的**子词（验证门 → 验证门 + 验证），只问半截时不至于漏召回；
+ *     子词也必须在词典里才算，避免「证门」这种拼接产物混进单元表。
+ * 刻意**不用** Intl.Segmenter：ICU 78 把「文档/插件/重启/覆盖率/台账/卸载」都拆成单字
+ * （实测见 README v3.12），跨环境还会随 ICU 版本变，测试不可复现。
+ */
+const ZH_WORD_MAX = 3
+const ZH_WORDS = (() => {
+  const set = new Set()
+  try {
+    const text = readFileSync(new URL('./zh-words.txt', import.meta.url), 'utf8')
+    for (const line of text.split(/\r?\n/)) {
+      const word = line.trim()
+      if (word === '' || word.startsWith('#')) continue
+      if (word.length < 2 || word.length > ZH_WORD_MAX) continue
+      if (!/^[\u4e00-\u9fff]+$/.test(word)) continue
+      set.add(word)
+    }
+  } catch {
+    // 词典读不到就退化成整段 bigram（v3.11 行为），不抛错、不影响记忆读写。
   }
-  return terms
+  return set
+})()
+
+/** 返回 run[i] 处最长词典词的长度（没有则 0）。 */
+function zhWordLengthAt(run, start) {
+  const longest = Math.min(ZH_WORD_MAX, run.length - start)
+  for (let length = longest; length >= 2; length -= 1) {
+    if (ZH_WORDS.has(run.slice(start, start + length))) return length
+  }
+  return 0
+}
+
+/**
+ * 切一个中文 run。返回的单元是「词」（词典内的多字词 + 词典内子词）或「bigram 兜底」。
+ * 跨词边界的 bigram **不会**产生 —— 这正是 A6 的解法。
+ */
+function segmentZhRun(run) {
+  const units = []
+  let index = 0
+  while (index < run.length) {
+    const length = zhWordLengthAt(run, index)
+    if (length > 0) {
+      const word = run.slice(index, index + length)
+      units.push(word)
+      // 3 字词额外保留**词内** bigram（验证门 → 验证/证门）：问「验证」半截时还能命中。
+      // 词内 bigram 不跨词边界，所以不会把「基本地址」拼成「本地」—— A6 仍然治住。
+      if (length === 3) {
+        units.push(word.slice(0, 2))
+        units.push(word.slice(1))
+      }
+      index += length
+      continue
+    }
+    // 未登录片段：一直吃到下一个词典词的开头，片段内按 bigram 切（保证未登录词还能字面命中）。
+    let end = index + 1
+    while (end < run.length && zhWordLengthAt(run, end) === 0) end += 1
+    const gap = run.slice(index, end)
+    if (gap.length === 1) units.push(gap)
+    else for (let offset = 0; offset + 2 <= gap.length; offset += 1) units.push(gap.slice(offset, offset + 2))
+    index = end
+  }
+  return units
+}
+
+// 分词结果按输入字符串缓存：同一批记忆条目每轮会被重复切很多次（渲染 + 排序 + 门槛各一遍）。
+// 缓存上限到了就整体清空 —— 宁可偶尔重算，也不让长会话把内存吃满。
+const SEGMENT_CACHE_LIMIT = 4000
+const TOKEN_CACHE = new Map()
+const UNIT_CACHE = new Map()
+function cacheGet(cache, key, compute) {
+  const hit = cache.get(key)
+  if (hit !== undefined) return hit
+  if (cache.size >= SEGMENT_CACHE_LIMIT) cache.clear()
+  const value = compute()
+  cache.set(key, value)
+  return value
+}
+
+/**
+ * 分词（排序层用）：英文/数字按整词，中文按词。
+ * 注意：返回的 Map 由缓存共享，**调用方不得修改**。
+ */
+export function tokenize(input) {
+  const key = String(input ?? '').toLowerCase()
+  return cacheGet(TOKEN_CACHE, key, () => {
+    const terms = new Map()
+    const bump = (term) => terms.set(term, (terms.get(term) ?? 0) + 1)
+    for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) bump(word)
+    for (const run of key.match(/[\u4e00-\u9fff]+/g) ?? []) {
+      for (const unit of segmentZhRun(run)) bump(unit)
+    }
+    return terms
+  })
 }
 
 /**
@@ -668,8 +767,9 @@ export function suggestAliases(text, limit = 4) {
     if (term.length < 2) continue
     if (ALIAS_STOP.has(term)) continue
     const isLatin = /^[a-z0-9]/.test(term)
-    // 中文只取 bigram（更长的是跨词拼接，质量差）；英文/代码词整词保留
-    if (!isLatin && term.length !== 2) continue
+    // v3.12：中文单元已经是「词」（2–3 字，词典内），不再是跨词拼接的 bigram，所以 2 字与 3 字都收；
+    // 英文/代码词整词保留。
+    if (!isLatin && (term.length < 2 || term.length > ZH_WORD_MAX)) continue
     scored.push({ term, score: (isLatin ? 2 : 1) + count })
   }
   scored.sort((a, b) => b.score - a.score || a.term.localeCompare(b.term))
@@ -690,7 +790,7 @@ const BM25_TAG_WEIGHT = 2
 /** aliases 是人工写的「跨词面桥」，命中权重应高于 tag（tag 是分类，alias 是等同词）。 */
 const BM25_ALIAS_WEIGHT = 2.5
 /** 同义词扩展的权重：低于原词，避免扩展词把噪声顶上来。 */
-const EXPANSION_WEIGHT = 0.5
+const EXPANSION_WEIGHT = 0.2
 
 function bm25Doc(entry) {
   const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
@@ -825,35 +925,38 @@ export function scoreEntriesStrict(entries, query) {
  *    实测在同一个负例里，虚词贡献了分子 27% 的分数（一 1.52 + 的 1.15 / 合计 9.83）。
  *
  * 拉丁词/数字仍是整词（长度 ≥2），中文单字 run 只有在它不是虚词时才保留。
+ *
+ * v3.12：中文单元从 bigram 换成**词**（segmentZhRun）。虚词规则不变，只是判断单位变成词：
+ * 一个字都是虚词的单字丢、每个字都是虚词的词丢。A6（「基本地址」跨边界拼出「本地」）随之消失。
  */
 const CJK_STOP_CHARS = new Set(
   [...'的了是在不有和就都也我你他她它这那什么怎么吗呢吧啊哦个上下中之与及或等很更最太再还被把给让从到对为以所而且但如因为所以一二三四五六七八九十每各某多没要会可才又已经并'],
 )
 
 export function contentUnitsOf(input) {
-  const value = String(input ?? '').toLowerCase()
-  const units = []
-  // v3.10（A5）：去掉拉丁词尾的 . _ -（原来 `chrome.` 和 `chrome` 是两个不同的词，实测导致漏召回）。
-  // 注意仍是 {1,}：单字符拉丁（C 盘 / D 盘里的 c、d）刻意不算内容单元 —— 它们跟排序层 tokenize 的口径不一致，
-  // 硬塞进来会出现「门槛过、排序层没候选」的错位（A9 试过，会直接抛错，已回退）。
-  for (const word of value.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) {
-    const trimmed = word.replace(/[._-]+$/, '')
-    if (trimmed !== '') units.push(trimmed)
-  }
-  for (const run of value.match(/[\u4e00-\u9fff]+/g) ?? []) {
-    if (run.length === 1) {
-      if (!CJK_STOP_CHARS.has(run)) units.push(run)
-      continue
+  const key = String(input ?? '').toLowerCase()
+  // 返回的数组由缓存共享，调用方不得修改。
+  return cacheGet(UNIT_CACHE, key, () => {
+    const units = []
+    // v3.10（A5）：去掉拉丁词尾的 . _ -（原来 `chrome.` 和 `chrome` 是两个不同的词，实测导致漏召回）。
+    // 注意仍是 {1,}：单字符拉丁（C 盘 / D 盘里的 c、d）刻意不算内容单元 —— 它们跟排序层 tokenize 的口径不一致，
+    // 硬塞进来会出现「门槛过、排序层没候选」的错位（A9 试过，会直接抛错，已回退）。
+    for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) {
+      const trimmed = word.replace(/[._-]+$/, '')
+      if (trimmed !== '') units.push(trimmed)
     }
-    for (let index = 0; index + 2 <= run.length; index += 1) {
-      const bigram = run.slice(index, index + 2)
-      // 两个都是虚词才丢：保住「会议」这类只含一个虚词字的真词，丢掉「的是」这类纯虚词 bigram。
-      // 注意「不是」两个都是虚词字 → 会被丢，这是有意的（它不承载主题信息）。
-      if (CJK_STOP_CHARS.has(bigram[0]) && CJK_STOP_CHARS.has(bigram[1])) continue
-      units.push(bigram)
+    // v3.12：中文按**词**（与排序层 tokenize 同一个 segmentZhRun），不再是 bigram。
+    for (const run of key.match(/[\u4e00-\u9fff]+/g) ?? []) {
+      for (const unit of segmentZhRun(run)) {
+        // 虚词不算分：单字虚词丢；多字单元要**每个字**都是虚词才丢 ——
+        // 保住「会议」这类只含一个虚词字的真词，丢掉「什么」「不要」这类纯虚词词。
+        // 注意「不是」两个字都是虚词 → 会被丢，这是有意的（它不承载主题信息）。
+        if ([...unit].every((char) => CJK_STOP_CHARS.has(char))) continue
+        units.push(unit)
+      }
     }
-  }
-  return units
+    return units
+  })
 }
 
 /**
@@ -889,8 +992,25 @@ export function queryClauses(query) {
  * 依据：72 正例 / 35 负例实测，单指标 56/72 且 0 负例；放宽到「只要求一致」64/72 但会放过
  * 「电脑为什么会蓝屏」这类单字假命中；再加「≥2 单元」正好 60/72 且负例 0 —— 白赚 4 个真命中。
  */
-export function gateDecision({ coverage, matchedUnits, agreeWithRanking, floor = RELEVANCE_FLOOR }) {
+export function gateDecision({ coverage, matchedUnits, matchedDf, unitCount, agreeWithRanking, floor = RELEVANCE_FLOOR }) {
   const units = Array.isArray(matchedUnits) ? matchedUnits.length : 0
+  // v3.12：单单元匹配的「证据不足」护栏。
+  // 词级切分让分母变小，单个词的命中就能把覆盖率顶到 0.3 以上 —— 实测负例
+  // 「电脑为什么会蓝屏」只命中「电脑」一次（该词在整库只出现 1 条）就到 0.3482，
+  // 而「已推荐未批准」那条让「推荐一部好看的电影」只命中「推荐」也到 0.33。
+  // 规则：**只命中 1 个单元**、该单元在语料里 df ≤ 1、且覆盖率不到 0.40 → 不放行。
+  // 依据：35 条负例里单单元命中的最高覆盖率 0.3482；74 条正例里靠单单元过门的（Hermes 0.435、
+  // 两个工作区 0.4013）都在 0.40 以上。
+  // 分两档：查询越短，单单元命中越像巧合，要求越高。
+  //   短查询（≤2 单元）：0.40 —— 实测正例「技能是怎么生成的」单命中 0.4379 能过，
+  //     负例「电脑为什么会蓝屏」单命中 0.3296 被挡住；
+  //   长查询（≥3 单元）：0.25 —— 合成负例「推荐一部好看的电影」对上「已推荐未批准」是 0.2321，
+  //     被挡住；长句正例里单命中的真实命中都在 0.25 以上（只有 1 条 0.2046 的会掉，见 README v3.12）。
+  const queryUnits = Number.isInteger(unitCount) ? unitCount : 99
+  const singleWordFloor = queryUnits <= 2 ? RELEVANCE_SINGLE_WORD_FLOOR_SHORT : RELEVANCE_SINGLE_WORD_FLOOR_LONG
+  if (units === 1 && Array.isArray(matchedDf) && matchedDf[0] <= 1 && coverage < singleWordFloor) {
+    return { pass: false, relaxed: false }
+  }
   if (coverage >= floor) return { pass: true, relaxed: false }
   const relaxed = agreeWithRanking === true && units >= 2 && coverage >= RELEVANCE_FLOOR_AGREE
   return { pass: relaxed, relaxed }
@@ -901,7 +1021,7 @@ export function relevanceCoverage(entries, query) {
   const clauses = queryClauses(query)
   if (clauses.length > 1) {
     // 分句取最大：每句单独算，谁最相关用谁（并合并 byId，供相关层同尺判断）。
-    let best = { coverage: 0, topId: null, matchedUnits: [], byId: new Map() }
+    let best = { coverage: 0, topId: null, matchedUnits: [], matchedDf: [], byId: new Map() }
     const merged = new Map()
     for (const clause of clauses) {
       const part = relevanceCoverage(list, clause)
@@ -921,7 +1041,7 @@ export function relevanceCoverage(entries, query) {
     return { entry, terms, length }
   })
   const queryUnits = [...new Set(contentUnitsOf(query))]
-  if (docs.length === 0 || queryUnits.length === 0) return { coverage: 0, topId: null, matchedUnits: [] }
+  if (docs.length === 0 || queryUnits.length === 0) return { coverage: 0, topId: null, matchedUnits: [], matchedDf: [] }
   let totalLength = 0
   for (const doc of docs) totalLength += doc.length
   const avgLength = totalLength / docs.length || 1
@@ -935,6 +1055,7 @@ export function relevanceCoverage(entries, query) {
   let best = 0
   let topId = null
   let matchedUnits = []
+  let matchedDf = []
   for (const doc of docs) {
     let score = 0
     const matched = []
@@ -950,6 +1071,8 @@ export function relevanceCoverage(entries, query) {
       best = score
       topId = doc.entry.id
       matchedUnits = matched
+      // v3.12：把命中单元的 df 一起带出去，供 gateDecision 判「单单元证据够不够」。
+      matchedDf = matched.map((unit) => df.get(unit) ?? 0)
     }
   }
   // v3.9：分子带 BM25 的 tf 饱和与长度归一，短条目 + 高频词会让比值超过 1（实测 1.42–1.95）。
@@ -968,7 +1091,7 @@ export function relevanceCoverage(entries, query) {
     }
     byId.set(doc.entry.id, denominator > 0 ? Math.min(1, own / denominator) : 0)
   }
-  return { coverage: Math.min(1, ratio), topId, matchedUnits, byId }
+  return { coverage: Math.min(1, ratio), topId, matchedUnits, matchedDf, unitCount: queryUnits.length, byId }
 }
 
 /** 单条打分（兼容旧签名）；传 options.entries 就能用上跨条目的 IDF。 */
