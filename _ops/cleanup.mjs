@@ -145,6 +145,30 @@ if (existsSync(pd)) {
   }
 }
 
+// ---- 规则 6：tidy 的系统工具缓存 ----
+// 注册表导出（一个 HKCU\SOFTWARE 就 13 MB）只在「改坏要回滚」的那几天有用；
+// 同类只留最新一份；*.zip 是下载来的压缩包，解开后的 exe / 已就位，压缩包本身可丢。
+const tidyTools = 'D:\\AI\\dsh-data\\tidy\\tools'
+if (existsSync(tidyTools)) {
+  const groups = new Map()
+  for (const name of readdirSync(tidyTools)) {
+    const full = path.join(tidyTools, name)
+    if (name.toLowerCase().endsWith('.zip')) {
+      add(full, 'tidy 下载的压缩包（解压后的工具已就位）')
+      continue
+    }
+    const m = name.match(/^(.+?)-\d{8}-\d{6}\.(reg|json|txt)$/)
+    if (!m) continue
+    const key = m[1] + '.' + m[2]
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push({ p: full, m: statSync(full).mtimeMs })
+  }
+  for (const [, list] of groups) {
+    list.sort((a, b) => b.m - a.m)
+    for (const item of list.slice(1)) add(item.p, 'tidy 注册表/扫描导出（同类只留最新 1 份）')
+  }
+}
+
 // ---- 输出 ----
 if (plan.length === 0) {
   console.log('cleanup: 没有该清的东西（保留策略全部满足）')
