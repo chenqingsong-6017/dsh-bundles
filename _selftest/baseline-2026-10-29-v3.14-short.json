@@ -1,0 +1,670 @@
+{
+  "metrics": {
+    "positives": 34,
+    "retired": 2,
+    "negatives": 21,
+    "recallAt1": 1,
+    "recallAt3": 1,
+    "mrr": 1,
+    "injectedCoverage": 1,
+    "fullTextRelevance": 1,
+    "negativeInjectionRate": 0,
+    "avgInjectedChars": 1468,
+    "budget": 1500
+  },
+  "positives": [
+    {
+      "query": "改完插件怎么让它生效",
+      "expected": [
+        "m74",
+        "m69"
+      ],
+      "top3": [
+        "m74",
+        "m69",
+        "m81"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1429
+    },
+    {
+      "query": "验证门是做什么的",
+      "expected": [
+        "m70"
+      ],
+      "top3": [
+        "m70",
+        "m76",
+        "m23"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1472
+    },
+    {
+      "query": "测试失败会被拦吗",
+      "expected": [
+        "m70"
+      ],
+      "top3": [
+        "m70",
+        "m57",
+        "m84"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1484
+    },
+    {
+      "query": "本机评测套件在哪",
+      "expected": [
+        "m71"
+      ],
+      "top3": [
+        "m71",
+        "m80",
+        "m78"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1490
+    },
+    {
+      "query": "评测结果怎么样",
+      "expected": [
+        "m71"
+      ],
+      "top3": [
+        "m71",
+        "m69",
+        "m75"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1461
+    },
+    {
+      "query": "headless profile 能跑进程隔离吗",
+      "expected": [
+        "m57"
+      ],
+      "top3": [
+        "m57",
+        "m80",
+        "m81"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1484
+    },
+    {
+      "query": "三路对照的耗时是多少",
+      "expected": [
+        "m71"
+      ],
+      "top3": [
+        "m71",
+        "m23",
+        "m24"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1461
+    },
+    {
+      "query": "评测套件发布到哪了",
+      "expected": [
+        "m78"
+      ],
+      "top3": [
+        "m78",
+        "m71",
+        "m75"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1426
+    },
+    {
+      "query": "抖音打不开先杀什么进程",
+      "expected": [
+        "m68"
+      ],
+      "top3": [
+        "m68",
+        "m57",
+        "m76"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1484
+    },
+    {
+      "query": "抖音为什么提权就退出",
+      "expected": [
+        "m68"
+      ],
+      "top3": [
+        "m68",
+        "m76",
+        "m67"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1484
+    },
+    {
+      "query": "VirtualBox 虚拟机报路径找不到",
+      "expected": [
+        "m66"
+      ],
+      "top3": [
+        "m66",
+        "m80",
+        "m77"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1481
+    },
+    {
+      "query": "迁移虚拟机怎么改注册信息",
+      "expected": [
+        "m66"
+      ],
+      "top3": [
+        "m66",
+        "m69",
+        "m74"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1481
+    },
+    {
+      "query": "GlassBoard 接管桌面图标怎么恢复",
+      "expected": [
+        "m67"
+      ],
+      "top3": [
+        "m67",
+        "m69",
+        "m68"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1459
+    },
+    {
+      "query": "Hermes 构建报证书错误",
+      "expected": [
+        "m72"
+      ],
+      "top3": [
+        "m72",
+        "m66"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1474
+    },
+    {
+      "query": "Hermes 在终端里启动就秒退",
+      "expected": [
+        "m72"
+      ],
+      "top3": [
+        "m72",
+        "m68",
+        "m82"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1474
+    },
+    {
+      "query": "DeepSeek API 支持哪些模型",
+      "expected": [
+        "m15"
+      ],
+      "top3": [
+        "m15",
+        "m57",
+        "m72"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1484
+    },
+    {
+      "query": "Hermes 的配置和密钥在哪",
+      "expected": [
+        "m72"
+      ],
+      "top3": [
+        "m72",
+        "m71",
+        "m23"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1474
+    },
+    {
+      "query": "文件夹改名后要复核哪些引用",
+      "expected": [
+        "m22"
+      ],
+      "top3": [
+        "m22",
+        "m15",
+        "m23"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1440
+    },
+    {
+      "query": "tidy 数据在哪、能回滚吗",
+      "expected": [
+        "m21"
+      ],
+      "top3": [
+        "m21",
+        "m71",
+        "m23"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1427
+    },
+    {
+      "query": "归档区能不能清理",
+      "expected": [
+        "m24",
+        "m66"
+      ],
+      "top3": [
+        "m24",
+        "m65",
+        "m66"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1480
+    },
+    {
+      "query": "工作区地图的权威来源",
+      "expected": [
+        "m76"
+      ],
+      "top3": [
+        "m76",
+        "m75",
+        "m23"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1483
+    },
+    {
+      "query": "dsh-亲爱的管家是干什么的",
+      "expected": [
+        "m76"
+      ],
+      "top3": [
+        "m76",
+        "m23",
+        "m84"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1483
+    },
+    {
+      "query": "dsh-创建这个工作区负责什么",
+      "expected": [
+        "m76"
+      ],
+      "top3": [
+        "m76",
+        "m75",
+        "m84"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1483
+    },
+    {
+      "query": "能不能跨工作区干活",
+      "expected": [
+        "m76"
+      ],
+      "top3": [
+        "m76",
+        "m75",
+        "m78"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1483
+    },
+    {
+      "query": "给插件更新的流程是什么",
+      "expected": [
+        "m74"
+      ],
+      "top3": [
+        "m74",
+        "m76",
+        "m23"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1473
+    },
+    {
+      "query": "skill-forge 有哪些工具",
+      "expected": [
+        "m69"
+      ],
+      "top3": [
+        "m69",
+        "m15",
+        "m21"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1487
+    },
+    {
+      "query": "竞品调研的核心结论",
+      "expected": [
+        "m75"
+      ],
+      "top3": [
+        "m75",
+        "m83",
+        "m76"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1446
+    },
+    {
+      "query": "会话搜索要不要自己写",
+      "expected": [
+        "m73"
+      ],
+      "top3": [
+        "m73",
+        "m84",
+        "m34"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1472
+    },
+    {
+      "query": "官方可选 bundle 怎么装",
+      "expected": [
+        "m73"
+      ],
+      "top3": [
+        "m73",
+        "m74",
+        "m69"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1472
+    },
+    {
+      "query": "插件 UX 规范放哪了",
+      "expected": [
+        "m4"
+      ],
+      "top3": [
+        "m4",
+        "m74",
+        "m73"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1445
+    },
+    {
+      "query": "WorkBuddy 学习空间能不能删",
+      "expected": [
+        "m65"
+      ],
+      "top3": [
+        "m65",
+        "m67",
+        "m83"
+      ],
+      "rank": 1,
+      "pinnedExpected": false,
+      "injected": true,
+      "fullText": true,
+      "chars": 1485
+    },
+    {
+      "query": "插件代码和数据放哪个盘",
+      "expected": [
+        "m1",
+        "m80"
+      ],
+      "top3": [
+        "m80",
+        "m21",
+        "m74"
+      ],
+      "rank": 1,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1483
+    },
+    {
+      "query": "快捷方式能不能改名",
+      "expected": [
+        "m19"
+      ],
+      "top3": [
+        "m22",
+        "m67",
+        "m62"
+      ],
+      "rank": 0,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1432
+    },
+    {
+      "query": "文件改英文名的规矩",
+      "expected": [
+        "m20"
+      ],
+      "top3": [
+        "m74",
+        "m22",
+        "m4"
+      ],
+      "rank": 0,
+      "pinnedExpected": true,
+      "injected": true,
+      "fullText": true,
+      "chars": 1450
+    }
+  ],
+  "negatives": [
+    {
+      "query": "今天上海天气怎么样",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "帮我写个 Python 快排",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "推荐一部好看的电影",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "React useEffect 的依赖数组怎么理解",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "MySQL 索引优化怎么做",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "如何练习英语口语",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "有什么好听的歌推荐",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "帮我写一首诗",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "明天会下雨吗",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "怎么减肥最快",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "给我讲个笑话",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "今晚吃什么好",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "手机没电了怎么办",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "翻译一句英文",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "电脑为什么会蓝屏",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "怎么学开车",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "哪家餐厅好吃",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "如何提高睡眠质量",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "有没有好的书推荐",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "怎么挑选显卡",
+      "relevant": 0,
+      "chars": 1467
+    },
+    {
+      "query": "今天汇率多少",
+      "relevant": 0,
+      "chars": 1467
+    }
+  ]
+}
