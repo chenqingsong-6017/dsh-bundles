@@ -25,6 +25,8 @@ import {
   contentUnitsOf,
   relevanceCoverage,
   queryIdfSum,
+  cleanAliases,
+  localDateOf,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -1004,6 +1006,194 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   renderMemory(store, { maxInjectChars: 1200, query: '插件更新后要重启吗', stats: posStats })
   assert.deepEqual(posStats.relevant, ['plug'])
   ok('v3.8 renderMemory：门槛与「相关 N」口径一致，stats 带覆盖率便于排查')
+}
+
+// ---- v3.9 数据安全：一轮独立审查（两个审查员 + Lead 复验）修掉的缺陷 ----
+{
+  // B07：每日备份轮转不能吃掉手工回滚点
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-bak-'))
+  writeFileSync(path.join(tmp, 'memory.json'), JSON.stringify({ version: 1, nextId: 1, entries: [] }), 'utf8')
+  for (let i = 1; i <= 11; i += 1) writeFileSync(path.join(tmp, `memory.json.bak-202610${String(i).padStart(2, '0')}`), '{}', 'utf8')
+  writeFileSync(path.join(tmp, 'memory.json.bak-before-aliases'), '{"keep":1}', 'utf8')
+  writeFileSync(path.join(tmp, 'memory.json.bak-before-merge3'), '{"keep":2}', 'utf8')
+  const h = host(tmp)
+  await h.defs.get('memory_add').execute({ text: '触发一次落盘' })
+  const names = readdirSync(tmp)
+  assert.ok(names.includes('memory.json.bak-before-aliases'), '手工回滚点被轮转删了')
+  assert.ok(names.includes('memory.json.bak-before-merge3'), '手工回滚点被轮转删了')
+  assert.ok(names.filter((name) => /\.bak-\d{8}$/.test(name)).length <= 10, '每日备份应只留 10 份')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 备份轮转只动每日备份，手工回滚点保留')
+}
+
+{
+  // B01：写盘失败必须报错，不能报「已记住」
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-writefail-'))
+  const h = host(tmp)
+  mkdirSync(path.join(tmp, 'memory.json.tmp')) // 让原子写的目标路径变成目录 → rename 必失败
+  let threw = false
+  try {
+    await h.defs.get('memory_add').execute({ text: '这条永远不落盘' })
+  } catch (error) {
+    threw = true
+  }
+  assert.equal(threw, true, '写盘失败却返回成功（假成功）')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 写盘失败会抛错，不再假成功')
+}
+
+{
+  // B03：add 的去重只认生效条目；命中的是失效条目时应重新生效
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-dedupe-dead-'))
+  const h = host(tmp)
+  const first = await h.defs.get('memory_add').execute({ text: '旧事实：预算 8000' })
+  await h.defs.get('memory_update').execute({ id: first.entry.id, text: '新事实：预算 12000', supersede: true })
+  const again = await h.defs.get('memory_add').execute({ text: '旧事实：预算 8000' })
+  const list = await h.defs.get('memory_list').execute({})
+  assert.ok(list.block.includes('预算 8000'), '重新写入的正文没有生效（假成功）')
+  assert.ok(again.entry.id !== first.entry.id, '不该复用已失效条目的 id')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 add 不再跟已失效条目去重（假成功）')
+}
+
+{
+  // B04：命中同一个生效条目时，新给的字段要合并进去
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-dedupe-fields-'))
+  const h = host(tmp)
+  await h.defs.get('memory_add').execute({ text: '同一句话' })
+  const second = await h.defs.get('memory_add').execute({
+    text: '同一句话',
+    aliases: ['别名甲'],
+    tags: ['t1'],
+    scope: 'plugin-dev',
+    importance: 9,
+    kind: 'rule',
+  })
+  assert.equal(second.deduped, true)
+  assert.deepEqual(second.entry.aliases, ['别名甲'])
+  assert.deepEqual(second.entry.tags, ['t1'])
+  assert.equal(second.entry.scope, 'plugin-dev')
+  assert.equal(second.entry.importance, 9)
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 去重时合并 aliases/tags/scope/importance（不再整包吞掉）')
+}
+
+{
+  // B05：supersede 的新条目继承重要度与过期日
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-supersede-fields-'))
+  const h = host(tmp)
+  const old = await h.defs.get('memory_add').execute({ text: '旧说法', importance: 10, staleAfter: '2026-12-31', kind: 'fact' })
+  const next = await h.defs.get('memory_update').execute({ id: old.entry.id, text: '新说法', supersede: true })
+  assert.equal(next.entry.importance, 10)
+  assert.equal(next.entry.staleAfter, '2026-12-31')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 supersede 继承 importance / staleAfter')
+}
+
+{
+  // B06 / B16：merge 继承 workspaces，且不接受重复 id
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-merge-fields-'))
+  const h = host(tmp)
+  const a = await h.defs.get('memory_add').execute({ text: '项目A规则一：提交前跑验证门', workspaces: ['D:\\AI\\projA'] })
+  const b = await h.defs.get('memory_add').execute({ text: '项目A规则二：收工前不许跳门', workspaces: ['D:\\AI\\projA'] })
+  const merged = await h.defs.get('memory_merge').execute({ ids: [a.entry.id, b.entry.id] })
+  assert.deepEqual(merged.entry.workspaces, ['D:\\AI\\projA'], '合并后应有 workspaces')
+  assert.deepEqual(merged.entry.tags ?? [], [])
+  let threw = false
+  try {
+    await h.defs.get('memory_merge').execute({ ids: [a.entry.id, a.entry.id] })
+  } catch (error) {
+    threw = true
+  }
+  assert.equal(threw, true, '重复 id 应被拒绝')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 merge 继承 workspaces；重复 id 被拒')
+}
+
+{
+  // B11：删条目后 nextId 不能回退（否则复用 id）
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-nextid-'))
+  const h = host(tmp)
+  const a = await h.defs.get('memory_add').execute({ text: '第一条' })
+  const b = await h.defs.get('memory_add').execute({ text: '第二条' })
+  await h.defs.get('memory_remove').execute({ id: b.entry.id })
+  const reloaded = host(tmp)
+  const c = await reloaded.defs.get('memory_add').execute({ text: '第三条' })
+  assert.notEqual(c.entry.id, b.entry.id, 'nextId 回退导致复用已删 id')
+  assert.notEqual(c.entry.id, a.entry.id)
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 nextId 按最大 id 兜底，删除后不复用 id')
+}
+
+{
+  // B13：verified:true 要清掉 ⏰，别一条记忆同时挂「待重验 + 已验证」
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-verified-'))
+  const h = host(tmp)
+  const a = await h.defs.get('memory_add').execute({ text: '依赖版本的事实', kind: 'fact', staleAfter: '2020-01-01' })
+  const after = await h.defs.get('memory_update').execute({ id: a.entry.id, text: a.entry.text, verified: true })
+  assert.equal(trustMark(after.entry).includes('⏰'), false, 'verified 之后仍有 ⏰')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v3.9 verified:true 顺手刷新 staleAfter，⏰ 不再和 ✓ 同时出现')
+}
+
+{
+  // B12：过期日按本地日历算，不随写入时刻漂一天
+  const midnight = new Date(2026, 9, 29, 0, 30, 0)
+  const morning = new Date(2026, 9, 29, 9, 0, 0)
+  assert.equal(deriveStaleAfter('fact', midnight), deriveStaleAfter('fact', morning), '过期日随当天几点写而变')
+  const expected = new Date(2026, 9, 29 + 90)
+  assert.equal(deriveStaleAfter('fact', morning), localDateOf(expected))
+  ok('v3.9 staleAfter 用本地日历（B12）')
+}
+
+{
+  // B15：别名去重 / 截断
+  assert.deepEqual(cleanAliases([' 甲 ', '甲', '', '乙', 'x'.repeat(80)]), ['甲', '乙', 'x'.repeat(60)])
+  assert.equal(cleanAliases(Array.from({ length: 20 }, (_, i) => 'a' + i)).length, 8)
+  ok('v3.9 cleanAliases：去重 / 截断 / 最多 8 条')
+}
+
+{
+  // A4：覆盖率不能超过 1（短条目 + 高频词曾到 1.95）
+  const short = [{ id: 'x', text: '插件插件插件', tags: [] }]
+  const r = relevanceCoverage(short, '插件插件')
+  assert.ok(r.coverage <= 1, '覆盖率超过 1：' + r.coverage)
+  assert.ok(r.coverage >= 0)
+  ok('v3.9 覆盖率封顶在 [0,1]')
+}
+
+{
+  // A8：诊断行也要参与预算裁剪（预算 300 时原来 582）
+  const bulk = Array.from({ length: 80 }, (_, i) => ({ id: 'z' + i, text: '第' + i + '条 ' + '插件配置与验证门说明'.repeat(3), tags: ['t' + (i % 3)] }))
+  for (const budget of [600, 900, 1200]) {
+    const rendered = renderMemory(bulk, { maxInjectChars: budget })
+    assert.ok(rendered.length <= budget, `预算 ${budget} 实际 ${rendered.length}`)
+  }
+  ok('v3.9 诊断行可缩：小预算也不再超')
+}
+
+{
+  // A13：text 不是字符串时渲染不崩
+  const block = renderMemory([{ id: 'n1', text: null }, { id: 'n2' }, { id: 'n3', text: 42 }, { id: 'ok1', text: '正常一条' }], {
+    maxInjectChars: 1200,
+  })
+  assert.ok(typeof block === 'string')
+  assert.ok(block.includes('正常一条'))
+  ok('v3.9 renderMemory 对非字符串 text 不再抛错')
+}
+
+{
+  // A2：门槛由 top 条目判，相关层却按 scoreEntries 选 —— 两者不同源会注入跟 query 零内容重合的条目。
+  const store = [
+    { id: 'py', text: 'python 快排实现的要点', tags: ['code'] },
+    { id: 'noise', text: '快点收工别磨蹭，今天先到这', tags: ['chat'] },
+    { id: 'other', text: '完全无关的一条记忆', tags: ['misc'] },
+  ]
+  const stats = {}
+  renderMemory(store, { maxInjectChars: 1200, query: 'python快排', stats })
+  assert.ok((stats.relevant ?? []).includes('py'), '真正含 python 的条目没进相关层')
+  assert.ok(!(stats.relevant ?? []).includes('noise'), '零内容单元重合的条目被注入了相关层')
+  ok('v3.9 相关层与门槛同尺：零重合条目不进相关层（A2）')
 }
 
 console.log(`memory: ${passed} 项通过`)

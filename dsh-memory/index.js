@@ -35,6 +35,9 @@ const DEFAULT_MAX_BYTES = 8000
 const BACKUP_KEEP = 10
 const DEFAULT_MAX_INJECT_CHARS = 1200
 const MAX_TEXT_CHARS = 600
+// v3.9：别名也是存储，不能无限灌（B15）。
+const MAX_ALIASES = 8
+const MAX_ALIAS_CHARS = 60
 const CONTEXT_ORDER = 900
 const INDEX_SUMMARY_CHARS = 44
 const RELEVANT_SHARE = 0.3
@@ -111,7 +114,16 @@ const CANDIDATE_TTL_DAYS = 7
 export function deriveStaleAfter(kind, base = new Date()) {
   const days = kind === 'fact' ? 90 : kind === 'note' ? 30 : 0
   if (days === 0) return ''
-  return new Date(base.getTime() + days * 86400000).toISOString().slice(0, 10)
+  return localDateOf(new Date(base.getTime() + days * 86400000))
+}
+
+/**
+ * v3.9：日期一律走本地日历。
+ * 原来 toISOString().slice(0,10) 取的是 UTC 日期，于是同一条事实「90 天后过期」
+ * 会取决于当天几点写：本地 0:30 写得到前一天，9:00 写得到当天（B12）。
+ */
+export function localDateOf(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
 /** 记忆重要度 1-10：显式字段优先，否则按 kind / pinned / 使用次数规则推导（Generative Agents 的 importance 零模型替代）。 */
@@ -273,6 +285,22 @@ const TRUST_LEGEND =
  * 规范化一条记忆：v1 只有 id/text/tag/pinned，v2 增加 scope/kind/tags/paths/supersededBy/usedCount 等。
  * 关键：**未知字段要保留**，否则 load→persist 一轮就把 v2 字段洗掉了。
  */
+/** v3.9：别名清洗（trim / 丢空 / 去重 / 单条 60 字 / 最多 8 条）。normalizeEntry 与去重合并共用同一口径。 */
+export function cleanAliases(input) {
+  if (!Array.isArray(input)) return []
+  const seen = new Set()
+  const aliases = []
+  for (const raw of input) {
+    if (typeof raw !== 'string') continue
+    const alias = raw.trim().slice(0, MAX_ALIAS_CHARS)
+    if (alias === '' || seen.has(alias)) continue
+    seen.add(alias)
+    aliases.push(alias)
+    if (aliases.length >= MAX_ALIASES) break
+  }
+  return aliases
+}
+
 export function normalizeEntry(input) {
   const out = { id: input.id, text: input.text }
   for (const field of OPTIONAL_STRING_FIELDS) {
@@ -291,7 +319,8 @@ export function normalizeEntry(input) {
     if (tags.length > 0) out.tags = tags
   }
   if (Array.isArray(input.aliases)) {
-    const aliases = input.aliases.map((alias) => (typeof alias === 'string' ? alias.trim() : '')).filter((alias) => alias !== '')
+    // v3.9：去重 + 单条截断 + 条数上限。之前不去重也不截断，400 个别名能把库撑到 16 KB 而 usedChars 还报 15（B15）。
+    const aliases = cleanAliases(input.aliases)
     if (aliases.length > 0) out.aliases = aliases
   }
   if (Array.isArray(input.paths)) {
@@ -321,7 +350,7 @@ export function normalizeEntry(input) {
  * 信任标记：❓未证实（status=draft）/ ⏰待重验（staleAfter 早于今天）/ ✓已验证（有 verifiedAt）。
  * 返回空串表示无标记，注入内容与旧版逐字一致。
  */
-export function trustMark(entry, today = new Date().toISOString().slice(0, 10)) {
+export function trustMark(entry, today = localDateOf()) {
   const marks = []
   if (entry?.status === 'draft') marks.push('❓未证实')
   if (typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < today) marks.push('⏰待重验')
@@ -329,7 +358,9 @@ export function trustMark(entry, today = new Date().toISOString().slice(0, 10)) 
   return marks.length > 0 ? marks.join(' ') + ' ' : ''
 }
 
-const lineFull = (entry) => `- ${trustMark(entry)}${entry.pinned ? '📌 ' : ''}${entry.text}`
+// v3.9：text 不是字符串时（手改 memory.json 写坏、或外部直接调 renderMemory）不能整块崩。
+const textOf = (entry) => (typeof entry?.text === 'string' ? entry.text : String(entry?.text ?? ''))
+const lineFull = (entry) => `- ${trustMark(entry)}${entry.pinned ? '📌 ' : ''}${textOf(entry)}`
 
 const entryDate = (entry) => {
   const raw = typeof entry.updatedAt === 'string' && entry.updatedAt !== '' ? entry.updatedAt : entry.addedAt
@@ -342,7 +373,7 @@ const entryTag = (entry) => (Array.isArray(entry.tags) && entry.tags.length > 0 
 const lineRelevant = (entry) => {
   const tag = entryTag(entry) ? ` [${entryTag(entry)}]` : ''
   const date = entryDate(entry)
-  return `- (${entry.id})${trustMark(entry)}${tag}${date ? ` ${date}` : ''} ${entry.text}`
+  return `- (${entry.id})${trustMark(entry)}${tag}${date ? ` ${date}` : ''} ${textOf(entry)}`
 }
 
 const lineIndexCompact = (entry) => {
@@ -354,7 +385,7 @@ const lineIndexCompact = (entry) => {
 }
 
 const lineIndex = (entry) => {
-  const flat = entry.text.replace(/\s+/g, ' ').trim()
+  const flat = textOf(entry).replace(/\s+/g, ' ').trim()
   const summary = flat.length > INDEX_SUMMARY_CHARS ? `${flat.slice(0, INDEX_SUMMARY_CHARS)}…` : flat
   const tag = entryTag(entry) ? ` [${entryTag(entry)}]` : ''
   const date = entryDate(entry)
@@ -398,7 +429,7 @@ export function renderMemory(allEntries, options) {
   const dropped = []
   // v3.6 有效性硬门控：staleAfter 已过的条目降级为「只进索引、不给全文」。
   // 依据 2026-10 的 Obsolete-Facts 论文：过时证据进了上下文反而拉低准确率（45%→32%）。
-  const todayStr = new Date().toISOString().slice(0, 10)
+  const todayStr = localDateOf()
   const isExpired = (entry) =>
     typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < todayStr
 
@@ -435,7 +466,8 @@ export function renderMemory(allEntries, options) {
     //   否则「帮我写个 Python 快排」这类无关问题会被同义词抬过门槛 —— 2026-10-29 实测负例误注入 0%→75%。
     // v3.8：改数「内容单元」（relevanceCoverage），治片段三重计数与虚词算分 ——
     //   旧算法下一个「推荐」就能把一个无关问题送过 0.15（实测 0.169），见 relevanceCoverage 的注释。
-    const { coverage } = relevanceCoverage(entries.filter((item) => !item.pinned), queryText)
+    const coverageReport = relevanceCoverage(entries.filter((item) => !item.pinned), queryText)
+    const { coverage } = coverageReport
     relevanceSeen = coverage
     if (coverage >= floor) {
       const now = Date.now()
@@ -455,6 +487,10 @@ export function renderMemory(allEntries, options) {
       for (const item of ranked) {
         if (relevant.length >= MAX_RELEVANT) break
         if (isExpired(item.entry)) continue
+        // v3.9（A2）：门槛由「top 条目」判，但相关层是按 scoreEntries 排序选的，两者不同源 ——
+        // 实测 query「python快排」过门 0.39，注入的却是跟 query 零内容单元重合的条目（只靠单字「快」）。
+        // 这里要求被注入的条目自身至少有一个内容单元命中。
+        if (!((coverageReport.byId?.get(item.entry.id) ?? 0) > 0)) continue
         if (relevant.length > 0 && item.composite * RELEVANT_COMPOSITE_MARGIN < topComposite) break
         const cost = lineRelevant(item.entry).length + 1
         if (spent + cost > cap) break
@@ -511,10 +547,12 @@ export function renderMemory(allEntries, options) {
 
   // 诊断：被挤出预算的条目必须留痕（列出 id，不列正文），否则又是「悄悄丢」。
   const MAX_DIAGNOSTIC_IDS = 24
-  const buildBlock = () => {
-    const ids = dropped.slice(0, MAX_DIAGNOSTIC_IDS).map((entry) => entry.id)
+  // v3.9：诊断行长度随「被挤出条目数」增长，原来完全不参与预算裁剪 —— 预算 200 时实测块长 472（超 272）。
+  // 现在 id 列表可缩（24 → 12 → 6 → 3 → 0），0 表示只报条数。
+  const buildBlock = (diagLimit = MAX_DIAGNOSTIC_IDS) => {
+    const ids = dropped.slice(0, Math.max(0, diagLimit)).map((entry) => entry.id)
     let groupText = ''
-    if (dropped.length > ids.length) {
+    if (diagLimit > 0 && dropped.length > ids.length) {
       const groups = new Map()
       for (const entry of dropped) {
         const key = entry.scope ?? (Array.isArray(entry.tags) && entry.tags[0]) ?? entry.tag ?? 'other'
@@ -525,7 +563,9 @@ export function renderMemory(allEntries, options) {
     }
     const diagnostic =
       dropped.length > 0
-        ? `⚠ 另有 ${dropped.length} 条未注入：${ids.join(' ')}${groupText}（用 memory_search 按 id 或关键词取全文）`
+        ? diagLimit > 0
+          ? `⚠ 另有 ${dropped.length} 条未注入：${ids.join(' ')}${groupText}（用 memory_search 按 id 或关键词取全文）`
+          : `⚠ 另有 ${dropped.length} 条未注入（用 memory_search 按 id 或关键词取全文）`
         : ''
     const footer = `（全文 ${full.length}${relevant.length > 0 ? ` · 相关 ${relevant.length}` : ''} · 索引 ${indexed.length}${compact.length > 0 ? ` · 跨域 ${compact.length}` : ''}${dropped.length > 0 ? ` · 未注入 ${dropped.length}` : ''}；跨域或更早的记忆用 memory_search 按 id / 关键词取）`
     const block = [
@@ -546,12 +586,22 @@ export function renderMemory(allEntries, options) {
   // v3.6 预算自洽：头部只做了**预留**，页脚与诊断行是**动态**的，之前没算进 used ——
   // 实测 1631 字符 / 预算 1500，「略超」其实一直超 131。做法：先按优先级分配，
   // 再拿真实长度回削最低优先级（跨域 → 索引尾部），削到装得下为止。
-  let built = buildBlock()
-  for (let guard = 0; guard < entries.length + 8 && built.block.length > maxInjectChars; guard += 1) {
+  let diagLimit = MAX_DIAGNOSTIC_IDS
+  let built = buildBlock(diagLimit)
+  for (let guard = 0; guard < entries.length + 40 && built.block.length > maxInjectChars; guard += 1) {
     const sink = compact.length > 0 ? compact : indexed
-    if (sink.length === 0) break
-    dropped.push(sink.pop())
-    built = buildBlock()
+    if (sink.length > 0) {
+      dropped.push(sink.pop())
+      built = buildBlock(diagLimit)
+      continue
+    }
+    // 索引/跨域削空后，再缩诊断行；全削干还超（头部 + pinned + 页脚），只能认了。
+    if (diagLimit > 0) {
+      diagLimit = diagLimit > 12 ? 12 : diagLimit > 6 ? 6 : diagLimit > 3 ? 3 : 0
+      built = buildBlock(diagLimit)
+      continue
+    }
+    break
   }
 
   const statsOut = options?.stats
@@ -771,7 +821,8 @@ export function contentUnitsOf(input) {
     }
     for (let index = 0; index + 2 <= run.length; index += 1) {
       const bigram = run.slice(index, index + 2)
-      // 两个都是虚词才丢：保住「会议」「不是」这类含虚词字的真词。
+      // 两个都是虚词才丢：保住「会议」这类只含一个虚词字的真词，丢掉「的是」这类纯虚词 bigram。
+      // 注意「不是」两个都是虚词字 → 会被丢，这是有意的（它不承载主题信息）。
       if (CJK_STOP_CHARS.has(bigram[0]) && CJK_STOP_CHARS.has(bigram[1])) continue
       units.push(bigram)
     }
@@ -833,7 +884,23 @@ export function relevanceCoverage(entries, query) {
       matchedUnits = matched
     }
   }
-  return { coverage: denominator > 0 ? best / denominator : 0, topId, matchedUnits }
+  // v3.9：分子带 BM25 的 tf 饱和与长度归一，短条目 + 高频词会让比值超过 1（实测 1.42–1.95）。
+  // 「覆盖率」语义上不可能超过 100%，这里封顶；对判定没有影响（>1 本来就已经过门）。
+  const ratio = denominator > 0 ? best / denominator : 0
+  // byId：每条记忆自己的覆盖率，供相关层「同尺」判断（v3.9 / A2）。
+  const byId = new Map()
+  for (const doc of docs) {
+    let own = 0
+    for (const unit of queryUnits) {
+      const frequency = doc.terms.get(unit) ?? 0
+      if (frequency === 0) continue
+      own +=
+        Math.min(1, (frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgLength))) *
+        idfOf(docs.length, df.get(unit))
+    }
+    byId.set(doc.entry.id, denominator > 0 ? Math.min(1, own / denominator) : 0)
+  }
+  return { coverage: Math.min(1, ratio), topId, matchedUnits, byId }
 }
 
 /** 单条打分（兼容旧签名）；传 options.entries 就能用上跨条目的 IDF。 */
@@ -969,6 +1036,8 @@ export function apply(ctx, config) {
   // 数据安全：解析失败不覆盖，改名留证并进入只读保护态（P0-1）。
   let storeHealth = 'ok'
   let corruptCopy = ''
+  // v3.9：加载时因字段不合法被丢弃的条目，原文件已另存到这里（只提示，不改数据）。
+  let droppedCopyPath = ''
 
   const backupDay = () => {
     const date = new Date()
@@ -979,7 +1048,10 @@ export function apply(ctx, config) {
     try {
       if (!existsSync(storeDir)) return
       const prefix = `${path.basename(storeFile)}.bak-`
-      const names = readdirSync(storeDir).filter((name) => name.startsWith(prefix))
+      // v3.9：只轮转「每日备份」bak-YYYYMMDD。原来按前缀一刀切，
+      // 手工回滚点（bak-before-aliases / bak-before-merge3）也会被当成备份删掉（B07，实测可复现）。
+      const dailyOnly = /.bak-\d{8}$/
+      const names = readdirSync(storeDir).filter((name) => name.startsWith(prefix) && dailyOnly.test(name))
       if (names.length <= BACKUP_KEEP) return
       const listed = names.map((name) => {
         try {
@@ -1059,15 +1131,37 @@ export function apply(ctx, config) {
       const body = JSON.stringify(state, null, 2)
       const temp = `${storeFile}.tmp`
       writeFileSync(temp, body, 'utf8')
-      try {
-        renameSync(temp, storeFile)
-      } catch (error) {
-        writeFileSync(storeFile, body, 'utf8')
+      // v3.9：两处修正
+      // 1) 删掉「rename 失败就直接覆盖目标文件」的兜底 —— 那是非原子写，崩在中间会留下半截 JSON（B17）。
+      // 2) rename 失败重试几次，仍失败就**抛错**：原来只 return false，六个写工具全当成功，
+      //    模型以为记住了、重载却是空的（B01，实测 add 返回 m1 而磁盘无文件）。
+      let renamed = false
+      let lastError = null
+      for (let attempt = 0; attempt < 3 && !renamed; attempt += 1) {
+        try {
+          renameSync(temp, storeFile)
+          renamed = true
+        } catch (error) {
+          lastError = error
+        }
+      }
+      if (!renamed) {
+        try {
+          unlinkSync(temp)
+        } catch (error) {
+          // 临时文件清不掉就留着，下次覆盖
+        }
+        storeHealth = 'readonly'
+        throw new Error(
+          `记忆落盘失败（${lastError?.message ?? 'rename failed'}）。本次写入没有生效，别当成已保存；先用 memory_list 确认，修好磁盘/权限后重载插件。`,
+        )
       }
       syncAliases()
       return true
     } catch (error) {
-      return false
+      if (error instanceof Error && error.message.startsWith('记忆落盘失败')) throw error
+      storeHealth = 'readonly'
+      throw new Error(`记忆落盘失败（${error?.message ?? 'unknown'}）。本次写入没有生效，别当成已保存。`)
     }
   }
 
@@ -1084,12 +1178,29 @@ export function apply(ctx, config) {
         throw new Error('store shape is not {entries: []}')
       }
       const entries = parsed.entries
+      const kept = entries
+        .filter((entry) => entry && typeof entry.id === 'string' && typeof entry.text === 'string')
+        .map(normalizeEntry)
+      // v3.9：形状不合法的条目被丢弃时先留证，别让下一次 persist 把它彻底抹掉（B09）。
+      if (kept.length !== entries.length) {
+        try {
+          const droppedCopy = `${storeFile}.dropped-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`
+          copyFileSync(storeFile, droppedCopy)
+          droppedCopyPath = droppedCopy
+        } catch (error) {
+          // 留证失败不阻断加载
+        }
+      }
+      // v3.9：nextId 不能只靠 entries.length —— 删过条目后它会落后、造成重复 id（B11）。
+      const maxIdNumber = kept.reduce((max, entry) => {
+        const match = /^m?(\d+)$/.exec(String(entry.id))
+        return match ? Math.max(max, Number(match[1])) : max
+      }, 0)
+      const storedNextId = Number.isInteger(parsed?.nextId) && parsed.nextId > 0 ? parsed.nextId : 0
       state = {
-        nextId: Number.isInteger(parsed?.nextId) && parsed.nextId > 0 ? parsed.nextId : entries.length + 1,
+        nextId: Math.max(storedNextId, maxIdNumber + 1),
         version: Number.isInteger(parsed?.version) && parsed.version > 0 ? parsed.version : 1,
-        entries: entries
-          .filter((entry) => entry && typeof entry.id === 'string' && typeof entry.text === 'string')
-          .map(normalizeEntry),
+        entries: kept,
       }
     } catch (error) {
       // 损坏：把原文件改名留证，进入只读保护态；绝不静默覆盖。
@@ -1159,9 +1270,15 @@ export function apply(ctx, config) {
   }
   const flushUsage = () => {
     if (!usageDirty) return
-    persist()
-    usageDirty = false
-    lastUsageFlush = Date.now()
+    try {
+      persist()
+      usageDirty = false
+      lastUsageFlush = Date.now()
+    } catch (error) {
+      // v3.9：persist 现在会抛错（写失败要报错）。用量计数只是记账，不能因此打断系统提示装配。
+      usageDirty = false
+      lastUsageFlush = Date.now()
+    }
   }
 
   // 从运行期上下文取「本条用户消息」当检索查询：官方 AGENTS.md 也走 context.agent.session。
@@ -1245,7 +1362,13 @@ export function apply(ctx, config) {
     const query = currentQuery(context)
     const scope = currentScopeOf(context)
     const stats = {}
-    const block = renderOnce(query, stats, scope, currentCwdOf(context))
+    let block = ''
+    try {
+      block = renderOnce(query, stats, scope, currentCwdOf(context))
+    } catch (error) {
+      // v3.9：渲染异常绝不能连累系统提示装配 —— 一条脏数据不该让每个会话都起不来。
+      return ''
+    }
     // 同一个 query 只计一次（text() 每个 step 都会被调用）；按分钟节流落盘。
     if (query !== '' && query !== lastCountedQuery) {
       lastCountedQuery = query
@@ -1566,9 +1689,43 @@ export function apply(ctx, config) {
         if (args?.staleAfter !== undefined && args.staleAfter !== '' && !DATE_ONLY.test(String(args.staleAfter))) {
           throw new Error('staleAfter 需要 YYYY-MM-DD 格式。')
         }
-        const duplicate = state.entries.find((entry) => entry.text === raw)
+        // v3.9 两处修正：
+        // 1) 只跟**生效**条目去重。原来会命中已 superseded 的条目，返回「已存在」、正文却永不注入（B03）。
+        // 2) 命中时把这次新给的字段合并进去。原来只回写 pinned/status/staleAfter/sources，
+        //    aliases/tags/scope/kind/importance/workspaces 全被吞掉（B04）——而 aliasHint 教的正是「再 add 一次补别名」。
+        const duplicate = state.entries.find((entry) => isActive(entry) && entry.text === raw)
         if (duplicate) {
           let changed = false
+          const unionInto = (field, incoming) => {
+            if (!Array.isArray(incoming)) return
+            const values = incoming.filter((item) => typeof item === 'string' && item.trim() !== '')
+            if (values.length === 0) return
+            const before = Array.isArray(duplicate[field]) ? duplicate[field] : []
+            const next = field === 'aliases' ? cleanAliases([...before, ...values]) : [...new Set([...before, ...values])]
+            if (next.length === 0) return
+            duplicate[field] = next
+            changed = true
+          }
+          unionInto('aliases', args?.aliases)
+          unionInto('tags', args?.tags)
+          unionInto('workspaces', args?.workspaces)
+          unionInto('paths', args?.paths)
+          unionInto('sources', args?.sources)
+          if (typeof args?.scope === 'string' && args.scope.trim() !== '' && duplicate.scope !== args.scope.trim()) {
+            duplicate.scope = args.scope.trim()
+            changed = true
+          }
+          if (typeof args?.kind === 'string' && args.kind.trim() !== '' && duplicate.kind !== args.kind.trim()) {
+            duplicate.kind = args.kind.trim()
+            changed = true
+          }
+          if (Number.isFinite(args?.importance)) {
+            const value = Math.max(1, Math.min(10, Math.round(args.importance)))
+            if (duplicate.importance !== value) {
+              duplicate.importance = value
+              changed = true
+            }
+          }
           if (args?.pinned === true && !duplicate.pinned) {
             duplicate.pinned = true
             changed = true
@@ -1579,10 +1736,6 @@ export function apply(ctx, config) {
           }
           if (typeof args?.staleAfter === 'string' && args.staleAfter !== '' && duplicate.staleAfter !== args.staleAfter) {
             duplicate.staleAfter = args.staleAfter
-            changed = true
-          }
-          if (Array.isArray(args?.sources) && args.sources.length > 0) {
-            duplicate.sources = args.sources.filter((item) => typeof item === 'string' && item.trim() !== '')
             changed = true
           }
           if (changed) {
@@ -1741,6 +1894,11 @@ export function apply(ctx, config) {
             ...(typeof entry.migratedFrom === 'string' ? { migratedFrom: entry.migratedFrom } : {}),
             ...(Array.isArray(entry.sources) ? { sources: entry.sources } : {}),
             ...(Array.isArray(entry.aliases) ? { aliases: entry.aliases } : {}),
+            // v3.9：原来只抄了 tag/tags/scope/kind/paths/workspaces/pinned/sources/aliases，
+            // importance 和 staleAfter 被丢掉 —— supersede 一次，重要度从 10 掉到按 kind 推导的 4（B05）。
+            ...(Number.isFinite(entry.importance) ? { importance: entry.importance } : {}),
+            ...(typeof entry.staleAfter === 'string' ? { staleAfter: entry.staleAfter } : {}),
+            ...(typeof entry.validFrom === 'string' ? { validFrom: entry.validFrom } : {}),
             addedAt: now,
             updatedAt: now,
           })
@@ -1792,6 +1950,11 @@ export function apply(ctx, config) {
         if (args?.verified === true) {
           entry.verifiedBy = 'agent'
           entry.verifiedAt = new Date().toISOString()
+          // v3.9：提示文案说「复核后用 verified:true 清除 ⏰」，但原来只加 ✓、不清 staleAfter，
+          // 于是一条记忆同时挂「⏰待重验 ✓已验证」，按提示操作也清不掉（B13）。
+          const refreshed = deriveStaleAfter(typeof entry.kind === 'string' ? entry.kind : '')
+          if (refreshed !== '') entry.staleAfter = refreshed
+          else delete entry.staleAfter
         } else if (args?.verified === false) {
           delete entry.verifiedBy
           delete entry.verifiedAt
@@ -1881,8 +2044,9 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         requireWritable()
-        const ids = Array.isArray(args?.ids) ? args.ids.filter((id) => typeof id === 'string' && id !== '') : []
-        if (ids.length < 2) throw new Error('memory_merge 需要至少两个 id。')
+        // v3.9：先把重复 id 去掉再判「至少两个」。原来 [m1, m1] 能通过校验，把同一条合并两次（B16）。
+        const ids = [...new Set(Array.isArray(args?.ids) ? args.ids.filter((id) => typeof id === 'string' && id !== '') : [])]
+        if (ids.length < 2) throw new Error('memory_merge 需要至少两个不同的 id。')
         const sources = ids.map((id) => state.entries.find((item) => item.id === id && isActive(item)))
         if (sources.some((entry) => entry === undefined)) throw new Error('有 id 不存在或已失效，先用 memory_list 确认。')
         const first = sources[0]
@@ -1899,15 +2063,37 @@ export function apply(ctx, config) {
         }
         const now = new Date().toISOString()
         // 别名继承：合并时把各来源的别名并起来，否则每合并一次「桥」就淡一次（v3.6 发现的稀疏化根因）。
-        const unionAliases = [...new Set(sources.flatMap((item) => (Array.isArray(item.aliases) ? item.aliases : [])))]
+        const unionAliases = cleanAliases(sources.flatMap((item) => (Array.isArray(item.aliases) ? item.aliases : [])))
+        // v3.9：workspaces / paths / tags / sources 也必须继承。原来只抄 first，项目私有规则一合并就变全局注入（B06）。
+        const unionOf = (field) => [...new Set(sources.flatMap((item) => (Array.isArray(item[field]) ? item[field] : [])))]
+        const unionWorkspaces = unionOf('workspaces')
+        const unionPaths = unionOf('paths')
+        const unionSources = unionOf('sources')
+        const unionTags = Array.isArray(args?.tags) ? [...new Set([...unionOf('tags'), ...args.tags])] : unionOf('tags')
+        // scope 只在来源一致时继承；不一致时不擅自放大成 global。
+        const scopeValues = [...new Set(sources.map((item) => (typeof item.scope === 'string' ? item.scope.trim() : '')).filter((value) => value !== ''))]
+        const inheritedScope =
+          typeof args?.scope === 'string' && args.scope.trim() !== ''
+            ? args.scope.trim()
+            : scopeValues.length === 1
+              ? scopeValues[0]
+              : ''
+        // 重要度取最大；过期日取最早（更保守的那一个）。
+        const importanceValues = sources.map((item) => item.importance).filter((value) => Number.isFinite(value))
+        const staleValues = sources.map((item) => item.staleAfter).filter((value) => typeof value === 'string' && DATE_ONLY.test(value)).sort()
         const merged = normalizeEntry({
           id: `m${state.nextId}`,
           text: mergedText,
           ...(unionAliases.length > 0 ? { aliases: unionAliases } : {}),
           ...(typeof args?.tag === 'string' && args.tag.trim() !== '' ? { tag: args.tag.trim() } : first.tag ? { tag: first.tag } : {}),
-          ...(Array.isArray(args?.tags) ? { tags: args.tags } : Array.isArray(first.tags) ? { tags: first.tags } : {}),
-          ...(typeof args?.scope === 'string' && args.scope.trim() !== '' ? { scope: args.scope.trim() } : typeof first.scope === 'string' ? { scope: first.scope } : {}),
+          ...(unionTags.length > 0 ? { tags: unionTags } : {}),
+          ...(inheritedScope !== '' ? { scope: inheritedScope } : {}),
           ...(typeof args?.kind === 'string' && args.kind.trim() !== '' ? { kind: args.kind.trim() } : typeof first.kind === 'string' ? { kind: first.kind } : {}),
+          ...(unionWorkspaces.length > 0 ? { workspaces: unionWorkspaces } : {}),
+          ...(unionPaths.length > 0 ? { paths: unionPaths } : {}),
+          ...(unionSources.length > 0 ? { sources: unionSources } : {}),
+          ...(importanceValues.length > 0 ? { importance: Math.max(...importanceValues) } : {}),
+          ...(staleValues.length > 0 ? { staleAfter: staleValues[0] } : {}),
           ...(args?.pinned === true || first.pinned === true ? { pinned: true } : {}),
           addedAt: now,
           updatedAt: now,
@@ -2086,7 +2272,7 @@ export function apply(ctx, config) {
           archived: state.entries.length - active.length,
           draft: active.filter((entry) => entry.status === 'draft').length,
           recheck: active.filter(
-            (entry) => typeof entry.staleAfter === 'string' && entry.staleAfter < new Date().toISOString().slice(0, 10),
+            (entry) => typeof entry.staleAfter === 'string' && entry.staleAfter < localDateOf(),
           ).length,
           byScope,
           // v3.7：别名缺口要可见。索引层排序/检索都在用别名，没别名 = 换皮问法召回不到，
@@ -2114,7 +2300,7 @@ export function apply(ctx, config) {
   // 依据：OpenAI 2026 记忆升级的核心不是模型更聪明，而是把条目摊给用户审（「记忆概览页面」），
   // 其内部数据显示「跨时间准确性」仍是最弱一环。memory_audit 是给模型的，缺的是人能一眼扫完的视图。
   const buildReview = () => {
-    const today = new Date().toISOString().slice(0, 10)
+    const today = localDateOf()
     const entries = activeEntries()
     const overdue = entries.filter((entry) => typeof entry.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < today)
     const unverified = entries.filter((entry) => entry.status === 'draft')
