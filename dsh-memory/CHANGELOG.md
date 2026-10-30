@@ -11,7 +11,8 @@
 - `history.jsonl`：persist 成功后按基线 diff 追加事件（2 MB 轮转，写失败 fail-safe）。
 
 ### Changed
-- **默认存储预算 `DEFAULT_MAX_BYTES` 8000 → 12000**（依据：mem0 / memobase 存储无上限、容量只在注入侧卡；注入预算不变）。
+- **存储预算 8000 → 12000**：代码 `DEFAULT_MAX_BYTES` 与 `cordis.patch.yml` 的 `maxBytes` **两处同时改**——配置覆盖代码默认值，只改一处不生效（真机实测踩到；bundle patch 里原本硬写 8000）。
+- 依据：mem0 / memobase 存储无上限，容量只在注入侧卡；注入预算不变。
 
 ### Verification
 - 单测 121 项通过；三道门通过。
