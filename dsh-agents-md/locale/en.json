@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "AGENTS.md Support",
-    "description": "Re-enables the shipped agent-instructions row so every session loads AGENTS.md / CLAUDE.md chains (user-global, then project root to working directory)."
-  }
-}

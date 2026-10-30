@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "AGENTS.md 支持",
-    "description": "重新启用官方 agent-instructions：每个会话都会加载 AGENTS.md / CLAUDE.md 链（先用户全局，再从仓库根到工作目录逐层）。"
-  }
-}
