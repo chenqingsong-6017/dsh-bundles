@@ -1433,6 +1433,18 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   ok('v3.17 规则文件沉淀：只抽硬规则 / 跳过代码块表格 / 去重')
 }
 
+// ---- v3.18 自动入库的预算保护前提：deprecated 不占预算、不注入 ----
+{
+  const pool = [
+    { id: 'k1', text: '规则一：插件必须同时配测试并跑 npm run check', kind: 'rule', status: 'draft' },
+    { id: 'k2', text: '旧条目应该被归档掉不再出现', kind: 'fact', status: 'deprecated', archivedAt: '2026-10-30', archiveReason: 'auto-archive' },
+  ]
+  const out = renderMemory(pool, { maxInjectChars: 600 })
+  assert.ok(!out.includes('旧条目'), 'deprecated 条目不注入')
+  assert.ok(out.includes('规则一'), 'draft 规则仍注入')
+  ok('v3.18 归档机制：deprecated 不注入、draft 参与注入')
+}
+
 console.log(`memory: ${passed} 项通过`)
 
 

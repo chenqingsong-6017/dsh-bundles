@@ -1483,6 +1483,62 @@ export function apply(ctx, config) {
     )
   }
 
+  /**
+   * v3.18 自动入库（高置信度通道）：规则文件来的硬规则直接以 draft 身份进库。
+   * 依据 arXiv 2610.27377《What to Store, When to Recall, What to Forget in Experience Memory for Coding Agents》——
+   * 写入策略要在「该记」和「该忘」之间做预算权衡，而不是一律推给人审。
+   * 三条同时成立才收：来源=规则文件 / kind=rule / 与现有记忆相似度 < 0.7。
+   * 预算不够时先归档「最低价值」条目（status=deprecated + archivedAt，可逆，不物理删）。
+   */
+  function lowestValueCandidate() {
+    const pool = activeEntries().filter(
+      (entry) => entry.pinned !== true && (entry.usedCount ?? 0) === 0 && entry.kind !== 'rule' && entry.status !== 'draft',
+    )
+    if (pool.length === 0) return null
+    return pool
+      .map((entry) => ({ entry, imp: effectiveImportance(entry) }))
+      .sort((a, b) => a.imp - b.imp)[0].entry
+  }
+
+  function makeRoom(size) {
+    const archived = []
+    let guard = 0
+    while (usedChars() + size > maxBytes && guard < 20) {
+      guard += 1
+      const victim = lowestValueCandidate()
+      if (victim === null) return { ok: false, archived }
+      victim.status = 'deprecated'
+      victim.archivedAt = new Date().toISOString()
+      victim.archiveReason = 'auto-archive: 为规则自动入库腾预算'
+      archived.push(victim.id)
+    }
+    return { ok: usedChars() + size <= maxBytes, archived }
+  }
+
+  function autoPromoteRule(candidate, scope) {
+    const raw = String(candidate?.text ?? '').trim()
+    if (raw === '') return null
+    if (state.entries.some((entry) => entry.text === raw)) return null
+    if (activeEntries().some((entry) => textSimilarity(entry.text, raw) >= SIMILAR_HINT_FLOOR)) return null
+    const room = makeRoom(raw.length)
+    if (!room.ok) return null
+    const now = new Date().toISOString()
+    const entry = normalizeEntry({
+      id: `m${state.nextId}`,
+      text: raw,
+      kind: 'rule',
+      status: 'draft',
+      ...(typeof scope === 'string' && scope !== '' ? { scope } : {}),
+      addedAt: now,
+      updatedAt: now,
+      sources: [candidate.reason ?? 'rule-file'],
+    })
+    state.nextId += 1
+    state.entries.push(entry)
+    persist()
+    return { entry, archived: room.archived }
+  }
+
   function loadCandidates() {
     try {
       const parsed = JSON.parse(readFileSync(candidateFile, 'utf8'))
@@ -3043,7 +3099,11 @@ export function apply(ctx, config) {
             const fileText = readFileSync(ruleFile, 'utf8')
             for (const candidate of extractRuleCandidates(fileText, taken)) {
               if (added >= MAX_CANDIDATES_PER_TURN) break
-              addCandidate(candidate.text, scope, candidate.kind, candidate.reason, agent?.id)
+              // v3.18：高置信度候选（规则文件 + 硬规则）直接进库，其余仍进候选池等人审。
+              const promoted = autoPromoteRule(candidate, scope)
+              if (promoted === null) {
+                addCandidate(candidate.text, scope, candidate.kind, candidate.reason, agent?.id)
+              }
               taken.add(candidate.text)
               added += 1
             }
