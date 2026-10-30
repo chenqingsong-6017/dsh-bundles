@@ -170,6 +170,15 @@ if (tested.length > 0) lines.push('测试门：全量跑了 ' + tested.length + 
 else lines.push('测试门：_selftest/tests 里没有测试文件')
 if (noTestWithEntry.length > 0) lines.push('测试门：有入口但没测试 —— ' + noTestWithEntry.join(', '))
 
+// ---- 阶段 4：标准门（report-only，规则见工作区 工业级标准.md） ----
+// 只报告不阻断：老插件缺 CHANGELOG 是已知欠账，按「改到谁就补谁」推进。
+const standardScript = path.join(BUNDLES_DIR, '_selftest', 'standard-check.mjs')
+if (existsSync(standardScript)) {
+  const std = run([standardScript], BUNDLES_DIR)
+  const summary = (std.output.split('\n').find((line) => line.startsWith('共 ')) ?? '').trim()
+  lines.push('标准门（report）：' + (summary || (std.ok ? '已跑' : '执行异常，见 standard-check')))
+}
+
 // ---- 汇总 ----
 const totalMs = Date.now() - gateStart
 const spent = '；总耗时 ' + (totalMs / 1000).toFixed(1) + 's'
