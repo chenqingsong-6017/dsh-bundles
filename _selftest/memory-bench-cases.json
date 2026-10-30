@@ -6,33 +6,32 @@
     {
       "query": "改完插件怎么让它生效",
       "expected": [
-        "m35",
-        "m39"
+        "m74",
+        "m69"
       ]
     },
     {
       "query": "验证门是做什么的",
       "expected": [
-        "m47",
-        "m48"
+        "m70"
       ]
     },
     {
       "query": "测试失败会被拦吗",
       "expected": [
-        "m48"
+        "m70"
       ]
     },
     {
       "query": "本机评测套件在哪",
       "expected": [
-        "m54"
+        "m71"
       ]
     },
     {
       "query": "评测结果怎么样",
       "expected": [
-        "m55"
+        "m71"
       ]
     },
     {
@@ -44,56 +43,55 @@
     {
       "query": "三路对照的耗时是多少",
       "expected": [
-        "m58"
+        "m71"
       ]
     },
     {
       "query": "评测套件发布到哪了",
       "expected": [
-        "m59"
+        "m78"
       ]
     },
     {
       "query": "抖音打不开先杀什么进程",
       "expected": [
-        "m32"
+        "m68"
       ]
     },
     {
       "query": "抖音为什么提权就退出",
       "expected": [
-        "m31"
+        "m68"
       ]
     },
     {
       "query": "VirtualBox 虚拟机报路径找不到",
       "expected": [
-        "m25",
-        "m26"
+        "m66"
       ]
     },
     {
       "query": "迁移虚拟机怎么改注册信息",
       "expected": [
-        "m27"
+        "m66"
       ]
     },
     {
       "query": "GlassBoard 接管桌面图标怎么恢复",
       "expected": [
-        "m29"
+        "m67"
       ]
     },
     {
       "query": "Hermes 构建报证书错误",
       "expected": [
-        "m16"
+        "m72"
       ]
     },
     {
       "query": "Hermes 在终端里启动就秒退",
       "expected": [
-        "m17"
+        "m72"
       ]
     },
     {
@@ -105,8 +103,7 @@
     {
       "query": "Hermes 的配置和密钥在哪",
       "expected": [
-        "m13",
-        "m14"
+        "m72"
       ]
     },
     {
@@ -125,77 +122,61 @@
       "query": "归档区能不能清理",
       "expected": [
         "m24",
-        "m26"
+        "m66"
       ]
     },
     {
       "query": "工作区地图的权威来源",
       "expected": [
-        "m41"
+        "m76"
       ]
     },
     {
       "query": "dsh-亲爱的管家是干什么的",
       "expected": [
-        "m42"
+        "m76"
       ]
     },
     {
       "query": "dsh-创建这个工作区负责什么",
       "expected": [
-        "m43"
-      ]
-    },
-    {
-      "query": "default-workspace 还在用吗",
-      "expected": [
-        "m44"
-      ]
-    },
-    {
-      "query": "dsh-acl-recovery 是什么",
-      "expected": [
-        "m45"
+        "m76"
       ]
     },
     {
       "query": "能不能跨工作区干活",
       "expected": [
-        "m46"
+        "m76"
       ]
     },
     {
       "query": "给插件更新的流程是什么",
       "expected": [
-        "m33",
-        "m35"
+        "m74"
       ]
     },
     {
       "query": "skill-forge 有哪些工具",
       "expected": [
-        "m38"
+        "m69"
       ]
     },
     {
       "query": "竞品调研的核心结论",
       "expected": [
-        "m51",
-        "m52",
-        "m53"
+        "m75"
       ]
     },
     {
       "query": "会话搜索要不要自己写",
       "expected": [
-        "m9"
+        "m73"
       ]
     },
     {
       "query": "官方可选 bundle 怎么装",
       "expected": [
-        "m7",
-        "m8"
+        "m73"
       ]
     },
     {
@@ -207,15 +188,14 @@
     {
       "query": "WorkBuddy 学习空间能不能删",
       "expected": [
-        "m5",
-        "m6"
+        "m65"
       ]
     },
     {
       "query": "插件代码和数据放哪个盘",
       "expected": [
         "m1",
-        "m3"
+        "m80"
       ]
     },
     {
