@@ -1069,6 +1069,7 @@ export function gateDecision({ coverage, matchedUnits, matchedDf, unitCount, agr
   // 覆盖率用整体 coverage（与主条件同一个数），只有「命中单元数/df」取排序 top 的 ——
   // 别用 byId：它是另一套归一（实测 Hermes 那条 coverage 0.2757 而 byId 0.1538，会把真命中挡掉）。
   const rankCoverage = coverage
+  // v3.13：单单元护栏按「要注入的那条」判，不按覆盖率 top
   if (rankUnits === 1 && Array.isArray(rankDf) && rankDf[0] <= 1 && rankCoverage < singleWordFloor) {
     return { pass: false, relaxed: false }
   }
@@ -1200,6 +1201,46 @@ export const memoryEntrySchema = {
   },
   required: ['id', 'text', 'addedAt', 'updatedAt'],
   additionalProperties: false,
+}
+
+/**
+ * v3.16 卡片导出：把一条记忆渲染成 Obsidian 兼容的 Markdown 卡片。
+ * 学自 dsh-viya-memory（MIT）的核心长板——记忆应该是人能看见、手改的文件，
+ * 而不是只有 agent 才读得到的 JSON。JSON 仍是权威存储（检索 / 预算 / 基准一律不动），
+ * 这里只做单向镜像，不参与检索与注入。
+ */
+export function cardMarkdown(entry, today = localDateOf()) {
+  const lines = ['---']
+  lines.push('id: ' + entry.id)
+  if (typeof entry.kind === 'string' && entry.kind !== '') lines.push('kind: ' + entry.kind)
+  if (typeof entry.tag === 'string' && entry.tag !== '') lines.push('tag: ' + entry.tag)
+  if (Array.isArray(entry.tags) && entry.tags.length > 0) lines.push('tags: [' + entry.tags.join(', ') + ']')
+  if (typeof entry.scope === 'string' && entry.scope !== '') lines.push('scope: ' + entry.scope)
+  if (entry.pinned) lines.push('pinned: true')
+  if (Number.isInteger(entry.importance)) lines.push('importance: ' + entry.importance)
+  if (typeof entry.status === 'string' && entry.status !== '') lines.push('status: ' + entry.status)
+  if (typeof entry.staleAfter === 'string' && entry.staleAfter !== '') {
+    lines.push('staleAfter: ' + entry.staleAfter)
+    if (entry.staleAfter < today) lines.push('recheck: true')
+  }
+  if (typeof entry.verifiedAt === 'string' && entry.verifiedAt !== '') lines.push('verifiedAt: ' + entry.verifiedAt)
+  if (typeof entry.supersededBy === 'string' && entry.supersededBy !== '') lines.push('supersededBy: ' + entry.supersededBy)
+  if (Number.isInteger(entry.usedCount) && entry.usedCount > 0) lines.push('usedCount: ' + entry.usedCount)
+  if (typeof entry.addedAt === 'string' && entry.addedAt !== '') lines.push('created: ' + entry.addedAt.slice(0, 10))
+  if (typeof entry.updatedAt === 'string' && entry.updatedAt !== '') lines.push('updated: ' + entry.updatedAt.slice(0, 10))
+  if (Array.isArray(entry.aliases) && entry.aliases.length > 0) lines.push('aliases: [' + entry.aliases.join(', ') + ']')
+  lines.push('---', '', String(entry.text ?? ''), '')
+  return lines.join('\n')
+}
+
+/** 文件名 slug：保留中英文数字，其余压成连字符；太长截断。 */
+export function slugOf(input, fallback = 'card') {
+  const slug = String(input ?? '')
+    .trim()
+    .replace(/[^\u4e00-\u9fffA-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 30)
+  return slug === '' ? fallback : slug.replace(/-+$/g, '') || fallback
 }
 
 export function apply(ctx, config) {
@@ -2922,6 +2963,69 @@ export function apply(ctx, config) {
       } catch (error) {
         // 沉淀失败不影响回合结束
       }
+    }),
+  )
+
+  // ---- v3.16 卡片导出：把记忆镜像成 Markdown（给 Obsidian / 任何编辑器看）----
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_export',
+      description:
+        'Export every memory as an Obsidian-compatible Markdown card (YAML frontmatter + body) into a folder. The JSON store stays authoritative; this is a one-way mirror so a human can read and edit memories in Obsidian or any editor.',
+      parameters: {
+        type: 'object',
+        properties: {
+          dir: { type: 'string', description: 'Target folder (absolute, or relative to the memory store). Defaults to <storeDir>/vault.' },
+          includeArchived: { type: 'boolean', description: 'Also export superseded/archived entries. Default false.' },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            dir: { type: 'string' },
+            written: { type: 'integer' },
+            skipped: { type: 'integer' },
+            entries: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: { id: { type: 'string' }, file: { type: 'string' } },
+                required: ['id', 'file'],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ['dir', 'written', 'skipped', 'entries'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          const list = Array.isArray(value?.entries) ? value.entries : []
+          const lines = list.slice(0, 12).map((item) => '- ' + item.id + ' → ' + item.file)
+          const more = list.length > 12 ? '\n… 另有 ' + (list.length - 12) + ' 个' : ''
+          return [text('已导出 ' + (value?.written ?? 0) + ' 张卡片到 ' + (value?.dir ?? '') + '（跳过 ' + (value?.skipped ?? 0) + ' 条已失效）\n' + lines.join('\n') + more)]
+        },
+      },
+      async execute(args) {
+        const targetArg = typeof args?.dir === 'string' ? args.dir.trim() : ''
+        const targetDir = path.resolve(targetArg !== '' ? targetArg : path.join(storeDir, 'vault'))
+        mkdirSync(targetDir, { recursive: true })
+        const includeArchived = args?.includeArchived === true
+        const written = []
+        let skipped = 0
+        for (const entry of state.entries) {
+          const archived = typeof entry.supersededBy === 'string' && entry.supersededBy !== ''
+          if (archived && !includeArchived) {
+            skipped += 1
+            continue
+          }
+          const target = path.join(targetDir, entry.id + '-' + slugOf(entry.text) + '.md')
+          writeFileSync(target, cardMarkdown(entry), 'utf8')
+          written.push({ id: entry.id, file: target })
+        }
+        return { dir: targetDir, written: written.length, skipped, entries: written.slice(0, 200) }
+      },
     }),
   )
 

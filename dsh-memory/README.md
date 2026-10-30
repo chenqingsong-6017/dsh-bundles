@@ -1205,4 +1205,52 @@ node _selftest/memory-locomo.mjs --data <locomo10.json> [--compare]
 - MemOS 本地插件隔离试用：未做。它的 L1/L2/L3 + 技能结晶值得看，但 beta、telemetry、与 dsh-memory 双重注入三个风险未排除。
 - 「证据集」尚未真正实现，只加了信号；按 query 构造 evidence set 需要单独设计。
 
+## v3.16 记忆看得见：卡片导出（2026-10-30）
+
+### 背景
+
+调研了 GitHub 上「DSH 接 Obsidian」的现成方案（主要参考 [MengXinSu/dsh-viya-memory](https://github.com/MengXinSu/dsh-viya-memory)，MIT，143 tests，零依赖，声明兼容 `>=0.2.0-0 <0.3.0-0`）。
+
+**结论是不换插件**：两套记忆会双重注入、工具重名，且现有 dsh-memory 有注入预算控制与三套检索基准，换掉等于丢掉这些。
+只学它的核心长板——**记忆应该是人能看见、手改的文件**。
+
+### 改动：`memory_export` + 卡片渲染
+
+- 每条记忆渲染成 Obsidian 兼容的 `.md`（YAML frontmatter + 正文），任何 Markdown 编辑器都能开；
+- frontmatter 字段：`id / kind / tag / tags / scope / pinned / importance / status / staleAfter / recheck / created / updated / usedCount / aliases`；
+- 默认导出到 `<storeDir>/vault`（本机 `D:\AI\dsh-data\memory\vault`），**默认跳过已失效条目**，`includeArchived: true` 可一并导出；
+- **JSON 仍是权威存储**：检索 / 注入预算 / 三套基准一律不动，导出是单向镜像，不参与排序与注入。
+
+### 实测
+
+| 项 | 结果 |
+|---|---|
+| 真实库导出 | **47 张卡**（45 条已失效跳过）→ `D:\AI\dsh-data\memory\vault` |
+| 单测 | **108 项通过**（+1：frontmatter 字段 / 过期 recheck 标记 / slug）|
+| 三道门 `npm run check` | 通过 |
+
+样例卡片：
+
+```markdown
+---
+id: m92
+kind: preference
+tag: ux
+tags: [working-style, requirements]
+scope: global
+usedCount: 1
+created: 2026-10-30
+updated: 2026-10-30
+---
+
+用户要求：需求不清时用苏格拉底式提问……
+```
+
+### 没做的（诚实清单）
+
+- **双向同步**（改 md 回写 JSON）：要先解决「谁赢」与冲突检测，收益低、风险高，不做；
+- **双链 `[[]]`**：89 条平铺记忆之间没有真实关系，硬造关系是假数据，不做；
+- 自动导出（每次写入都镜像）：会放大写操作，先用工具手动触发。
+
+
 

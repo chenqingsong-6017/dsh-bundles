@@ -28,6 +28,8 @@ import {
   cleanAliases,
   localDateOf,
   gateDecision,
+  cardMarkdown,
+  slugOf,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -1381,6 +1383,28 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(tokenize('how are you').size > 0, '全停用词查询退化为不过滤，不能变空集')
   assert.ok(tokenize('https://github.com/x').has('github'), 'URL 子词不受停用词影响')
   ok('v3.15 英文停用词过滤 + 全停用词退化 + URL 子词不受影响')
+}
+
+// ---- v3.16 卡片导出（学 dsh-viya-memory 的「记忆要看得见」） ----
+{
+  const card = cardMarkdown({
+    id: 'm99', kind: 'rule', tag: 'ux', tags: ['a', 'b'], scope: 'global',
+    text: '记忆应该是人能看见的文件', pinned: true, importance: 9,
+    addedAt: '2026-10-30T01:02:03.000Z', updatedAt: '2026-10-30T04:05:06.000Z',
+    staleAfter: '2026-01-01',
+  }, '2026-10-30')
+  assert.ok(card.startsWith('---\n'), '卡片以 frontmatter 开头')
+  assert.ok(card.includes('id: m99'), '带 id')
+  assert.ok(card.includes('pinned: true'), '带 pinned')
+  assert.ok(card.includes('created: 2026-10-30'), '日期只取前半段')
+  assert.ok(card.includes('recheck: true'), '已过期卡打 recheck 标记')
+  assert.ok(card.includes('记忆应该是人能看见的文件'), '正文在 frontmatter 之外')
+  assert.ok(!card.includes('undefined'), '不输出 undefined 字段')
+  const withAliases = cardMarkdown({ id: 'm98', text: 'x', aliases: ['别名一'] }, '2026-10-30')
+  assert.ok(withAliases.includes('aliases: [别名一]'), '别名写进 frontmatter')
+  assert.equal(slugOf('记忆 卡片/测试'), '记忆-卡片-测试', 'slug 保留中文、分隔符压缩')
+  assert.equal(slugOf(''), 'card', '空文本回落 card')
+  ok('v3.16 卡片导出：frontmatter 字段 / 过期标记 / slug')
 }
 
 console.log(`memory: ${passed} 项通过`)
