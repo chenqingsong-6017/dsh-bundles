@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Subagent Brief",
+    "description": "Cuts over-long subagent settlement messages at the agent/pre-step boundary into a short summary plus a pointer to the child session. Default 1200 chars, only source.kind=subagent-settled notices."
+  }
+}

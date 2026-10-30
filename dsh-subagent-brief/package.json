@@ -1,0 +1,27 @@
+{
+  "name": "@local/dsh-subagent-brief",
+  "version": "0.2.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "description": "Subagent summary contract: over-long subagent settlement messages are cut at the agent/pre-step boundary and replaced with a short summary plus a pointer to the child session.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

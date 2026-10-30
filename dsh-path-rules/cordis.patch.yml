@@ -2,5 +2,9 @@
     - id: path-rules
       name: '@local/dsh-path-rules'
       config:
-        # 每轮最多往系统提示里注入多少字符（超出按触发顺序截断并提示）
+        # 总开关。false = 完全不注入、不注册工具（改完要重载插件才生效）
+        enabled: true
+        # 路径层（frontmatter 写了 paths 的规则）每轮最多注入多少字符
         maxChars: 3000
+        # 核心层（frontmatter 写了 always: true 的规则）每轮最多注入多少字符
+        maxAlwaysChars: 2000

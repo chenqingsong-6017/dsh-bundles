@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "分类器代审",
+    "description": "在每次工具派发前补一层策略判断：规则文件决定放行 / 人工确认 / 拒绝，无命中就保持原有审批行为。内置 5 条硬红线（rm -rf /、format、vssadmin delete shadows、写 .ssh/、.credentials），v1 只做规则引擎，零延迟零成本。"
+  }
+}

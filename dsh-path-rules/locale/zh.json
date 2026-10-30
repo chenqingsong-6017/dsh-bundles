@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "路径规则",
-    "description": "把规则按文件路径分片：只有 agent 触及匹配的文件时，对应规则才进入系统提示。规则放 .dsh/rules/*.md，头部写 paths 通配符。"
+    "description": "把规则分三层：用户级 < 项目级 < 路径命中。frontmatter 写 always: true 的规则每轮注入（核心层，默认 2000 字符预算），写 paths 的规则只在 agent 触及匹配文件后才注入（路径层，默认 3000 字符）；同 id 时更近/更具体的层覆盖更远的层。规则放 .dsh/rules/*.md。"
   }
 }

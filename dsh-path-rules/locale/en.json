@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Path Rules",
-    "description": "Splits rules by file path: a rule enters the system prompt only after the agent touches a matching file. Rules live in .dsh/rules/*.md with a paths glob header."
+    "description": "Three rule layers: user-level < project-level < path-hit. Rules with always: true are injected every turn (core layer, 2000-char budget); rules with paths are injected only after the agent touches a matching file (path layer, 3000-char budget). On an id conflict the nearer/more specific layer wins. Rules live in .dsh/rules/*.md."
   }
 }

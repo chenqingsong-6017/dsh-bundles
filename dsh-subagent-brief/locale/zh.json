@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "子 agent 摘要契约",
+    "description": "子 agent 的结算消息正文超过阈值就在 agent/pre-step 截成摘要，细节留在子会话。默认 1200 字符，只处理 source.kind=subagent-settled 的消息。"
+  }
+}

@@ -1,0 +1,14 @@
+- insert:
+    - id: subagent-brief
+      name: '@local/dsh-subagent-brief'
+      config:
+        # 子 agent 结算消息的「正文」超过这么多字符就收成摘要（默认 1200）
+        maxChars: 1200
+        # 拦截哪些来源的消息（默认 subagent-settled：@deepseek-ai/dsh-subagent
+        # 的 createSettlementMessage() 把子会话结果作为 user 消息投递给父会话时
+        # 打的 source.kind。显式给空数组 = 一个都不拦）
+        sourceKinds:
+          - subagent-settled
+        # 2026-10-30 v2：拦截点改成 agent/pre-step（父 agent 每一步之前的水位线），
+        # 不是 tools/post-execute —— 子会话结果不走工具返回值，走 inbox 消息。
+        enabled: true

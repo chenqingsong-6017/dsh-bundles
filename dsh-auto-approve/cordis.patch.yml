@@ -1,0 +1,14 @@
+- insert:
+    - id: auto-approve
+      name: '@local/dsh-auto-approve'
+      config:
+        # 总开关：false 时完全不干预任何工具调用
+        enabled: true
+        # 内置红线（rm -rf /、format、vssadmin delete shadows、写 .ssh/、.credentials）默认生效
+        builtins: true
+        # status 里保留多少条最近判断（1-200，默认 20）
+        maxRecords: 20
+        # v2 预留：LLM 分类器默认关闭；本插件不实现网络调用、不读密钥
+        llm:
+          enabled: false
+          timeoutMs: 1200

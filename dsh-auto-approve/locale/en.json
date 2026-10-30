@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Auto Approve",
+    "description": "A policy layer in front of every tool dispatch: JSON rules decide allow / ask / deny, and calls that match nothing keep the existing approval behavior. Ships 5 built-in hard red lines (rm -rf /, format, vssadmin delete shadows, writes to .ssh/, .credentials). v1 is a pure rule engine: predictable, zero latency, zero cost."
+  }
+}

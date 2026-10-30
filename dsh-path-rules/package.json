@@ -1,12 +1,12 @@
 {
   "name": "@local/dsh-path-rules",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "engines": {
     "node": ">=22.19.0"
   },
   "type": "module",
-  "description": "Path-scoped rules: markdown rules with glob paths enter the system prompt only after a matching file is touched.",
+  "description": "Layered path-scoped rules: user-level < project-level < path-hit priority, an always-on core layer with its own budget, and per-rule source/priority in diagnostics.",
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
