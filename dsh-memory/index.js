@@ -70,6 +70,15 @@ const STALE_PENALTY = 0.55
 export function isStaleEntry(entry, today = localDateOf()) {
   return typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < today
 }
+
+/**
+ * v3.20：一条记忆算不算「归档」——被取代（supersededBy）或显式 deprecated。
+ * 从 v3.3 起 activeEntries 就是这个口径，这里提成模块级函数，给「归档分文件冷存」复用，
+ * 避免两处判断漂移（历史教训：只判 supersededBy 时 deprecated 条目仍算生效，预算虚高）。
+ */
+export function isArchivedEntry(entry) {
+  return (typeof entry?.supersededBy === 'string' && entry.supersededBy !== '') || entry?.status === 'deprecated'
+}
 const COMPOSITE_IMPORTANCE_WEIGHT = 0.5
 const COMPOSITE_RECENCY_WEIGHT = 0.3
 const RELEVANT_COMPOSITE_MARGIN = 1.15
@@ -1329,6 +1338,10 @@ export function apply(ctx, config) {
       ? Math.min(config.maxInjectChars, 32 * 1024)
       : DEFAULT_MAX_INJECT_CHARS
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
+  // v3.20：归档条目分文件冷存 —— 主库只留生效记忆，归档落 archive.json（与 aliases.json 同级的旁路文件）。
+  // 起因：归档条目永远占着 memory.json，且 memory_list 每次都把 93 条一起吐出来（实测 37 KB），
+  // 而它们既不计预算、也不参与注入 —— 唯一的作用是留历史。分文件后主库干净、列表默认不吐归档。
+  const archiveFile = path.join(storeDir, 'archive.json')
   // v3.6：别名放**旁路文件**，不跟条目混存。
   // 起因：运行中的旧版本在做 load→normalizeEntry 时不认识 aliases，一次 memory_update 落盘就把 32 条别名全洗掉了。
   // 旁路文件对旧版本完全不可见，天然免疫这种「未知字段被丢弃」的破坏。
@@ -1582,13 +1595,100 @@ export function apply(ctx, config) {
   let lastSignature = ''
   let tmpCounter = 0
 
-  /** 磁盘上 memory.json 的指纹（mtime + size）：用来判断「别的进程写过了没有」。 */
+  /** 磁盘上 memory.json + archive.json 的指纹（mtime + size）：用来判断「别的进程写过了没有」。 */
   function storeSignature() {
+    const part = (file) => {
+      try {
+        const info = statSync(file)
+        return `${info.mtimeMs}:${info.size}`
+      } catch (error) {
+        return '-'
+      }
+    }
+    return `${part(storeFile)}|${part(archiveFile)}`
+  }
+
+  /**
+   * v3.20：读归档文件。不存在返回 []；**坏了也返回 [] 不抛** —— 归档坏掉绝不能连累主库启动。
+   * 读出来的每一条都强制按归档处理（补 status=deprecated），防止文件被手工改过导致「档案复活」。
+   */
+  function readArchiveEntries() {
+    let raw = ''
     try {
-      const info = statSync(storeFile)
-      return `${info.mtimeMs}:${info.size}`
+      raw = readFileSync(archiveFile, 'utf8')
     } catch (error) {
-      return ''
+      return []
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.entries) ? parsed.entries : []
+      const now = new Date().toISOString()
+      return list
+        .filter((entry) => entry && typeof entry.id === 'string' && typeof entry.text === 'string')
+        .map(normalizeEntry)
+        .map((entry) =>
+          isArchivedEntry(entry)
+            ? entry
+            : { ...entry, status: 'deprecated', archivedAt: entry.archivedAt ?? now, archiveReason: entry.archiveReason ?? 'migrated: archive.json' },
+        )
+    } catch (error) {
+      return []
+    }
+  }
+
+  /** v3.20：把归档文件里的条目并回内存态（主库同 id 的条目优先，归档只补缺）。 */
+  function loadArchive() {
+    const archived = readArchiveEntries()
+    if (archived.length === 0) return
+    const seen = new Set(state.entries.map((entry) => entry.id))
+    let added = 0
+    for (const entry of archived) {
+      if (seen.has(entry.id)) continue
+      seen.add(entry.id)
+      state.entries.push(entry)
+      added += 1
+    }
+    if (added === 0) return
+    const maxIdNumber = state.entries.reduce((max, entry) => {
+      const match = /^m?(\d+)$/.exec(String(entry.id))
+      return match ? Math.max(max, Number(match[1])) : max
+    }, 0)
+    state.nextId = Math.max(state.nextId, maxIdNumber + 1)
+    lastSignature = storeSignature()
+  }
+
+  /** v3.20：原子写一个小文件（temp 唯一名 + fsync + rename 重试）。persist 用它写 archive.json。 */
+  function writeAtomic(targetFile, body) {
+    tmpCounter += 1
+    const temp = `${targetFile}.tmp-${process.pid}-${tmpCounter}`
+    writeFileSync(temp, body, 'utf8')
+    try {
+      const fd = openSync(temp, 'r')
+      try {
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+    } catch (error) {
+      // 个别文件系统不支持 fsync：退化成不 fsync，但不因此失败
+    }
+    let renamed = false
+    let lastError = null
+    for (let attempt = 0; attempt < 3 && !renamed; attempt += 1) {
+      try {
+        renameSync(temp, targetFile)
+        renamed = true
+      } catch (error) {
+        lastError = error
+      }
+    }
+    if (!renamed) {
+      try {
+        unlinkSync(temp)
+      } catch (error) {
+        // 临时文件清不掉就留着，下次覆盖
+      }
+      throw new Error(`归档写入失败（${lastError?.message ?? 'rename failed'}）：${path.basename(targetFile)}`)
     }
   }
 
@@ -1658,6 +1758,10 @@ export function apply(ctx, config) {
       const mine = Date.parse(entry.updatedAt ?? '') || 0
       const theirs = Date.parse(existing.updatedAt ?? '') || 0
       byId.set(entry.id, mine >= theirs ? entry : existing)
+    }
+    // v3.20：别的进程可能往 archive.json 追加了归档条目（指纹包含它），这里一并并进来。
+    for (const entry of readArchiveEntries()) {
+      if (!byId.has(entry.id)) byId.set(entry.id, entry)
     }
     state.entries = [...byId.values()]
     const maxIdNumber = state.entries.reduce((max, entry) => {
@@ -1739,7 +1843,13 @@ export function apply(ctx, config) {
     try {
       mergeWithDisk()
       mkdirSync(storeDir, { recursive: true })
-      const body = JSON.stringify(state, null, 2)
+      // v3.20：归档分文件冷存。主库只写生效条目；归档条目落 archive.json。
+      // 顺序：**先写归档、再写主库** —— 归档写失败就整体失败（主库原样不动），
+      // 不会出现「主库已经把条目摘掉、归档却没写成功」的丢数据窗口。
+      const activeForWrite = state.entries.filter((entry) => !isArchivedEntry(entry))
+      const archivedForWrite = state.entries.filter((entry) => isArchivedEntry(entry))
+      writeAtomic(archiveFile, JSON.stringify({ version: 1, entries: archivedForWrite }, null, 2))
+      const body = JSON.stringify({ ...state, entries: activeForWrite }, null, 2)
       // 学 write-file-atomic：临时文件名必须**每进程唯一**（pid + 序号）。
       // 原来固定用 `memory.json.tmp`，两个进程同时写会共用同一个临时文件互相踩 —— 比整库覆盖更隐蔽。
       tmpCounter += 1
@@ -1845,6 +1955,7 @@ export function apply(ctx, config) {
   }
 
   load()
+  loadArchive()
   loadAliases()
   applyAliases()
   loadCandidates()
@@ -1868,8 +1979,7 @@ export function apply(ctx, config) {
   // 原来只判 supersededBy，导致 deprecated 条目仍算进 activeEntries → usedChars 预算虚高、
   // memory_review 的 total 比实际注入多 3 条、memory_audit 的 active 也偏大。
   // renderMemory 一直是两者都过滤的，这里对齐它。
-  const isActive = (entry) =>
-    (typeof entry.supersededBy !== 'string' || entry.supersededBy === '') && entry?.status !== 'deprecated'
+  const isActive = (entry) => !isArchivedEntry(entry)
   const activeEntries = () => state.entries.filter(isActive)
   const usedChars = () => activeEntries().reduce((sum, entry) => sum + entry.text.length, 0)
   const publicEntry = (entry) => ({ ...entry })
@@ -2016,11 +2126,17 @@ export function apply(ctx, config) {
     if (block === '') return ['<memory>', '（记忆库为空）', reminder, '</memory>'].join('\n')
     return block.replace('</memory>', `${reminder}\n</memory>`)
   }
-  const listOutput = () => {
+  const listOutput = (options) => {
+    // v3.20：默认只返回生效条目。归档条目走 archive.json，要看需显式 includeArchived:true。
+    // 起因：归档既不计预算也不参与注入，却让 memory_list 每次多吐 30+ KB（实测 93 条 / 37 KB）。
+    const includeArchived = options?.includeArchived === true
     const block = renderOnce('', undefined, undefined, lastKnownCwd)
     const entries = activeEntries()
+    const listed = includeArchived ? state.entries : entries
     return {
       total: state.entries.length,
+      active: entries.length,
+      includeArchived,
       superseded: state.entries.filter(
         (entry) => typeof entry.supersededBy === 'string' && entry.supersededBy !== '',
       ).length,
@@ -2034,7 +2150,7 @@ export function apply(ctx, config) {
       // v2.8：maxInjectChars 只管正文行，头部/索引/诊断另有固定开销，所以总长会略超——
       // 与其让人猜，不如直接把「是否超」标出来。
       injectedOverBudget: block.length > maxInjectChars,
-      entries: state.entries.map(publicEntry),
+      entries: listed.map(publicEntry),
       block,
     }
   }
@@ -2053,6 +2169,8 @@ export function apply(ctx, config) {
     type: 'object',
     properties: {
       total: { type: 'integer' },
+      active: { type: 'integer' },
+      includeArchived: { type: 'boolean' },
       superseded: { type: 'integer' },
       archived: { type: 'integer' },
       health: { type: 'string' },
@@ -2065,7 +2183,7 @@ export function apply(ctx, config) {
       entries: { type: 'array', items: memoryEntrySchema },
       block: { type: 'string' },
     },
-    required: ['total', 'superseded', 'health', 'usedChars', 'maxBytes', 'maxInjectChars', 'injectedChars', 'entries', 'block'],
+    required: ['total', 'active', 'includeArchived', 'superseded', 'health', 'usedChars', 'maxBytes', 'maxInjectChars', 'injectedChars', 'entries', 'block'],
     additionalProperties: false,
   }
 
@@ -2075,7 +2193,12 @@ export function apply(ctx, config) {
     const entries = Array.isArray(value?.entries) ? value.entries : []
     const healthWarn =
       value?.health === 'corrupt' ? `\n⚠ 记忆库损坏保护中（原文件已另存：${value?.healthNote ?? '未知'}），写入已禁用，修好后重载插件。` : ''
-    const head = `记忆 ${value?.total ?? 0} 条（失效 ${value?.superseded ?? 0} · 归档 ${value?.archived ?? 0}），存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入 ${value?.injectedChars ?? 0}/${value?.maxInjectChars ?? 0} 字符${value?.injectedOverBudget ? ' ⚠超预算' : ''}${healthWarn}`
+    const archivedCount = value?.archived ?? 0
+    const hiddenHint =
+      archivedCount > 0 && value?.includeArchived !== true
+        ? `\n（另有 ${archivedCount} 条归档未列出：它们不计预算、不参与注入，存在 archive.json；要看加 includeArchived:true）`
+        : ''
+    const head = `记忆 ${value?.active ?? 0} 条生效 / ${archivedCount} 条归档（合计 ${value?.total ?? 0}），存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入 ${value?.injectedChars ?? 0}/${value?.maxInjectChars ?? 0} 字符${value?.injectedOverBudget ? ' ⚠超预算' : ''}${hiddenHint}${healthWarn}`
     if (entries.length === 0) return [text(`${head}\n（还没有任何记忆。用 memory_add 写入第一条。）`)]
     const lines = entries.map(
       (entry) =>
@@ -2093,14 +2216,23 @@ export function apply(ctx, config) {
     tools.register({
       name: 'memory_list',
       description:
-        'List the persistent memories injected into every session, with ids, tags, pinned flags and the exact injected block. Use it before adding or pruning.',
-      parameters: { type: 'object', properties: {}, additionalProperties: false },
+        'List the persistent memories injected into every session, with ids, tags, pinned flags and the exact injected block. Use it before adding or pruning. Archived entries (superseded/deprecated, stored in archive.json) are excluded by default; pass includeArchived:true to see them.',
+      parameters: {
+        type: 'object',
+        properties: {
+          includeArchived: {
+            type: 'boolean',
+            description: 'true also lists archived entries (superseded/deprecated). Default false — they do not count toward the budget and are never injected.',
+          },
+        },
+        additionalProperties: false,
+      },
       output: {
         schema: listSchema,
         render: renderList,
       },
-      async execute() {
-        return listOutput()
+      async execute(args) {
+        return listOutput(args)
       },
     }),
   )
@@ -2661,6 +2793,68 @@ export function apply(ctx, config) {
         const removed = state.entries.length !== before
         if (removed) persist()
         return { id, removed, total: state.entries.length }
+      },
+    }),
+  )
+
+  // v3.20：归档可逆 —— 被预算保护挤掉的条目（deprecated、未被取代）可以恢复成生效记忆。
+  // 被 superseded 的不许直接恢复（会同时存在两个版本），提示用 memory_add 重写。
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_restore',
+      description:
+        'Restore one archived entry back to active (only entries archived by budget protection, i.e. deprecated but NOT superseded). Fails when the budget is full. Use memory_list({includeArchived:true}) to find ids.',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'string', description: 'Archived entry id, e.g. "m105".' } },
+        required: ['id'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            restored: { type: 'boolean' },
+            reason: { type: 'string' },
+            usedChars: { type: 'integer' },
+            total: { type: 'integer' },
+          },
+          required: ['id', 'restored', 'usedChars', 'total'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          if (value?.restored) return [text(`已恢复 ${value?.id}（占用 ${value?.usedChars ?? 0} 字符，下一条模型请求起重新注入）`)]
+          if (value?.reason === 'not-archived') return [text(`${value?.id} 本来就是生效记忆，不用恢复`)]
+          return [text(`没有这条记忆：${value?.id}`)]
+        },
+      },
+      async execute(args) {
+        requireWritable()
+        refreshBeforeWrite()
+        const id = typeof args?.id === 'string' ? args.id.trim() : ''
+        if (id === '') throw new Error('memory_restore 需要 id。')
+        const entry = state.entries.find((item) => item.id === id)
+        if (!entry) {
+          return { id, restored: false, reason: 'missing', usedChars: usedChars(), total: state.entries.length }
+        }
+        if (!isArchivedEntry(entry)) {
+          return { id, restored: false, reason: 'not-archived', usedChars: usedChars(), total: state.entries.length }
+        }
+        if (typeof entry.supersededBy === 'string' && entry.supersededBy !== '') {
+          throw new Error(`${id} 已被 ${entry.supersededBy} 取代，不能直接恢复（会同时存在两个版本）。要保留内容请用 memory_add 重写一条。`)
+        }
+        if (usedChars() + entry.text.length > maxBytes) {
+          throw new Error(
+            `恢复后会到 ${usedChars() + entry.text.length} / ${maxBytes} 字符，超预算。先用 memory_remove 删掉别的，或调大 maxBytes。`,
+          )
+        }
+        delete entry.status
+        delete entry.archivedAt
+        delete entry.archiveReason
+        entry.updatedAt = new Date().toISOString()
+        persist()
+        return { id, restored: true, usedChars: usedChars(), total: state.entries.length }
       },
     }),
   )

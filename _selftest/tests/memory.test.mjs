@@ -1490,12 +1490,89 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(auto.length, 1, '规则自动入库一条')
   assert.equal(auto[0].status, 'draft', '自动入库标 draft')
   assert.equal(auto[0].kind, 'rule', 'kind 是 rule')
-  const archived = after.entries.filter((e) => e.status === 'deprecated' && e.archiveReason !== undefined)
+  // v3.20：归档条目默认不在 memory_list 里（分文件冷存），要看需 includeArchived:true。
+  const afterAll = await defs.get('memory_list').execute({ includeArchived: true })
+  const archived = afterAll.entries.filter((e) => e.status === 'deprecated' && e.archiveReason !== undefined)
   assert.ok(archived.length >= 1, '预算不够时应有条目被归档，实际 ' + archived.length)
   assert.ok(after.usedChars <= after.maxBytes, '归档后不超预算：' + after.usedChars + '/' + after.maxBytes)
   ok('v3.19 自动入库集成：规则进库(draft) + 预算不足时归档腾地方')
   rmSync(workTmp, { recursive: true, force: true })
   rmSync(storeTmp, { recursive: true, force: true })
+}
+
+// ---- v3.20 归档分文件冷存（archive.json）：主库只留生效、列表默认不吐归档、归档可恢复 ----
+{
+  const sepDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-archive-'))
+  writeFileSync(
+    path.join(sepDir, 'memory.json'),
+    JSON.stringify({
+      nextId: 5,
+      version: 1,
+      entries: [
+        { id: 'm1', text: '生效条目：插件放 D 盘', kind: 'rule' },
+        { id: 'm2', text: '被 m1 取代的旧说法', supersededBy: 'm1' },
+        { id: 'm3', text: '被预算保护挤掉的条目', status: 'deprecated', archivedAt: '2026-10-30T00:00:00.000Z', archiveReason: 'auto-archive' },
+      ],
+    }),
+    'utf8',
+  )
+  const h = host(sepDir)
+  const listed = await h.defs.get('memory_list').execute({})
+  assert.equal(listed.active, 1, '生效 1 条')
+  assert.equal(listed.archived, 2, '归档 2 条')
+  assert.equal(listed.entries.length, 1, '默认只返回生效条目')
+  assert.equal(listed.includeArchived, false, '显式回显 includeArchived=false')
+
+  const all = await h.defs.get('memory_list').execute({ includeArchived: true })
+  assert.equal(all.entries.length, 3, 'includeArchived:true 才返回全部 3 条')
+  ok('v3.20 memory_list 默认不返回归档，includeArchived:true 才列全')
+
+  // 触发一次 persist：归档条目应落到 archive.json，主库只剩生效的
+  await h.defs.get('memory_add').execute({ text: '新加一条生效记忆', kind: 'fact' })
+  const mainRaw = JSON.parse(readFileSync(path.join(sepDir, 'memory.json'), 'utf8'))
+  const archRaw = JSON.parse(readFileSync(path.join(sepDir, 'archive.json'), 'utf8'))
+  assert.ok(
+    mainRaw.entries.every((e) => !e.supersededBy && e.status !== 'deprecated'),
+    '主库 memory.json 不应再含归档条目',
+  )
+  assert.equal(archRaw.entries.length, 2, 'archive.json 收 2 条归档')
+  ok('v3.20 persist 分文件：memory.json 只留生效，archive.json 存归档')
+
+  // 重载后归档仍在（loadArchive 合并回来），且总数对得上
+  const h2 = host(sepDir)
+  const listed2 = await h2.defs.get('memory_list').execute({})
+  assert.equal(listed2.active, 2, '重载后生效 2 条')
+  assert.equal(listed2.archived, 2, '重载后归档 2 条（从 archive.json 读回）')
+  ok('v3.20 重载后归档不丢：archive.json 被合并回内存态')
+
+  // 被取代的不许恢复；纯归档的可以恢复，恢复后预算/生效数都对
+  let rejected = false
+  try {
+    await h2.defs.get('memory_restore').execute({ id: 'm2' })
+  } catch (error) {
+    rejected = true
+  }
+  assert.equal(rejected, true, '被 supersededBy 取代的条目不许直接恢复')
+  const restored = await h2.defs.get('memory_restore').execute({ id: 'm3' })
+  assert.equal(restored.restored, true, '纯归档条目可恢复')
+  const listed3 = await h2.defs.get('memory_list').execute({})
+  assert.equal(listed3.active, 3, '恢复后生效 3 条')
+  assert.equal(listed3.archived, 1, '恢复后归档剩 1 条')
+  const restoredEntries = await h2.defs.get('memory_list').execute({ includeArchived: true })
+  const m3 = restoredEntries.entries.find((e) => e.id === 'm3')
+  assert.equal(m3.status, undefined, '恢复后 status 被清掉')
+  ok('v3.20 memory_restore：拒绝被取代条目，纯归档可恢复且清掉 deprecated 标记')
+
+  // 归档文件损坏不能连累主库启动
+  writeFileSync(path.join(sepDir, 'archive.json'), '{ 这不是 JSON', 'utf8')
+  const h3 = host(sepDir)
+  const listedCorrupt = await h3.defs.get('memory_list').execute({})
+  assert.equal(listedCorrupt.active, 3, '归档损坏时主库仍全部生效')
+  assert.equal(listedCorrupt.archived, 0, '归档损坏当作没有归档')
+  assert.equal(listedCorrupt.health, 'ok', '健康态不被归档损坏污染')
+  ok('v3.20 归档文件损坏 fail-safe：不抛错、不污染主库')
+
+  rmSync(sepDir, { recursive: true, force: true })
 }
 
 console.log(`memory: ${passed} 项通过`)
