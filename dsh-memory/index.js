@@ -369,7 +369,9 @@ function storeLocation(overrideDir) {
   return { dir: base, file: path.join(base, 'memory.json') }
 }
 
-const OPTIONAL_STRING_FIELDS = ['tag', 'scope', 'kind', 'migratedFrom', 'validFrom', 'supersededBy']
+// v3.20：补 archivedAt / archiveReason —— v3.19 的自动归档会写它们，但 normalizeEntry 不认识，
+// 结果「load→persist」一轮就把归档时间和原因洗掉（归档历史只剩 status=deprecated 一个标记）。
+const OPTIONAL_STRING_FIELDS = ['tag', 'scope', 'kind', 'migratedFrom', 'validFrom', 'supersededBy', 'archivedAt', 'archiveReason']
 const OPTIONAL_NUMBER_FIELDS = ['usedCount']
 
 // v2.6 信任字段（学 OKF v0.2 / simple-agent-memory）：把「确认的事实」「未证实的猜测」「过期待重验」分开。
@@ -1278,6 +1280,10 @@ export const memoryEntrySchema = {
     addedAt: { type: 'string' },
     updatedAt: { type: 'string' },
     status: { type: 'string' },
+    // v3.20 修 v3.19 的漏声明：自动归档会写这两个字段，schema 不声明的话工具层会整条拒绝
+    // （实测：库里只要有一条自动归档的记忆，memory_list 直接报 invalid output）。
+    archivedAt: { type: 'string' },
+    archiveReason: { type: 'string' },
     staleAfter: { type: 'string' },
     verifiedBy: { type: 'string' },
     verifiedAt: { type: 'string' },

@@ -15,8 +15,14 @@
 - **归档条目不再写入 `memory.json`**：主库只存生效条目，归档落 `archive.json`；加载时合并回内存态，检索/审计行为不变。
 - `memory_list` 默认**不返回**归档条目（此前 93 条会全吐出来，37 KB/次）；表头改为「N 条生效 / M 条归档」。
 
+### Fixed
+- **v3.19 连带 bug：`memory_list` 整条不可用** —— `memoryEntrySchema` 未声明 `archivedAt` / `archiveReason`，库中存在自动归档条目时工具层校验失败（`additionalProperties: false`）。
+- **v3.19 连带 bug：归档元数据被洗掉** —— `normalizeEntry` 的 `OPTIONAL_STRING_FIELDS` 缺这两个字段，load→persist 一轮就丢归档时间与原因。
+- 两处均有单测覆盖；单测 117 → **118**。
+
 ### Verification
-- 单测 117 项通过；三道门通过。
+- 单测 118 项通过；三道门通过。
+- 重启后真机验收：`archive.json` 生成（1 条 m95），主库只剩 47 条生效，`memory_list` 返回 47 条 / 21.9 KB（改造前 93 条 / 37.4 KB）。
 - 真实库副本冒烟：48 条 → 47 生效 + 1 归档，零写入。
 - bench 零回归（recall@1 100% / @3 100% / 负例误注入 9.5%）。
 

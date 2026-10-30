@@ -1545,6 +1545,20 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(listed2.archived, 2, '重载后归档 2 条（从 archive.json 读回）')
   ok('v3.20 重载后归档不丢：archive.json 被合并回内存态')
 
+  // v3.19 自动归档写的 archivedAt/archiveReason 必须在 schema 里声明 —— 否则工具层校验整条失败，
+  // memory_list 会直接报 invalid output（本次实测踩到：真实库里 1 条自动归档就足以让列表全挂）。
+  const withMeta = await h2.defs.get('memory_list').execute({ includeArchived: true })
+  const archivedSample = withMeta.entries.find((e) => e.id === 'm3')
+  assert.ok(archivedSample.archivedAt !== undefined, '归档条目应带 archivedAt')
+  assert.ok(archivedSample.archiveReason !== undefined, '归档条目应带 archiveReason')
+  for (const key of ['archivedAt', 'archiveReason']) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(memoryEntrySchema.properties, key),
+      'memoryEntrySchema 必须声明 ' + key + '（否则 additionalProperties:false 会拒掉整条工具返回）',
+    )
+  }
+  ok('v3.20 schema 覆盖归档元字段（修 v3.19 漏声明导致 memory_list 整条拒绝）')
+
   // 被取代的不许恢复；纯归档的可以恢复，恢复后预算/生效数都对
   let rejected = false
   try {

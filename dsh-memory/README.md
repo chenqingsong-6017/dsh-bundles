@@ -1356,13 +1356,18 @@ v1.1 的刻意取舍是「拒绝写入，不自动淘汰」。自动入库必须
 - **`memory_list` 默认不返回归档**，新增 `includeArchived` 参数（默认 false）；返回体新增 `active` / `includeArchived` 字段，表头改成「N 条生效 / M 条归档」并提示怎么看归档。
 - **新工具 `memory_restore`**：被预算保护挤掉的条目（deprecated 且未被取代）可以恢复成生效记忆；被 `supersededBy` 取代的不许直接恢复（否则会出现两个版本），提示用 `memory_add` 重写。恢复会先查预算，超了拒绝。
 - 新增导出 `isArchivedEntry(entry)`，把「归档判定」收成一处（原来 `activeEntries` 内联，两处口径容易漂移）。
+- **顺带修掉 v3.19 的两个连带 bug**（做分文件时被真机暴露）：
+  1. `memoryEntrySchema` 没声明 `archivedAt` / `archiveReason`，而 schema 是 `additionalProperties: false` —— **库里只要有一条自动归档的记忆，`memory_list` 的整条返回就会被工具层拒绝**（实测报 `value.entries[42].archivedAt is not a declared property`，列表直接不可用）；
+  2. `normalizeEntry` 的 `OPTIONAL_STRING_FIELDS` 不含这两个字段，**load→persist 一轮就把归档时间与原因洗掉**（归档历史只剩一个 `status=deprecated`）。
+  两处都补上，并各加单测断言（schema 覆盖 + 重载后元数据仍在）。
 
 ### 验证
 
 | 项 | 结果 |
 |---|---|
-| 单测 | **117 项通过**（新增 5 项 v3.20 用例：默认不列归档 / 分文件落盘 / 重载归档不丢 / restore 拒绝被取代条目 / 归档损坏 fail-safe）|
+| 单测 | **118 项通过**（新增 6 项 v3.20 用例：默认不列归档 / 分文件落盘 / 重载归档不丢 / schema 覆盖归档元字段 / restore 拒绝被取代条目 / 归档损坏 fail-safe）|
 | 真实库副本冒烟 | 48 条存量 → 47 生效 + 1 归档，`memory_list` 只列 47，**未产生任何写入**（主库仍 48 条、archive.json 未创建）|
+| 重启后真机验收 | 懒迁移按预期触发：`archive.json` 生成（1 条 m95，带 `archivedAt`/`archiveReason`），`memory.json` 只剩 47 条生效；`memory_list` 返回 47 条 / 21.9 KB（改造前 93 条 / 37.4 KB）|
 | 中文 bench | recall@1 100% / @3 100% / 负例误注入 9.5%（与改动前一致）|
 | 卫生检查 | 硬规则 6/6 注入、注入 1469 字符（上限 1750）、失效未漏注入 ✅ |
 | 三道门 | 通过（18 个测试全量）|
