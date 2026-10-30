@@ -24,14 +24,17 @@
  *   - `memory_search` 是子串 + 分词计分的轻量检索，不是语义检索（记忆体量小，够用）。
  */
 
-import { closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 
-const DEFAULT_MAX_BYTES = 8000
+// v3.21：8000 → 12000。取经五家开源实现后确认：mem0 / memobase 存储根本不设上限，容量只在注入侧卡；
+// Letta 也是「不设总条数预算，靠注入预算 + 摘要压缩」。我们此前「存储 8000 + 注入 1200/1500」双层都卡，
+// 实测后果是「记忆加不进去」（7892/8000 只剩 108 字符）。注入预算才是真正影响 token 成本的那层，存储层放宽。
+const DEFAULT_MAX_BYTES = 12000
 const BACKUP_KEEP = 10
 const DEFAULT_MAX_INJECT_CHARS = 1200
 const MAX_TEXT_CHARS = 600
@@ -1348,6 +1351,50 @@ export function apply(ctx, config) {
   // 起因：归档条目永远占着 memory.json，且 memory_list 每次都把 93 条一起吐出来（实测 37 KB），
   // 而它们既不计预算、也不参与注入 —— 唯一的作用是留历史。分文件后主库干净、列表默认不吐归档。
   const archiveFile = path.join(storeDir, 'archive.json')
+  // v3.21：append-only 历史（学 mem0 的 history 表：ADD/UPDATE/DELETE 全记）。
+  // 起因：2026-10-30 一次性物理删了 48 条归档，事后没有任何地方能查「删了什么、什么时候删的」。
+  // 做法：每次 persist 成功后按基线做一次 diff，把 add/update/remove 追加成 JSONL；写失败绝不连累主操作。
+  const historyFile = path.join(storeDir, 'history.jsonl')
+  const HISTORY_MAX_BYTES = 2 * 1024 * 1024
+  const HISTORY_TEXT_CAP = 400
+  const historyCap = (value) => (typeof value === 'string' ? value.slice(0, HISTORY_TEXT_CAP) : undefined)
+  /** id → { sig, text }：上一次落盘时的指纹，用来算本次 diff。 */
+  let historyBaseline = new Map()
+  const historySig = (entry) => `${entry.text ?? ''}|${entry.status ?? ''}|${entry.supersededBy ?? ''}`
+  const resetHistoryBaseline = () => {
+    historyBaseline = new Map(state.entries.map((entry) => [entry.id, { sig: historySig(entry), text: entry.text }]))
+  }
+  function recordHistoryDiff() {
+    try {
+      const next = new Map()
+      const events = []
+      const ts = new Date().toISOString()
+      for (const entry of state.entries) {
+        const sig = historySig(entry)
+        next.set(entry.id, { sig, text: entry.text })
+        const before = historyBaseline.get(entry.id)
+        if (before === undefined) {
+          events.push({ ts, event: 'add', id: entry.id, text: historyCap(entry.text), ...(entry.status ? { status: entry.status } : {}) })
+        } else if (before.sig !== sig) {
+          events.push({ ts, event: 'update', id: entry.id, before: historyCap(before.text), after: historyCap(entry.text), ...(entry.status ? { status: entry.status } : {}) })
+        }
+      }
+      for (const [id, before] of historyBaseline) {
+        if (!next.has(id)) events.push({ ts, event: 'remove', id, text: historyCap(before.text) })
+      }
+      if (events.length === 0) return
+      mkdirSync(storeDir, { recursive: true })
+      try {
+        if (statSync(historyFile).size > HISTORY_MAX_BYTES) renameSync(historyFile, `${historyFile}.1`)
+      } catch (error) {
+        // 没有历史文件 / 轮转失败：继续追加即可
+      }
+      appendFileSync(historyFile, events.map((item) => JSON.stringify(item)).join('\n') + '\n', 'utf8')
+      historyBaseline = next
+    } catch (error) {
+      // 历史只是旁路审计，写失败不能连累主操作（fail-safe）
+    }
+  }
   // v3.6：别名放**旁路文件**，不跟条目混存。
   // 起因：运行中的旧版本在做 load→normalizeEntry 时不认识 aliases，一次 memory_update 落盘就把 32 条别名全洗掉了。
   // 旁路文件对旧版本完全不可见，天然免疫这种「未知字段被丢弃」的破坏。
@@ -1899,6 +1946,8 @@ export function apply(ctx, config) {
       }
       lastSignature = storeSignature()
       syncAliases()
+      // v3.21：落盘成功后记一次 diff（add/update/remove），形成 append-only 审计链。
+      recordHistoryDiff()
       return true
     } catch (error) {
       if (error instanceof Error && (error.message.startsWith('记忆落盘失败') || error.message.includes('memory.json.lock'))) throw error
@@ -1962,6 +2011,8 @@ export function apply(ctx, config) {
 
   load()
   loadArchive()
+  // v3.21：历史 diff 的基线要取「刚加载完」的状态，否则第一次写会把所有存量都记成 add。
+  resetHistoryBaseline()
   loadAliases()
   applyAliases()
   loadCandidates()
@@ -2861,6 +2912,151 @@ export function apply(ctx, config) {
         entry.updatedAt = new Date().toISOString()
         persist()
         return { id, restored: true, usedChars: usedChars(), total: state.entries.length }
+      },
+    }),
+  )
+
+  // v3.21：历史查询（只读）。数据来自 persist 时按基线 diff 出来的 history.jsonl，一条事件一行。
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_history',
+      description:
+        'Read the append-only change log (history.jsonl): add / update / remove events with timestamps and truncated text. Use it to answer "what was deleted/changed and when".',
+      parameters: {
+        type: 'object',
+        properties: {
+          id: { type: 'string', description: 'Only events about this memory id, e.g. "m95".' },
+          event: { type: 'string', description: 'Only this event type: add | update | remove.' },
+          limit: { type: 'integer', description: 'Max events to return (1-100, default 20, newest last).' },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            total: { type: 'integer' },
+            matched: { type: 'integer' },
+            entries: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  ts: { type: 'string' },
+                  event: { type: 'string' },
+                  id: { type: 'string' },
+                  text: { type: 'string' },
+                  before: { type: 'string' },
+                  after: { type: 'string' },
+                  status: { type: 'string' },
+                },
+                required: ['ts', 'event', 'id'],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ['total', 'matched', 'entries'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          const lines = (value?.entries ?? []).map((item) => {
+            const delta = item.event === 'update' ? ` 「${item.before ?? ''}」→「${item.after ?? ''}」` : item.text ? ` 「${item.text}」` : ''
+            return `- ${item.ts} ${item.event} ${item.id}${delta}`
+          })
+          const head = `变更历史：${value?.total ?? 0} 条事件 / 命中 ${value?.matched ?? 0} 条（最多显示 ${value?.entries?.length ?? 0} 条）`
+          return [text([head, ...lines].join('\n'))]
+        },
+      },
+      async execute(args) {
+        const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 100) : 20
+        const wantId = typeof args?.id === 'string' ? args.id.trim() : ''
+        const wantEvent = typeof args?.event === 'string' ? args.event.trim() : ''
+        let raw = ''
+        try {
+          raw = readFileSync(historyFile, 'utf8')
+        } catch (error) {
+          return { total: 0, matched: 0, entries: [] }
+        }
+        const all = []
+        for (const line of raw.split('\n')) {
+          if (line.trim() === '') continue
+          try {
+            const item = JSON.parse(line)
+            if (item && typeof item.ts === 'string' && typeof item.event === 'string' && typeof item.id === 'string') all.push(item)
+          } catch (error) {
+            // 坏行跳过：历史是旁路，不因为一行坏了整份不可读
+          }
+        }
+        const matched = all.filter((item) => (wantId === '' || item.id === wantId) && (wantEvent === '' || item.event === wantEvent))
+        return { total: all.length, matched: matched.length, entries: matched.slice(-limit) }
+      },
+    }),
+  )
+
+  // v3.21：批量清归档（物理删，必须 confirm）。补上「手工一条条删 48 次」缺的受控入口。
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_purge',
+      description:
+        'Permanently delete archived entries (superseded/deprecated). Requires confirm:true. Refuses to touch active memories. Filter with ids or olderThanDays. Prefer memory_list({includeArchived:true}) first.',
+      parameters: {
+        type: 'object',
+        properties: {
+          confirm: { type: 'boolean', description: 'Must be true — this is a permanent delete, not an archive.' },
+          ids: { type: 'array', items: { type: 'string' }, description: 'Only these archived ids (default: all archived entries).' },
+          olderThanDays: { type: 'integer', description: 'Only archived entries whose archivedAt/updatedAt is older than N days.' },
+        },
+        required: ['confirm'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            purged: { type: 'integer' },
+            remaining: { type: 'integer' },
+            usedChars: { type: 'integer' },
+            ids: { type: 'array', items: { type: 'string' } },
+            reason: { type: 'string' },
+          },
+          required: ['purged', 'remaining', 'usedChars', 'ids'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          if (value?.reason === 'no-archived') return [text('没有归档条目可删（memory_list 默认也不列它们）。')]
+          const ids = value?.ids ?? []
+          const preview = ids.slice(0, 10).join(', ') + (ids.length > 10 ? ` …共 ${ids.length} 条` : '')
+          return [text(`已永久删除 ${value?.purged ?? 0} 条归档（${preview}），剩余 ${value?.remaining ?? 0} 条记忆，占用 ${value?.usedChars ?? 0} 字符。`)]
+        },
+      },
+      async execute(args) {
+        requireWritable()
+        refreshBeforeWrite()
+        const wantIds = Array.isArray(args?.ids) ? args.ids.filter((item) => typeof item === 'string' && item.trim() !== '') : []
+        const olderThanDays = Number.isInteger(args?.olderThanDays) && args.olderThanDays > 0 ? args.olderThanDays : 0
+        const nowMs = Date.now()
+        const targets = state.entries.filter((entry) => {
+          if (!isArchivedEntry(entry)) return false
+          if (wantIds.length > 0 && !wantIds.includes(entry.id)) return false
+          if (olderThanDays > 0) {
+            const stamp = Date.parse(entry.archivedAt ?? entry.updatedAt ?? '')
+            if (!Number.isFinite(stamp) || nowMs - stamp < olderThanDays * 86400000) return false
+          }
+          return true
+        })
+        if (targets.length === 0) {
+          return { purged: 0, remaining: state.entries.length, usedChars: usedChars(), ids: [], reason: 'no-archived' }
+        }
+        if (args?.confirm !== true) {
+          throw new Error(
+            `memory_purge 会**永久删除** ${targets.length} 条归档条目（不是归档，删了不可恢复）。确认后用 ${targets.length} 条 id 或 confirm:true 重试；先 memory_list({includeArchived:true}) 看一眼。`,
+          )
+        }
+        const removedIds = targets.map((entry) => entry.id)
+        const removedSet = new Set(removedIds)
+        state.entries = state.entries.filter((entry) => !removedSet.has(entry.id))
+        persist()
+        return { purged: removedIds.length, remaining: state.entries.length, usedChars: usedChars(), ids: removedIds.slice(0, 100) }
       },
     }),
   )

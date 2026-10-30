@@ -1589,6 +1589,62 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   rmSync(sepDir, { recursive: true, force: true })
 }
 
+// ---- v3.21 预算放宽 + append-only 历史 + 批量清归档 ----
+{
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-v321-'))
+  const h = host(dir)
+  const listed = await h.defs.get('memory_list').execute({})
+  assert.equal(listed.maxBytes, 12000, '默认存储预算应为 12000（v3.21 放宽）')
+  ok('v3.21 默认存储预算 8000 → 12000（注入预算不变，仍 1200/1500）')
+
+  const added = await h.defs.get('memory_add').execute({ text: '历史用例：先加一条', kind: 'fact' })
+  await h.defs.get('memory_update').execute({ id: added.entry.id, text: '历史用例：改一下' })
+  await h.defs.get('memory_remove').execute({ id: added.entry.id })
+  const hist = await h.defs.get('memory_history').execute({ limit: 50 })
+  const events = hist.entries.map((e) => e.event)
+  assert.ok(events.includes('add'), '历史里应有 add，实际 ' + events.join(','))
+  assert.ok(events.includes('update'), '历史里应有 update')
+  assert.ok(events.includes('remove'), '历史里应有 remove')
+  const removedEvent = hist.entries.find((e) => e.event === 'remove' && e.id === added.entry.id)
+  assert.ok(String(removedEvent.text).includes('历史用例'), 'remove 事件要留下被删正文（截断前 400 字）')
+  const onlyMine = await h.defs.get('memory_history').execute({ id: added.entry.id })
+  assert.ok(onlyMine.matched >= 2, '按 id 过滤应命中多条，实际 ' + onlyMine.matched)
+  ok('v3.21 append-only 历史：add/update/remove 落 history.jsonl，可按 id 过滤')
+
+  const dir2 = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-purge-'))
+  writeFileSync(
+    path.join(dir2, 'memory.json'),
+    JSON.stringify({
+      nextId: 9,
+      version: 1,
+      entries: [
+        { id: 'm1', text: '生效记忆', kind: 'rule' },
+        { id: 'm2', text: '旧说法', supersededBy: 'm1' },
+        { id: 'm3', text: '被挤掉的', status: 'deprecated', archivedAt: '2026-10-01T00:00:00.000Z', archiveReason: 'auto-archive' },
+      ],
+    }),
+    'utf8',
+  )
+  const hp = host(dir2)
+  let refused = false
+  try {
+    await hp.defs.get('memory_purge').execute({ confirm: false })
+  } catch (error) {
+    refused = true
+  }
+  assert.equal(refused, true, '没有 confirm:true 必须拒绝')
+  const purged = await hp.defs.get('memory_purge').execute({ confirm: true })
+  assert.equal(purged.purged, 2, '应删 2 条归档（superseded + deprecated）')
+  const afterPurge = await hp.defs.get('memory_list').execute({})
+  assert.equal(afterPurge.active, 1, '生效记忆不受影响')
+  assert.equal(afterPurge.archived, 0, '归档已清零')
+  const historyAfter = await hp.defs.get('memory_history').execute({ limit: 50 })
+  assert.ok(historyAfter.entries.filter((e) => e.event === 'remove').length >= 2, 'purge 也要进历史（remove 事件）')
+  ok('v3.21 memory_purge：无 confirm 拒绝；只删归档、生效记忆不动，且进历史')
+  rmSync(dir, { recursive: true, force: true })
+  rmSync(dir2, { recursive: true, force: true })
+}
+
 console.log(`memory: ${passed} 项通过`)
 
 

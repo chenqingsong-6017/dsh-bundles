@@ -3,6 +3,23 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v3.21.0 — 2026-10-30
+
+### Added
+- `memory_history`：读 append-only 变更日志（add / update / remove，带时间戳与被删正文），支持按 id / event 过滤。
+- `memory_purge`：批量物理删除归档条目，必须 `confirm:true`，支持 `ids` / `olderThanDays` 过滤；只碰归档，生效记忆不动。
+- `history.jsonl`：persist 成功后按基线 diff 追加事件（2 MB 轮转，写失败 fail-safe）。
+
+### Changed
+- **默认存储预算 `DEFAULT_MAX_BYTES` 8000 → 12000**（依据：mem0 / memobase 存储无上限、容量只在注入侧卡；注入预算不变）。
+
+### Verification
+- 单测 121 项通过；三道门通过。
+- bench 零回归（recall@1 100% / @3 100% / 负例误注入 9.5%）。
+
+### Notes
+- 生效需重启 DSH。
+
 ## v3.20.0 — 2026-10-30
 
 ### Added
