@@ -270,6 +270,75 @@ export function extractCandidates(text) {
   }
   return out
 }
+
+/**
+ * v3.17 规则文件沉淀：从 AGENTS.md / .dsh/rules 抽「硬规则」进候选池。
+ * 起因（2026-10-30 实测）：搜「cua 工具被过滤成几个」「插件必须配什么测试」时记忆库空手 ——
+ * 这两条规则只存在于规则文件里，从没进过记忆库。写入覆盖是记忆系统第一位的问题，
+ * 而当时的候选沉淀只抓用户消息，抓不到 agent 读到的规则。
+ *
+ * 只抽「硬规则行」（必须/一律/永远/禁止/不要/不得/务必/只能），跳过代码块、标题、表格、引用。
+ * 进**候选池**不直接入库 —— 影子模式不变，仍要人点头。
+ */
+const RULE_MARKERS = /必须|一律|永远|禁止|不要|不得|务必|只能|别再|绝对/
+export function extractRuleCandidates(text, taken = new Set()) {
+  const raw = String(text ?? '')
+  if (raw.trim() === '') return []
+  const out = []
+  let inFence = false
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (trimmed.startsWith('```')) {
+      inFence = !inFence
+      continue
+    }
+    if (inFence) continue
+    if (trimmed === '') continue
+    if (trimmed.startsWith('#')) continue
+    if (trimmed.startsWith('|')) continue
+    if (trimmed.startsWith('>')) continue
+    const body = trimmed
+      .replace(/^[-*+]\s+/, '')
+      .replace(/^\d+[.、)]\s+/, '')
+      .replace(/\*\*/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    if (body.length < 8 || body.length > 160) continue
+    if (!RULE_MARKERS.test(body)) continue
+    if (/[?？]$/.test(body)) continue
+    // 以冒号结尾的是「引出下文」的引导句，不是规则本身（实测：「看资料时按这个顺序，不要一上来只搜 DSH 插件：」）。
+    if (/[：:]$/.test(body)) continue
+    if (taken.has(body)) continue
+    out.push({ text: body.slice(0, MAX_TEXT_CHARS), kind: 'rule', reason: '规则文件' })
+  }
+  return out
+}
+
+/** 规则文件清单：工作区根 AGENTS.md / CLAUDE.md、.dsh/rules/*.md、全局 ~/.dsh/AGENTS.md。 */
+export function collectRuleFiles(cwd) {
+  const files = []
+  if (typeof cwd === 'string' && cwd !== '') {
+    files.push(path.join(cwd, 'AGENTS.md'))
+    files.push(path.join(cwd, 'CLAUDE.md'))
+    const rulesDir = path.join(cwd, '.dsh', 'rules')
+    try {
+      for (const name of readdirSync(rulesDir)) {
+        if (name.endsWith('.md')) files.push(path.join(rulesDir, name))
+      }
+    } catch (error) {
+      // 没有 .dsh/rules 目录是常态
+    }
+  }
+  files.push(path.join(os.homedir(), '.dsh', 'AGENTS.md'))
+  return files.filter((candidate) => {
+    try {
+      return statSync(candidate).isFile()
+    } catch (error) {
+      return false
+    }
+  })
+}
+
 const MEMORY_HEADER =
   '以下是跨会话记住的用户/项目事实（越靠后越新）。把它们当背景，不要逐条复述；与用户本轮明确指令冲突时，以本轮指令为准。'
 
@@ -2959,6 +3028,28 @@ export function apply(ctx, config) {
         const scope = currentScopeOf(payload)
         for (const candidate of extractCandidates(text)) {
           addCandidate(candidate.text, scope, candidate.kind, candidate.reason, agent?.id)
+        }
+        // v3.17：规则文件沉淀（补「写入覆盖」缺口 —— 今天两个实测失败都是「库里根本没记」）。
+        // 只对还没进候选池、也不在记忆库里的硬规则行下手；每回合最多 MAX_CANDIDATES_PER_TURN 条。
+        // 没有工作区上下文（测试 / 无 cwd 会话）时不扫规则文件 —— 否则会把全局 AGENTS.md 也灌进候选池。
+        try {
+          if (lastKnownCwd === '') throw new Error('no-cwd')
+          const taken = new Set()
+          for (const entry of state.entries) taken.add(entry.text)
+          for (const item of candidates.items ?? []) taken.add(item.text)
+          let added = 0
+          for (const ruleFile of collectRuleFiles(lastKnownCwd)) {
+            if (added >= MAX_CANDIDATES_PER_TURN) break
+            const fileText = readFileSync(ruleFile, 'utf8')
+            for (const candidate of extractRuleCandidates(fileText, taken)) {
+              if (added >= MAX_CANDIDATES_PER_TURN) break
+              addCandidate(candidate.text, scope, candidate.kind, candidate.reason, agent?.id)
+              taken.add(candidate.text)
+              added += 1
+            }
+          }
+        } catch (error) {
+          // 规则沉淀失败不影响回合结束
         }
       } catch (error) {
         // 沉淀失败不影响回合结束

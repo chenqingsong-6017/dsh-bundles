@@ -30,6 +30,8 @@ import {
   gateDecision,
   cardMarkdown,
   slugOf,
+  extractRuleCandidates,
+  collectRuleFiles,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -1405,6 +1407,30 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(slugOf('记忆 卡片/测试'), '记忆-卡片-测试', 'slug 保留中文、分隔符压缩')
   assert.equal(slugOf(''), 'card', '空文本回落 card')
   ok('v3.16 卡片导出：frontmatter 字段 / 过期标记 / slug')
+}
+
+// ---- v3.17 规则文件沉淀（补「库里根本没记」的缺口） ----
+{
+  const md = [
+    '# 标题不算',
+    '',
+    '- 插件代码必须放 D 盘，不落 C 盘',
+    '- 这是一句普通说明，没有硬规则词',
+    '| 表格 | 内容 |',
+    '```js',
+    '// 必须 在代码块里不算',
+    '```',
+    '> 引用里的必须也不算',
+    '- 看资料按这个顺序，不要一上来只搜：',
+  ].join('\n')
+  const got = extractRuleCandidates(md)
+  assert.equal(got.length, 1, '只抽硬规则行（跳过标题/表格/代码块/引用/引导句）')
+  assert.ok(got[0].text.includes('D 盘'), '内容对')
+  assert.equal(got[0].kind, 'rule', 'kind 是 rule')
+  const taken = new Set([got[0].text])
+  assert.equal(extractRuleCandidates(md, taken).length, 0, '已存在的不重复抽')
+  assert.ok(collectRuleFiles('D:\\AI-date\\dsh-date\\dsh-创建').length >= 1, '能列出本工作区规则文件')
+  ok('v3.17 规则文件沉淀：只抽硬规则 / 跳过代码块表格 / 去重')
 }
 
 console.log(`memory: ${passed} 项通过`)
