@@ -1457,6 +1457,47 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   ok('v3.19 时效降权：过期条目仍可检索，但排序压后')
 }
 
+// ---- v3.19 自动入库 + 预算保护：真跑一遍 turn-stopping（闭包逻辑的集成测试） ----
+{
+  const workTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-ws-'))
+  const storeTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-auto-'))
+  writeFileSync(path.join(workTmp, 'AGENTS.md'), '- 部署前必须跑 npm run check 并确认输出\n', 'utf8')
+  const defs = new Map()
+  const layers = []
+  const handlers = new Map()
+  const ctx = {
+    tools: { register: (d) => { defs.set(d.name, d); return () => {} } },
+    effect: (fn) => fn(),
+    on: (name, h) => { handlers.set(name, h); return () => {} },
+    get: (name) => (name === 'workingDirectory' ? { get: () => workTmp } : undefined),
+    systemPrompt: { context: (layer) => { layers.push(layer); return () => {} } },
+  }
+  // 故意把 maxBytes 配小（600），塞一条 580 字符的填充记忆，
+  // 让「规则（21 字符）自动入库」必然触发一次归档 —— 这才测得到预算保护。
+  apply(ctx, { storeDir: storeTmp, maxInjectChars: 1500, maxBytes: 600 })
+  const session = { id: 's-auto' }
+  layers[0].text({ agent: { session } })
+  await defs.get('memory_add').execute({ text: '填充记忆 ' + 'x'.repeat(570), kind: 'fact' })
+  const before = await defs.get('memory_list').execute({})
+  assert.ok(before.usedChars > 500, '预算应先被塞到 500+，实际 ' + before.usedChars)
+
+  const ts = handlers.get('agent/turn-stopping')
+  assert.equal(typeof ts, 'function', '注册了 turn-stopping')
+  await ts({ agent: { id: 's-auto', session: { deriveMessages: () => [{ role: 'user', content: [{ type: 'text', text: '今天天气不错' }] }] } } })
+
+  const after = await defs.get('memory_list').execute({})
+  const auto = after.entries.filter((e) => e.text.includes('部署前必须跑'))
+  assert.equal(auto.length, 1, '规则自动入库一条')
+  assert.equal(auto[0].status, 'draft', '自动入库标 draft')
+  assert.equal(auto[0].kind, 'rule', 'kind 是 rule')
+  const archived = after.entries.filter((e) => e.status === 'deprecated' && e.archiveReason !== undefined)
+  assert.ok(archived.length >= 1, '预算不够时应有条目被归档，实际 ' + archived.length)
+  assert.ok(after.usedChars <= after.maxBytes, '归档后不超预算：' + after.usedChars + '/' + after.maxBytes)
+  ok('v3.19 自动入库集成：规则进库(draft) + 预算不足时归档腾地方')
+  rmSync(workTmp, { recursive: true, force: true })
+  rmSync(storeTmp, { recursive: true, force: true })
+}
+
 console.log(`memory: ${passed} 项通过`)
 
 
