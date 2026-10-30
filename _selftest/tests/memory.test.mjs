@@ -1370,6 +1370,19 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   ok('v3.13 单单元护栏按「要注入的那条」判，不按覆盖率 top')
 }
 
+
+// ---- v3.15 英文停用词（LoCoMo 对照实验的产物） ----
+{
+  // 起因：LoCoMo 检索层 recall@1 28.3%，朴素 BM25 + 停用词 33.1% —— 差的全是 a/is/the/of。
+  // 中文侧早就有虚词规则，英文侧一直漏。
+  assert.ok(!tokenize('the cat and a dog').has('the'), '英文停用词不进词表')
+  assert.ok(!tokenize('the cat and a dog').has('and'), '连词也不进')
+  assert.ok(tokenize('the cat and a dog').has('cat'), '内容词要保留')
+  assert.ok(tokenize('how are you').size > 0, '全停用词查询退化为不过滤，不能变空集')
+  assert.ok(tokenize('https://github.com/x').has('github'), 'URL 子词不受停用词影响')
+  ok('v3.15 英文停用词过滤 + 全停用词退化 + URL 子词不受影响')
+}
+
 console.log(`memory: ${passed} 项通过`)
 
 

@@ -1133,3 +1133,76 @@ v3.12 把长句从 60% 拉到 66.7% 之后剩 5 条失败，逐条拆开是三�
 
 > v3.14 插件侧只改 zh-words.txt（词典在加载时读一次，**需重启 DSH 生效**，不需要 remove_bundle/install_bundle）；v3.14b 是记忆数据改动，**立即生效**、与重启无关。
 
+## v3.15 学外部：LoCoMo 基线 + 英文停用词 + 搜索侧证据信号（2026-10-30）
+
+### 背景：先拿外部基线，再谈改进
+
+调研（2026-10-30。出处层级按可信度排列：论文 > 仓库源码 > README）：
+
+| 来源 | 结论 | 对我们的意义 |
+|---|---|---|
+| arXiv 2610.34073《Memory Tax》| 大规模评测：很多专用记忆系统不如朴素 RAG，净值为负 | 「接入一个记忆框架」本身有税 |
+| arXiv 2610.30755 | Raw-RAG 在 LoCoMo/LongMemEval/MEME/MemoryAgentBench 6/7 设置第一，胜在覆盖率 | 复杂度不等于效果 |
+| arXiv 2610.22668 | 相关 ≠ 充分证据，应构造「查询专属证据集」 | memory_search 返回的是「相关」不是「能答」 |
+| arXiv 2610.36308 | 证据预算变大反而更差（45%→32%），过时版本是主因 | staleAfter 方向对 |
+| Tencent-Hunyuan/Hy-Memory 源码 | 词面（jieba + rank_bm25）+ 稠密双通道，缺 BM25 会静默降级 | 我们已有 BM25，缺的是停用词 |
+| MemTensor/MemOS README | 2026-08-17 完成 DSH 接入，`@memtensor/memos-local-plugin` 是原生 bundle | 备选，未采纳（beta + telemetry + 双重注入）|
+
+### 新评测工具：`_selftest/memory-locomo.mjs`
+
+用 snap-research/locomo 的 10 个对话、1982 条可评分 QA 测**检索层**（只测 evidence 命中，不调模型）：
+
+```powershell
+node _selftest/memory-locomo.mjs --data <locomo10.json> [--compare]
+```
+
+`--compare` 会并排跑一条 30 行的朴素英文 BM25 做对照，用来分账：差距来自我们的打分，还是数据本身难。
+
+### 改动 1：英文停用词（tokenize）
+
+对照实验发现：英文检索比朴素 BM25 差 4.8 个点，差距全在 a/is/the/of 上 —— 中文侧早就有虚词规则，英文侧一直漏。
+
+| LoCoMo 检索层 | 改前 | 改后 | 朴素 BM25 |
+|---|---|---|---|
+| recall@1 | 28.3% | **32.8%** | 33.1% |
+| recall@5 | 51.1% | **55.7%** | 56.2% |
+| MRR | 0.388 | **0.434** | 0.436 |
+
+全停用词查询（"how are you"）退化为不过滤，避免什么都检索不到；URL / 路径子词不受影响。
+
+### 改动 2：memory_search 补 `confidence` / `coverage`
+
+原来只滤 `score > 0.0001`，问「MySQL 索引优化怎么做」也会吐 8 条 —— 有结果 ≠ 有答案（arXiv 2610.22668）。
+
+现在返回体多两个字段：`confidence: 'ok' | 'low'`、`coverage`（0–1）。判定复用注入层同一个 `gateDecision`，但**不砍结果**（砍了会把「库里没有」误报成「有但不相关」），只在渲染时加一行提示。
+
+真实库实测（90 条）：
+
+| 查询 | coverage | confidence |
+|---|---|---|
+| cua 工具被过滤成几个（库里确实没有） | 0.179 | **low** |
+| 今天上海天气怎么样 | 0.000 | low |
+| 记忆检索 recall@3 是多少 | 0.356 | ok |
+| 验证门 dsh-proof 收工前跑什么 | 0.805 | ok |
+
+遗留：「MySQL 索引优化怎么做」coverage 0.251 仍过门（bench 里唯一失败项）。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| 单测 | **107 项通过**（+1：停用词 / 全停用词退化 / URL 子词）|
+| 中文基准 | recall@1 **97.1%** / @3 **100%** / MRR 0.985 / 负例误注入 4.8%（均不变）|
+| 评测套件 memory-eval | 全绿 |
+| LoCoMo | recall@1 **32.8%**（改前 28.3%）|
+| 三道门 `npm run check` | 通过 |
+
+> LoCoMo 数据不进仓库（2.8MB）：先 `git clone --depth 1 https://github.com/snap-research/locomo` 到 `D:\AI\dsh-data\tmp\locomo`，脚本默认读那里，或用 `--data` 指定。
+
+### 没做的（诚实清单）
+
+- 语义/向量检索：触发口径（不可见率 ≥5% / 活跃 >150 / 长句 <85%）仍未触发，继续不做。
+- MemOS 本地插件隔离试用：未做。它的 L1/L2/L3 + 技能结晶值得看，但 beta、telemetry、与 dsh-memory 双重注入三个风险未排除。
+- 「证据集」尚未真正实现，只加了信号；按 query 构造 evidence set 需要单独设计。
+
+

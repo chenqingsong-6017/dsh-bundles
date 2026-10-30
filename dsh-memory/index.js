@@ -775,14 +775,28 @@ function latinSubUnits(word) {
  * 分词（排序层用）：英文/数字按整词（含路径/URL 子词），中文按词。
  * 注意：返回的 Map 由缓存共享，**调用方不得修改**。
  */
+/**
+ * 英文停用词（v3.15）。来自 LoCoMo 对照实验：朴素 BM25 + 停用词过滤 recall@1 33.1%，
+ * 我们 28.3% —— 差距全在 a/is/the/of 这类词上（中文侧早就有虚词规则，英文侧一直漏）。
+ * 只过滤长 ≥1 的整词；latinSubUnits 拆出的 URL/路径子词不受影响。
+ */
+const EN_STOP = new Set('a an the and or but if then than that this these those i you he she it we they me him her us them my your his its our their am is are was were be been being do does did have has had will would can could should may might must not no yes of in on at to for with from by as so such what when where who which how why there here up down out over again very just also too only own same some any all both each few more most other'.split(' '))
+
 export function tokenize(input) {
   const key = String(input ?? '').toLowerCase()
   return cacheGet(TOKEN_CACHE, key, () => {
     const terms = new Map()
     const bump = (term) => terms.set(term, (terms.get(term) ?? 0) + 1)
-    for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) for (const unit of latinSubUnits(word)) bump(unit)
+    for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) {
+      if (EN_STOP.has(word)) continue
+      for (const unit of latinSubUnits(word)) bump(unit)
+    }
     for (const run of key.match(/[\u4e00-\u9fff]+/g) ?? []) {
       for (const unit of segmentZhRun(run)) bump(unit)
+    }
+    // 全是停用词的查询（"how are you"）不能变成空集，否则什么都检索不到 —— 退化为不过滤。
+    if (terms.size === 0) {
+      for (const word of key.match(/[a-z0-9][a-z0-9_\-.]{1,}/g) ?? []) for (const unit of latinSubUnits(word)) bump(unit)
     }
     return terms
   })
@@ -1937,6 +1951,8 @@ export function apply(ctx, config) {
             query: { type: 'string' },
             total: { type: 'integer' },
             matched: { type: 'integer' },
+            confidence: { type: 'string' },
+            coverage: { type: 'number' },
             byId: { type: 'array', items: { type: 'string' } },
             matches: {
               type: 'array',
@@ -1973,7 +1989,8 @@ export function apply(ctx, config) {
           const lines = matches.map((item) =>
             `- ${item.id}${trustMark(item)}${item.pinned ? ' 📌' : ''}${(item.tags?.[0] ?? item.tag) ? ` [${item.tags?.[0] ?? item.tag}]` : ''}${item.scope ? ` <${item.scope}>` : ''} ${item.text}`)
           const byId = Array.isArray(value?.byId) && value.byId.length > 0 ? `（按 id 直取 ${value.byId.join('、')}）` : ''
-          return [text(`匹配 ${value?.matched ?? 0} / ${value?.total ?? 0} 条${byId}：\n${lines.join('\n')}`)]
+          const weak = value?.confidence === 'low' ? `\n⚠ 相关性低于注入门槛（覆盖率 ${value?.coverage ?? 0}），这些可能只是词面巧合；若都不对，换个关键词再搜。` : ''
+          return [text(`匹配 ${value?.matched ?? 0} / ${value?.total ?? 0} 条${byId}：\n${lines.join('\n')}${weak}`)]
         },
       },
       async execute(args) {
@@ -1996,10 +2013,26 @@ export function apply(ctx, config) {
         const top = scored.slice(0, limit)
         countUsage(top.map((item) => item.entry.id))
         flushUsage()
+        // v3.15：搜索侧补「证据充分性」信号（学 arXiv 2610.22668：相关 ≠ 充分证据）。
+        // 之前只滤 score>0.0001，问「MySQL 索引优化」也会吐 8 条 —— 有结果不等于有答案。
+        // 不砍结果（砍了会把「库里没有」误报成「有但不相关」），只给结论加一个可判读的信号。
+        const coverageReport = relevanceCoverage(state.entries, query)
+        const agreeWithRanking = coverageReport.topId != null && scored.length > 0 && scored[0].entry.id === coverageReport.topId
+        const gate = gateDecision({
+          coverage: coverageReport.coverage,
+          matchedUnits: coverageReport.matchedUnits,
+          matchedDf: coverageReport.matchedDf,
+          unitCount: coverageReport.unitCount,
+          agreeWithRanking,
+        })
+        const confidence = idHits.length > 0 || gate.pass ? 'ok' : 'low'
+        const coverage = Math.round(coverageReport.coverage * 1000) / 1000
         return {
           query,
           total: state.entries.length,
           matched: scored.length,
+          confidence,
+          coverage,
           ...(idHits.length > 0 ? { byId: idHits.map((entry) => entry.id) } : {}),
           matches: scored.slice(0, limit).map((item) => ({
             id: item.entry.id,
