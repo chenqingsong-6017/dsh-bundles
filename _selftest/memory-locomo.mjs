@@ -17,7 +17,8 @@ function arg(name, fallback) {
   const i = argv.indexOf('--' + name)
   return i >= 0 && argv[i + 1] ? argv[i + 1] : fallback
 }
-const DATA = arg('data', 'D:\\AI\\dsh-data\\tmp\\locomo\\data\\locomo10.json')
+// v3.21（2026-10-30）：从 tmp 迁到 eval —— tmp 是随时会被清理的临时区，基准数据放这里会被误删。
+const DATA = arg('data', 'D:\\AI\\dsh-data\\eval\\locomo\\data\\locomo10.json')
 const K = Number(arg('k', '5'))
 const COMPARE = argv.includes('--compare')
 const CATEGORY = { 1: 'multi-hop', 2: 'temporal', 3: 'open-domain', 4: 'single-hop', 5: 'adversarial' }
