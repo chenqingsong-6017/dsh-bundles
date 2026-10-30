@@ -65,6 +65,11 @@ const RELEVANCE_FLOOR_AGREE = 0.12
 //   短查询（≤2 个内容单元）：0.40；长查询（≥3 个）：0.25。
 const RELEVANCE_SINGLE_WORD_FLOOR_SHORT = 0.40
 const RELEVANCE_SINGLE_WORD_FLOOR_LONG = 0.25
+// v3.19：过期条目的排序惩罚（不是过滤 —— 过期信息仍要能搜到，只是不该排在前面）。
+const STALE_PENALTY = 0.55
+export function isStaleEntry(entry, today = localDateOf()) {
+  return typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < today
+}
 const COMPOSITE_IMPORTANCE_WEIGHT = 0.5
 const COMPOSITE_RECENCY_WEIGHT = 0.3
 const RELEVANT_COMPOSITE_MARGIN = 1.15
@@ -982,6 +987,7 @@ export function scoreEntries(entries, query) {
   const avgLength = totalLength / docs.length || 1
   const df = new Map()
   for (const term of weights.keys()) df.set(term, docs.filter((doc) => doc.terms.has(term)).length)
+  const today = localDateOf()
   return docs.map((doc) => {
     let score = 0
     for (const [term, weight] of weights) {
@@ -993,6 +999,9 @@ export function scoreEntries(entries, query) {
       const aliasBoost = doc.aliasTerms.has(term) ? BM25_ALIAS_WEIGHT : 1
       score += weight * tagBoost * aliasBoost * idf * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / avgLength)))
     }
+    // v3.19 时效降权：过了 staleAfter 的条目仍然可检索（不丢信息），但排序压到后面。
+    // 依据 arXiv 2610.36308 —— 过时版本干扰是记忆检索的主要错误源（证据预算越大反而越差）。
+    if (isStaleEntry(doc.entry, today)) score *= STALE_PENALTY
     return { entry: doc.entry, score }
   })
 }
@@ -2135,6 +2144,7 @@ export function apply(ctx, config) {
                   pinned: { type: 'boolean' },
                   status: { type: 'string' },
                   staleAfter: { type: 'string' },
+                  stale: { type: 'boolean' },
                   verifiedAt: { type: 'string' },
                   sources: { type: 'array', items: { type: 'string' } },
                   score: { type: 'number' },
@@ -2211,6 +2221,7 @@ export function apply(ctx, config) {
             ...(item.entry.pinned ? { pinned: true } : {}),
             ...(typeof item.entry.status === 'string' ? { status: item.entry.status } : {}),
             ...(typeof item.entry.staleAfter === 'string' ? { staleAfter: item.entry.staleAfter } : {}),
+            ...(isStaleEntry(item.entry) ? { stale: true } : {}),
             ...(typeof item.entry.verifiedAt === 'string' ? { verifiedAt: item.entry.verifiedAt } : {}),
             ...(Array.isArray(item.entry.sources) ? { sources: item.entry.sources } : {}),
             score: Math.round(item.score * 1000) / 1000,

@@ -32,6 +32,7 @@ import {
   slugOf,
   extractRuleCandidates,
   collectRuleFiles,
+  isStaleEntry,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -1443,6 +1444,17 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(!out.includes('旧条目'), 'deprecated 条目不注入')
   assert.ok(out.includes('规则一'), 'draft 规则仍注入')
   ok('v3.18 归档机制：deprecated 不注入、draft 参与注入')
+}
+
+// ---- v3.19 时效降权（过期不丢，但排序压后） ----
+{
+  const stale = { id: 's1', text: '验证门在收工前自动跑', staleAfter: '2026-01-01' }
+  const fresh = { id: 's2', text: '验证门在收工前自动跑' }
+  assert.equal(isStaleEntry(stale, '2026-10-30'), true, '过期判据')
+  assert.equal(isStaleEntry(fresh, '2026-10-30'), false, '没有 staleAfter 不算过期')
+  const ranked = scoreEntries([stale, fresh], '验证门 收工前').sort((a, b) => b.score - a.score)
+  assert.equal(ranked[0].entry.id, 's2', '同样文本时未过期的排前面')
+  ok('v3.19 时效降权：过期条目仍可检索，但排序压后')
 }
 
 console.log(`memory: ${passed} 项通过`)
