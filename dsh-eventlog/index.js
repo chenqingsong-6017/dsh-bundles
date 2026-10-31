@@ -211,28 +211,33 @@ export function apply(ctx, config) {
     while (toolNames.size > MAX_TOOL_CACHE) toolNames.delete(toolNames.keys().next().value)
   }
 
+  // 取「人能看懂的那句」：真实 payload（2026-11-01 从会话日志反解）长这样：
+  //   data.message.content = [{ type: 'text', text: 'Error: code run failed ... \n    at ...' }]
+  //   data.error = { name: 'CodeRunFailedError', code: 'CODE_RUN_FAILED' }（只有类名，没有原因）
+  // 所以顺序必须 content 优先、error.name 兜底，否则只记到类名，等于没记原因。
+  function textOf(candidate) {
+    if (typeof candidate === 'string') return candidate
+    if (Array.isArray(candidate)) {
+      return candidate
+        .map((item) => (typeof item === 'string' ? item : item?.text))
+        .filter((item) => typeof item === 'string' && item !== '')
+        .join(' ')
+    }
+    if (candidate !== null && typeof candidate === 'object') {
+      if (typeof candidate.text === 'string' && candidate.text !== '') return candidate.text
+      if (typeof candidate.message === 'string' && candidate.message !== '') return candidate.message
+      if (typeof candidate.name === 'string' && candidate.name !== '') return candidate.name
+      try { return JSON.stringify(candidate) } catch (error) { return String(candidate) }
+    }
+    return ''
+  }
+
   function errorTextOf(data, message) {
-    const candidates = [message?.error, data?.error, message?.content, data?.message, data?.content]
+    const candidates = [message?.error, message?.content, data?.message, data?.content, data?.error]
     for (const candidate of candidates) {
       if (candidate === undefined || candidate === null) continue
-      if (typeof candidate === 'string') {
-        if (candidate !== '') return candidate
-        continue
-      }
-      if (Array.isArray(candidate)) {
-        const joined = candidate
-          .map((item) => (typeof item === 'string' ? item : item?.text))
-          .filter((item) => typeof item === 'string' && item !== '')
-          .join(' ')
-        if (joined !== '') return joined
-        continue
-      }
-      if (typeof candidate === 'object') {
-        if (typeof candidate.message === 'string' && candidate.message !== '') return candidate.message
-        if (typeof candidate.text === 'string' && candidate.text !== '') return candidate.text
-        if (typeof candidate.name === 'string' && candidate.name !== '') return candidate.name
-        try { return JSON.stringify(candidate) } catch (error) { return String(candidate) }
-      }
+      const text = textOf(candidate)
+      if (text !== '') return text
     }
     return ''
   }
@@ -254,14 +259,15 @@ export function apply(ctx, config) {
         const callId = message.toolCallId ?? data.toolCallId ?? data.callId
         const known = callId === undefined || callId === null ? undefined : toolNames.get(String(callId))
         const toolName = String(known ?? data.name ?? message.name ?? 'unknown').slice(0, 64)
-        const detail = errorTextOf(data, message).replace(/\s+/g, ' ').trim().slice(0, 240)
+        // 只取首行：错误正文后面常带整段调用栈，塞进 message 没有信息增量
+        const detail = (errorTextOf(data, message).split('\n')[0] || '').replace(/\s+/g, ' ').trim().slice(0, 240)
         append({
           level: 'warn',
           channel: 'agent',
           code: 'TOOL-ERROR',
           source: toolName,
           message: detail === '' ? toolName + ' 调用失败' : toolName + ' 调用失败：' + detail,
-          session: String(session?.header?.id ?? session?.id ?? ''),
+          session: String(session?.id ?? session?.header?.id ?? session?.sessionId ?? ''),
         })
       } catch (error) {
         noteError(error)

@@ -2,6 +2,15 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.1.2 — 2026-11-01
+
+### Fixed
+- **只落错误类名、丢真实原因**：v0.1.1 按 `message.error → message.content → data.error` 取值，但真实 payload 里 `message.error` 不存在、`data.error` 只有 `{ name: CodeRunFailedError, code: CODE_RUN_FAILED }`，于是日志写成「run_code 调用失败：CodeRunFailedError」——等于没记原因（2026-11-01 重启后实测到）。
+- 取值顺序改为 `message.error → message.content → data.message → data.content → data.error`（正文优先、类名兜底），并只取首行，调用栈不进 message。
+- 顺带兼容 `session.id`，避免会话列留空。
+
+### Tests
+- 新增 1 项：content 有正文、error 只有类名时，message 必须是正文首行、不含类名、不含 ` at ` 栈帧 → 单测 12 → 13 项。
 ## v0.1.1 — 2026-11-01
 
 ### Fixed

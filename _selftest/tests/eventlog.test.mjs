@@ -142,6 +142,35 @@ const host = (dir, extra) => {
   assert.equal(stillOne.matched, 1, '成功结果不记')
   ok('自动捕获：真实 payload（message 包装 + callId 映射 + 无 [object Object]）')
 
+  // v0.1.2：content 有正文、error 只有类名 → message 取正文首行，不是 CodeRunFailedError
+  capture.handler({ header: { id: 's1' } }, { type: 'tool/call', data: { callId: 'c2', name: 'run_code' } })
+  capture.handler(
+    { header: { id: 's1' } },
+    {
+      type: 'tool/result',
+      data: {
+        message: {
+          isError: true,
+          toolCallId: 'c2',
+          content: [
+            {
+              type: 'text',
+              text: 'Error: code run failed (exception): ToolCallError: cannot read "x": not found\n    at foo (file:///a.js:1:1)',
+            },
+          ],
+        },
+        error: { name: 'CodeRunFailedError', code: 'CODE_RUN_FAILED' },
+      },
+    },
+  )
+  const human = await h.defs.get('log_query').execute({ code: 'TOOL-ERROR', keyword: 'cannot read' })
+  assert.equal(human.matched, 1, '正文里有 cannot read 就该命中')
+  assert.equal(human.entries[0].source, 'run_code')
+  assert.ok(human.entries[0].message.includes('not found'), '要落真实原因')
+  assert.ok(!human.entries[0].message.includes('CodeRunFailedError'), '不能只落错误类名')
+  assert.ok(!human.entries[0].message.includes(' at '), '调用栈不进 message')
+  ok('自动捕获：取错误正文首行（不是只落错误类名 / 不带调用栈）')
+
   // minLevel 过滤
   const quiet = host(mkdtempSync(path.join(os.tmpdir(), 'dsh-eventlog-q-')), { minLevel: 'error' })
   const low = await quiet.defs.get('log_write').execute({ message: 'info 不该落盘', level: 'info' })
