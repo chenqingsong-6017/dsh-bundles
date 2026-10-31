@@ -129,6 +129,19 @@ const host = (dir, extra) => {
   assert.equal(captured.entries[0].source, 'web_fetch')
   ok('自动捕获：tool/result 报错 → TOOL-ERROR（成功调用不记）')
 
+  // 真实事件形状（v0.1.1）：tool/call 记名字，tool/result.message 包装 + toolCallId 回查
+  capture.handler({ header: { id: 's1' } }, { type: 'tool/call', data: { callId: 'c1', name: 'vision_crop' } })
+  capture.handler({ header: { id: 's1' } }, { type: 'tool/result', data: { message: { isError: true, toolCallId: 'c1', content: [{ type: 'text', text: 'invalid region "-3,-4"' }] } } })
+  const realShape = await h.defs.get('log_query').execute({ code: 'TOOL-ERROR', keyword: 'invalid region' })
+  assert.equal(realShape.matched, 1, '真实 payload 也要抓到')
+  assert.equal(realShape.entries[0].source, 'vision_crop', '按 toolCallId 还原工具名，不能是 unknown')
+  assert.ok(realShape.entries[0].message.includes('invalid region'), '错误正文要落进 message')
+  assert.ok(!realShape.entries[0].message.includes('[object Object]'), '不能出现 [object Object]')
+  capture.handler({ header: { id: 's1' } }, { type: 'tool/result', data: { message: { isError: false, toolCallId: 'c1' } } })
+  const stillOne = await h.defs.get('log_query').execute({ code: 'TOOL-ERROR', keyword: 'invalid region' })
+  assert.equal(stillOne.matched, 1, '成功结果不记')
+  ok('自动捕获：真实 payload（message 包装 + callId 映射 + 无 [object Object]）')
+
   // minLevel 过滤
   const quiet = host(mkdtempSync(path.join(os.tmpdir(), 'dsh-eventlog-q-')), { minLevel: 'error' })
   const low = await quiet.defs.get('log_write').execute({ message: 'info 不该落盘', level: 'info' })

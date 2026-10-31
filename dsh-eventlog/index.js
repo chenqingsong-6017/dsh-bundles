@@ -28,6 +28,7 @@ const MAX_DATA_CHARS = 900
 const MAX_LIMIT = 200
 const MAX_SCAN_FILES = 200
 const MAX_FILE_BYTES = 8 * 1024 * 1024
+const MAX_TOOL_CACHE = 200
 const DAY_MS = 86400000
 const FILE_RE = /^events-(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.jsonl$/
 
@@ -196,15 +197,64 @@ export function apply(ctx, config) {
   }
 
   // ---- 自动捕获：工具报错（静默失败里最常见的一类；全量调用审计归 dsh-audit） ----
+  // 真实事件形状（2026-11-01 用 _selftest/metrics/tool-error-rate.mjs 反向确认，v0.1.0 读错字段）：
+  //   tool/call   data = { callId, name, ... }
+  //   tool/result data = { message: { isError, toolCallId, content: [{ type, text }], error? } }
+  // 旧实现读 data.isError / data.name —— 真实 payload 里都没有，结果是 source=unknown、message=[object Object]。
+  const toolNames = new Map()
+
+  function rememberToolCall(data) {
+    const callId = data?.callId ?? data?.id
+    const toolName = data?.name
+    if (callId === undefined || callId === null || typeof toolName !== 'string' || toolName === '') return
+    toolNames.set(String(callId), toolName)
+    while (toolNames.size > MAX_TOOL_CACHE) toolNames.delete(toolNames.keys().next().value)
+  }
+
+  function errorTextOf(data, message) {
+    const candidates = [message?.error, data?.error, message?.content, data?.message, data?.content]
+    for (const candidate of candidates) {
+      if (candidate === undefined || candidate === null) continue
+      if (typeof candidate === 'string') {
+        if (candidate !== '') return candidate
+        continue
+      }
+      if (Array.isArray(candidate)) {
+        const joined = candidate
+          .map((item) => (typeof item === 'string' ? item : item?.text))
+          .filter((item) => typeof item === 'string' && item !== '')
+          .join(' ')
+        if (joined !== '') return joined
+        continue
+      }
+      if (typeof candidate === 'object') {
+        if (typeof candidate.message === 'string' && candidate.message !== '') return candidate.message
+        if (typeof candidate.text === 'string' && candidate.text !== '') return candidate.text
+        if (typeof candidate.name === 'string' && candidate.name !== '') return candidate.name
+        try { return JSON.stringify(candidate) } catch (error) { return String(candidate) }
+      }
+    }
+    return ''
+  }
+
   ctx.effect(() =>
     ctx.on('session/event', (session, event) => {
       try {
+        const type = event?.type
+        if (type !== 'tool/call' && type !== 'tool/result') return
         if (captureToolErrors !== true) return
-        if (event?.type !== 'tool/result') return
         const data = event?.data ?? {}
-        if (data.isError !== true && data.error === undefined) return
-        const toolName = String(data.name ?? data.tool ?? 'unknown').slice(0, 64)
-        const detail = String(data.error?.message ?? data.error ?? data.message ?? '').slice(0, 240)
+        if (type === 'tool/call') {
+          rememberToolCall(data)
+          return
+        }
+        const message = data.message ?? {}
+        const failed = message.isError === true || data.isError === true || message.error !== undefined || data.error !== undefined
+        if (!failed) return
+        const callId = message.toolCallId ?? data.toolCallId ?? data.callId
+        const known = callId === undefined || callId === null ? undefined : toolNames.get(String(callId))
+        const toolName = String(known ?? data.name ?? message.name ?? 'unknown').slice(0, 64)
+        const detail = errorTextOf(data, message).replace(/\s+/g, ' ').trim().slice(0, 240)
         append({
           level: 'warn',
           channel: 'agent',

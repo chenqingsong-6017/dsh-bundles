@@ -2,6 +2,15 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.1.1 — 2026-11-01
+
+### Fixed
+- **自动捕获读错事件字段**：v0.1.0 读 `data.isError` / `data.name`，但真实 `tool/result` 形状是 `{ message: { isError, toolCallId, content } }`，工具名只在 `tool/call` 里 —— 结果记成 `source: unknown`、`message: unknown 调用失败：[object Object]`（2026-11-01 真机日志里实测到 1 条）。
+- 现在按 `tool/call` 的 `callId` 建 200 条上限的映射回查工具名，错误正文取 `message.error` → `message.content[].text` → `data.error` 依次回退，逐层 `String` 保护，不会再出现 `[object Object]`。
+- 兼容 v0.1.0 的旧形状（顶层 `isError` / `name`），已有调用方不受影响。
+
+### Tests
+- 新增 1 项：真实 payload（`message` 包装 + `callId` 映射 + 正文断言 + 不出现 `[object Object]`）→ 单测 11 → 12 项。
 ## v0.1.0 — 2026-11-01
 
 ### Added

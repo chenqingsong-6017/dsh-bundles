@@ -50,7 +50,8 @@ D:\AI\dsh-data\logs\
 1. **不进上下文**：永不注册 systemPrompt 层，零常驻 token 成本。
 2. **fail-safe**：所有写盘/清理都在 try/catch 里，失败只记 `lastError`，绝不抛给会话或其它插件。
 3. **不重复**：不记全量工具调用（那是 `dsh-audit` 的活），只记错误与运维事件。
-4. **自动捕获很克制**：只接 `session/event` 里的 `tool/result` 且 `isError === true` → `TOOL-ERROR`；其余靠 `log_write` 主动写。
+4. **自动捕获很克制**：只接 `session/event` 里的 `tool/result`（`message.isError === true` 或带 `error`）→ `TOOL-ERROR`；其余靠 `log_write` 主动写。
+   真实形状是 `tool/call { callId, name }` + `tool/result { message: { isError, toolCallId, content } }`，工具名靠 `callId` 映射回查（v0.1.0 读错字段记成 `unknown / [object Object]`，v0.1.1 修）。
 5. **可重造物**：日志按天滚动、超保留天数自动清（删除三查的免审通道：随时可重造的运行产物）。
 
 ## 配置（cordis.patch.yml 或 profile 层）
