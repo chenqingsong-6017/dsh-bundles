@@ -1,0 +1,29 @@
+{
+  "name": "@local/dsh-obsidian",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "description": "Read-only index of the local Obsidian vault (P1): search / read / status, index.json on D:, never writes the vault.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

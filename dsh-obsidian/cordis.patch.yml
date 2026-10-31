@@ -1,0 +1,9 @@
+# Obsidian 只读索引：本 bundle 自带插件代码，name 用相对路径即按本 patch 所在目录解析。
+- insert:
+    - id: obsidian
+      name: './index.js'
+      # 需要改配置时取消下面注释（默认值即为推荐值）：
+      # config:
+      #   vaultDir: D:\AI-date\obsidian\vault
+      #   storeDir: D:\AI\dsh-data\obsidian
+      #   buildOnStart: true
