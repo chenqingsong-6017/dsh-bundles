@@ -215,9 +215,34 @@ export function costOf(bucket, prices) {
 
 const emptyTotals = () => ({ calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 })
 
+/**
+ * v2026-10-31：价格表支持外部文件（单一事实源）。
+ * 起因：dsh-usage 与 dsh-cost 各存一份 prices，改价要改两处，漏一处就报不同的钱。
+ * 优先级：pricesFile 读得到就用文件；读不到 / 坏了退回内联 prices（fail-safe，绝不因为价格表读失败而崩）。
+ */
+export function resolvePrices(config) {
+  const inline = config?.prices && typeof config.prices === 'object' ? config.prices : null
+  const file = typeof config?.pricesFile === 'string' && config.pricesFile.trim() !== '' ? config.pricesFile.trim() : ''
+  if (file === '') return inline
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const clean = {}
+      for (const [key, value] of Object.entries(parsed)) {
+        if (key.startsWith('_')) continue
+        if (value !== null && typeof value === 'object') clean[key] = value
+      }
+      if (Object.keys(clean).length > 0) return clean
+    }
+  } catch (error) {
+    // 文件不存在 / JSON 坏了：静默退回内联，不打断任何统计
+  }
+  return inline
+}
+
 export function apply(ctx, config) {
   const timeZone = typeof config?.timeZone === 'string' && config.timeZone.trim() !== '' ? config.timeZone.trim() : undefined
-  const prices = config?.prices && typeof config.prices === 'object' ? config.prices : null
+  const prices = resolvePrices(config)
   const currency = typeof config?.currency === 'string' && config.currency.trim() !== '' ? config.currency.trim() : 'CNY'
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
   const tools = ctx.tools
