@@ -26,47 +26,6 @@ const DEFAULT_MAX_LINE = 220
 
 const num = (value) => (Number.isFinite(value) ? value : 0)
 
-import { readFileSync } from 'node:fs'
-
-/**
- * v2026-10-31：价格表支持外部文件（与 dsh-usage 共用同一个 prices.json，改价只改一处）。
- * 读不到 / 坏了退回内联 prices —— 价格表读失败绝不能连累每轮的 HUD 行。
- */
-export function resolvePrices(config) {
-  const inline = config?.prices && typeof config.prices === 'object' ? config.prices : null
-  const file = typeof config?.pricesFile === 'string' && config.pricesFile.trim() !== '' ? config.pricesFile.trim() : ''
-  if (file === '') return inline
-  try {
-    const parsed = JSON.parse(readFileSync(file, 'utf8'))
-    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const clean = {}
-      for (const [key, value] of Object.entries(parsed)) {
-        if (key.startsWith('_')) continue
-        if (value !== null && typeof value === 'object') clean[key] = value
-      }
-      if (Object.keys(clean).length > 0) return clean
-    }
-  } catch (error) {
-    // 静默退回内联
-  }
-  return inline
-}
-
-/**
- * 把「按模型分组」的价格表摊平成单个模型的四项价格。
- * prices.json 是 { 'deepseek-flash': {input,...} }（usage 用），cost 只需要当前模型那一组。
- * 兼容已经写成扁平的旧配置（{input,...}）——原样返回。
- */
-export function flattenPrices(prices, model) {
-  if (prices === null || prices === undefined || typeof prices !== 'object') return undefined
-  if (typeof prices.input === 'number') return prices
-  const key =
-    typeof model === 'string' && prices[model] !== undefined
-      ? model
-      : Object.keys(prices).find((item) => prices[item] !== null && typeof prices[item] === 'object')
-  return key === undefined ? undefined : prices[key]
-}
-
 /** 12345 -> 12.3k；1234567 -> 1.23M；128000 -> 128k。去掉无意义的 .0，保持一眼可读。 */
 export function fmtTokens(value) {
   const n = num(value)
@@ -148,7 +107,7 @@ export function costOf(stats, prices) {
 }
 
 export function apply(ctx, config) {
-  const prices = flattenPrices(resolvePrices(config), typeof config?.model === 'string' ? config.model.trim() : '')
+  const prices = config?.prices !== undefined && config.prices !== null && typeof config.prices === 'object' ? config.prices : undefined
   const currency = typeof config?.currency === 'string' && config.currency !== '' ? config.currency + ' ' : ''
   const maxLine = Number.isInteger(config?.maxLine) && config.maxLine > 0 ? config.maxLine : DEFAULT_MAX_LINE
 
