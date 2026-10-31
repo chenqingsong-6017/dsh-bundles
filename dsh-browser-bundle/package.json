@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-browser-bundle",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "engines": {
     "node": ">=22.19.0"
@@ -23,7 +23,7 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/dsh-browser-use": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp": "0.2.1-rc.3"
+    "@deepseek-ai/dsh-browser-use": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-experimental-browser-use-playwright-mcp": "0.2.1-rc.5"
   }
 }

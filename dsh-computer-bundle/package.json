@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-computer-bundle",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "engines": {
     "node": ">=22.19.0"
@@ -23,7 +23,7 @@
     }
   },
   "dependencies": {
-    "@deepseek-ai/dsh-computer-use": "0.2.1-rc.3",
-    "@deepseek-ai/dsh-experimental-computer-use-cua-driver-native": "0.2.1-rc.3"
+    "@deepseek-ai/dsh-computer-use": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-experimental-computer-use-cua-driver-native": "0.2.1-rc.5"
   }
 }
