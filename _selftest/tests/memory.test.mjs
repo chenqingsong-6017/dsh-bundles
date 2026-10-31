@@ -1645,6 +1645,21 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   rmSync(dir2, { recursive: true, force: true })
 }
 
+// v3.23：inject:false 只参与检索、不占每轮注入预算（事实/历史类条目）
+{
+  const fact = { id: 'f1', text: 'FACT-ONLY-SEARCHABLE', kind: 'fact', inject: false }
+  const ruleItem = { id: 'r1', text: 'RULE-ALWAYS-IN', kind: 'rule' }
+  const both = renderMemory([fact, ruleItem], { maxInjectChars: 800 })
+  assert.equal(both.includes('FACT-ONLY-SEARCHABLE'), false, 'inject:false 不能进注入块')
+  assert.equal(both.includes('RULE-ALWAYS-IN'), true, '普通条目照常注入')
+  const onlyFact = renderMemory([fact], { maxInjectChars: 800 })
+  assert.equal(onlyFact.includes('FACT-ONLY-SEARCHABLE'), false, '只剩 inject:false 时也不出现')
+  assert.equal(normalizeEntry({ id: 'x', text: 'y', inject: false }).inject, false, 'normalizeEntry 保留 inject:false')
+  assert.equal(normalizeEntry({ id: 'x', text: 'y' }).inject, undefined, '缺省不写 inject 字段')
+  assert.equal(normalizeEntry({ id: 'x', text: 'y', inject: true }).inject, undefined, 'inject:true 不落盘（缺省即注入）')
+  ok('v3.23 inject:false：只检索不注入，且缺省行为不变')
+}
+
 console.log(`memory: ${passed} 项通过`)
 
 

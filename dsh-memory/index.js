@@ -443,6 +443,8 @@ export function normalizeEntry(input) {
     if (sources.length > 0) out.sources = sources
   }
   if (input.pinned === true) out.pinned = true
+  // v3.23：inject:false = 只检索、不注入（事实/历史类条目用）。缺省等于 true。
+  if (input.inject === false) out.inject = false
   if (typeof input.lastUsedAt === 'string' && input.lastUsedAt !== '') out.lastUsedAt = input.lastUsedAt
   out.addedAt = typeof input.addedAt === 'string' ? input.addedAt : new Date().toISOString()
   out.updatedAt = typeof input.updatedAt === 'string' ? input.updatedAt : new Date().toISOString()
@@ -510,6 +512,9 @@ export function renderMemory(allEntries, options) {
     (entry) =>
       (typeof entry?.supersededBy !== 'string' || entry.supersededBy === '') &&
       entry?.status !== 'deprecated' &&
+      // v3.23：inject:false 的条目只参与 memory_search，不占每轮注入预算。
+      // 依据 Anthropic 官方 context engineering：前置只留硬规则，事实/历史类走 just-in-time 检索。
+      entry?.inject !== false &&
       applicableAt(entry, cwd),
   )
 
@@ -1279,6 +1284,8 @@ export const memoryEntrySchema = {
     supersededBy: { type: 'string' },
     usedCount: { type: 'integer' },
     pinned: { type: 'boolean' },
+    // v3.23：输出 schema 必须同步声明，否则 memory_list 会整条 rejecting（v3.20 踩过同一个坑）。
+    inject: { type: 'boolean' },
     lastUsedAt: { type: 'string' },
     addedAt: { type: 'string' },
     updatedAt: { type: 'string' },
@@ -2267,6 +2274,9 @@ export function apply(ctx, config) {
   const applyEntryFlags = (entry, args) => {
     if (args?.pinned === true) entry.pinned = true
     else if (args?.pinned === false) delete entry.pinned
+    // v3.23：inject:false 只检索不注入；传 true 显式恢复注入。
+    if (args?.inject === false) entry.inject = false
+    else if (args?.inject === true) delete entry.inject
   }
 
   ctx.effect(() =>
@@ -2331,6 +2341,7 @@ export function apply(ctx, config) {
                   kind: { type: 'string' },
                   importance: { type: 'integer' },
                   pinned: { type: 'boolean' },
+                  inject: { type: 'boolean' },
                   status: { type: 'string' },
                   staleAfter: { type: 'string' },
                   stale: { type: 'boolean' },
@@ -2464,6 +2475,10 @@ export function apply(ctx, config) {
             type: 'array',
             items: { type: 'string' },
             description: 'Absolute workspace path prefixes this entry applies to (v3.0). When set, the entry is only injected in matching working directories; elsewhere it stays searchable but costs no prompt space.',
+          },
+          inject: {
+            type: 'boolean',
+            description: 'v3.23: set false for facts/history that should be retrievable by memory_search but must NOT occupy the per-turn injection budget. Hard rules should stay injected (default).',
           },
         },
         required: ['text'],
@@ -2691,6 +2706,10 @@ export function apply(ctx, config) {
           verified: {
             type: 'boolean',
             description: 'true = mark as just re-checked (records verifiedAt now); false = clear the verification.',
+          },
+          inject: {
+            type: 'boolean',
+            description: 'v3.23: false = searchable but never injected (facts/history); true = restore injection.',
           },
           supersede: {
             type: 'boolean',
