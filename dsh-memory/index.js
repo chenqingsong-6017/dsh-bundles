@@ -761,6 +761,12 @@ export function renderMemory(allEntries, options) {
     statsOut.relevanceCoverage = Number(relevanceSeen.toFixed(4))
     statsOut.compact = compact.map((entry) => entry.id)
     statsOut.dropped = dropped.map((entry) => entry.id)
+    // v3.24：注入收益度量（学 Google ADK 的 _prompt_chars_saved）——
+    // 光报「注入了多少」不够，还要能答「降级成索引行替我们省了多少」。
+    const sizeOf = (list, render) => list.reduce((n, entry) => n + render(entry).length + 1, 0)
+    statsOut.fullChars = sizeOf(full, lineFull)
+    statsOut.indexedChars = sizeOf(indexed, lineIndex)
+    statsOut.droppedFullChars = sizeOf(dropped, lineFull)
   }
 
   return built.block
@@ -1349,10 +1355,18 @@ export function slugOf(input, fallback = 'card') {
 export function apply(ctx, config) {
   const maxBytes =
     Number.isInteger(config?.maxBytes) && config.maxBytes > 0 ? Math.min(config.maxBytes, 64 * 1024) : DEFAULT_MAX_BYTES
-  const maxInjectChars =
+  let maxInjectChars =
     Number.isInteger(config?.maxInjectChars) && config.maxInjectChars > 0
       ? Math.min(config.maxInjectChars, 32 * 1024)
       : DEFAULT_MAX_INJECT_CHARS
+  // v3.24：参数交叉校验（学 Google ADK 的成对校验）——注入预算不该超过存储预算。
+  // 配反了不抛错（fail-safe），钳到 maxBytes 并把原因写进诊断，让人看得见。
+  let configWarning = ''
+  if (maxInjectChars > maxBytes) {
+    configWarning =
+      'maxInjectChars(' + maxInjectChars + ') 大于 maxBytes(' + maxBytes + ')：已钳到 ' + maxBytes + '。注入预算不该超过存储预算。'
+    maxInjectChars = maxBytes
+  }
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
   // v3.20：归档条目分文件冷存 —— 主库只留生效记忆，归档落 archive.json（与 aliases.json 同级的旁路文件）。
   // 起因：归档条目永远占着 memory.json，且 memory_list 每次都把 93 条一起吐出来（实测 37 KB），
@@ -2194,7 +2208,9 @@ export function apply(ctx, config) {
     // v3.20：默认只返回生效条目。归档条目走 archive.json，要看需显式 includeArchived:true。
     // 起因：归档既不计预算也不参与注入，却让 memory_list 每次多吐 30+ KB（实测 93 条 / 37 KB）。
     const includeArchived = options?.includeArchived === true
-    const block = renderOnce('', undefined, undefined, lastKnownCwd)
+    // v3.24：把 stats 传下去，才能报「索引行花了多少、出局的全量本要花多少」。
+    const listStats = {}
+    const block = renderOnce('', listStats, undefined, lastKnownCwd)
     const entries = activeEntries()
     const listed = includeArchived ? state.entries : entries
     return {
@@ -2214,6 +2230,15 @@ export function apply(ctx, config) {
       // v2.8：maxInjectChars 只管正文行，头部/索引/诊断另有固定开销，所以总长会略超——
       // 与其让人猜，不如直接把「是否超」标出来。
       injectedOverBudget: block.length > maxInjectChars,
+      // v3.24：降级收益——索引行花了多少、被出局的条目若全量展开要花多少。
+      injectStats: {
+        fullChars: listStats.fullChars ?? 0,
+        indexedChars: listStats.indexedChars ?? 0,
+        droppedFullChars: listStats.droppedFullChars ?? 0,
+        indexedCount: Array.isArray(listStats.indexed) ? listStats.indexed.length : 0,
+        droppedCount: Array.isArray(listStats.dropped) ? listStats.dropped.length : 0,
+      },
+      ...(configWarning !== '' ? { configWarning } : {}),
       entries: listed.map(publicEntry),
       block,
     }
@@ -2239,6 +2264,17 @@ export function apply(ctx, config) {
       archived: { type: 'integer' },
       health: { type: 'string' },
       healthNote: { type: 'string' },
+      configWarning: { type: 'string' },
+      injectStats: {
+        type: 'object',
+        properties: {
+          fullChars: { type: 'integer' },
+          indexedChars: { type: 'integer' },
+          droppedFullChars: { type: 'integer' },
+          indexedCount: { type: 'integer' },
+          droppedCount: { type: 'integer' },
+        },
+      },
       usedChars: { type: 'integer' },
       maxBytes: { type: 'integer' },
       maxInjectChars: { type: 'integer' },

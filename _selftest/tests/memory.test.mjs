@@ -1668,6 +1668,21 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   ok('v3.23 inject:false：只检索不注入，且缺省行为不变')
 }
 
+// v3.24：注入收益度量——要能回答「降级成索引行省了多少」
+{
+  // 预算充足：应给出全文字符数
+  const stBig = {}
+  renderMemory([{ id: 'a1', text: 'A'.repeat(120), pinned: true }], { maxInjectChars: 1000, stats: stBig })
+  assert.ok(stBig.fullChars > 0, '预算充足时 fullChars > 0')
+  // 预算紧张：应给出索引/出局字符数，供换算「降级省了多少」
+  const stTight = {}
+  renderMemory([{ id: 'b1', text: 'B'.repeat(120) }, { id: 'c1', text: 'C'.repeat(120) }], { maxInjectChars: 150, stats: stTight })
+  assert.equal(typeof stTight.indexedChars, 'number', '索引行字符数要报出来')
+  assert.equal(typeof stTight.droppedFullChars, 'number', '出局条目全量字符数要报出来')
+  assert.ok(stTight.indexedChars > 0 || stTight.droppedFullChars > 0, '预算紧张时要走索引或出局')
+  ok('v3.24 注入收益度量：stats 带全文/索引/出局三类字符数')
+}
+
 console.log(`memory: ${passed} 项通过`)
 
 
