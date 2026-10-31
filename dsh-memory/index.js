@@ -2625,6 +2625,8 @@ export function apply(ctx, config) {
           ...(typeof args?.kind === 'string' ? { kind: args.kind.trim() } : {}),
           ...(Number.isFinite(args?.importance) ? { importance: args.importance } : {}),
           ...(args?.pinned === true ? { pinned: true } : {}),
+          // v3.23 修：add 路径原本没接 inject，schema 声明了但落盘时被丢掉。
+          ...(args?.inject === false ? { inject: false } : {}),
           ...(typeof args?.status === 'string' ? { status: args.status } : {}),
           ...(typeof args?.staleAfter === 'string' && args.staleAfter !== '' ? { staleAfter: args.staleAfter } : {}),
           ...(derivedStale !== '' ? { staleAfter: derivedStale } : {}),

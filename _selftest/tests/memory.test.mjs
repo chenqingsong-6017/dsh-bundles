@@ -1657,6 +1657,14 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(normalizeEntry({ id: 'x', text: 'y', inject: false }).inject, false, 'normalizeEntry 保留 inject:false')
   assert.equal(normalizeEntry({ id: 'x', text: 'y' }).inject, undefined, '缺省不写 inject 字段')
   assert.equal(normalizeEntry({ id: 'x', text: 'y', inject: true }).inject, undefined, 'inject:true 不落盘（缺省即注入）')
+  // 集成：memory_add 必须真的把 inject:false 落盘（v3.23 修过一次漏接）
+  const d3 = mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-inject-'))
+  const h3 = host(d3)
+  const added = await h3.defs.get('memory_add').execute({ text: '只检索的事实', inject: false })
+  assert.equal(added.entry.inject, false, 'memory_add 要接住 inject:false')
+  const listed = await h3.defs.get('memory_list').execute({})
+  assert.equal(listed.entries.find((e) => e.id === added.entry.id).inject, false, '落盘后仍能看到')
+  rmSync(d3, { recursive: true, force: true })
   ok('v3.23 inject:false：只检索不注入，且缺省行为不变')
 }
 
