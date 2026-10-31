@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Research workbench",
+    "description": "Research rules enforced at the tool boundary: concrete decision question, every conclusion needs a resolvable ref, file refs are checked, reports refuse to render when evidence is missing."
+  }
+}

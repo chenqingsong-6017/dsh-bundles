@@ -1,0 +1,22 @@
+{
+  "name": "@local/dsh-research",
+  "version": "0.1.1",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "description": "Research workflow as tool boundaries: concrete decision question, one evidence line per conclusion, tiered sources, mechanical audit, markdown report.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": ["index.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "CHANGELOG.md"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
