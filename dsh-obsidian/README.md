@@ -53,7 +53,8 @@ config:
 |---|---|
 | `node --check index.js` | 通过 |
 | 单测 `_selftest/tests/obsidian.test.mjs` | 见验证门输出（纯函数 + 临时 vault 夹具 + 4 个工具真调用） |
-| 真机（重启后） | 待验：`obsidian_status` 的笔记数应与资源管理器手点一致；`obsidian_search` 能命中画像卡 |
+| 真机（2026-11-01） | ✅ `notes=21` / `bases=4` / `links=18` / `brokenLinks=0` / `parseErrors=0`，与手数一致；重建 2ms、index.json 25.7KB |
+| 工具真调用 | ✅ 「陛下」（别名）→ Me.md 排第一；「事件日志」+ `type=journal` → 只回日志 1 条；`obsidian_note(10-Life/15-People/Me.md)` 拿到 `type=person`；空 query 与 `../AGENTS.md` 均被拒 |
 
 ## 已知边界（诚实清单）
 
