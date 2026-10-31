@@ -166,9 +166,17 @@ export function apply(ctx, config) {
     let file = fileFor(storeDir, day)
     try {
       if (existsSync(file) && statSync(file).size > MAX_FILE_BYTES) {
+        // 轮转要按「候选文件是否已满」判断：只看基名会导致 .1 一出现就每条新事件建一个新文件
+        // （2026-11-01 实测：基文件 12.67MB 后连写 3 条生成 .1~.4 各 1 条，照此一天能碎出几千个文件）。
         let index = 1
-        while (existsSync(path.join(storeDir, 'events-' + day + '.' + index + '.jsonl')) && index < 100) index += 1
-        file = path.join(storeDir, 'events-' + day + '.' + index + '.jsonl')
+        while (index <= 1000) {
+          const candidate = path.join(storeDir, 'events-' + day + '.' + index + '.jsonl')
+          if (!existsSync(candidate) || statSync(candidate).size <= MAX_FILE_BYTES) {
+            file = candidate
+            break
+          }
+          index += 1
+        }
       }
       appendFileSync(file, JSON.stringify(event) + '\n', 'utf8')
       written += 1
@@ -254,7 +262,11 @@ export function apply(ctx, config) {
           return
         }
         const message = data.message ?? {}
-        const failed = message.isError === true || data.isError === true || message.error !== undefined || data.error !== undefined
+        // 显式 isError:false 一律当成功：有些 payload 会带一个非致命 error 字段，别误报成失败
+        const explicitSuccess = message.isError === false || data.isError === false
+        const failed = explicitSuccess
+          ? false
+          : message.isError === true || data.isError === true || message.error !== undefined || data.error !== undefined
         if (!failed) return
         const callId = message.toolCallId ?? data.toolCallId ?? data.callId
         const known = callId === undefined || callId === null ? undefined : toolNames.get(String(callId))
@@ -310,12 +322,17 @@ export function apply(ctx, config) {
         },
       },
       async execute(args) {
+        const message = String(args?.message ?? '').replace(/\s+/g, ' ').trim()
+        if (message === '') {
+          lastError = 'log_write: message 为空，已拒绝（空事件只会污染日志）'
+          return { ok: false }
+        }
         const result = append({
           level: args?.level,
           channel: args?.channel,
           code: args?.code,
           source: args?.source,
-          message: args?.message,
+          message,
           data: args?.data,
         })
         if (result === null) return { ok: false }

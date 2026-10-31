@@ -203,4 +203,53 @@ const host = (dir, extra) => {
   ok('fail-safe：目录不可写时返回 ok:false 并记 lastError，不抛')
 }
 
+// ---- v0.1.3：轮转按候选文件大小续写（别一条一个文件） ----
+{
+  const dir = mkdtempSync(path.join(os.tmpdir(), "dsh-eventlog-roll-"))
+  const day = localDay(Date.now())
+  const base = fileFor(dir, day)
+  const line = JSON.stringify(normalizeEvent({ message: 'x'.repeat(300) })) + '\n'
+  writeFileSync(base, line.repeat(30000), 'utf8')
+  assert.ok(readFileSync(base).length > 8 * 1024 * 1024, "构造一个超过 8MB 的当天基文件")
+  const h = host(dir)
+  await h.defs.get('log_write').execute({ message: 'after-roll-1' })
+  await h.defs.get('log_write').execute({ message: 'after-roll-2' })
+  const names = readdirSync(dir)
+  assert.equal(names.filter((n) => n.endsWith(".2.jsonl")).length, 0, "第二块没满就不该再建 .2")
+  const rolled = names.find((n) => n.endsWith(".1.jsonl"))
+  assert.ok(rolled, "基文件满后应滚到 .1")
+  const lines = readFileSync(path.join(dir, rolled), 'utf8').trim().split('\n')
+  assert.ok(lines.length >= 3, "LOG-START + 2 条应续写在同一块里，而不是一条一个文件")
+  rmSync(dir, { recursive: true, force: true })
+  ok("轮转：按候选文件大小续写，不碎成一条一文件（块内 " + lines.length + " 行）")
+}
+
+// ---- v0.1.3：空 message 拒绝 ----
+{
+  const dir = mkdtempSync(path.join(os.tmpdir(), "dsh-eventlog-empty-"))
+  const h = host(dir)
+  const empty = await h.defs.get('log_write').execute({ message: '   ' })
+  assert.equal(empty.ok, false, "空事件必须拒绝")
+  const st = await h.defs.get('log_status').execute({})
+  assert.notEqual(st.lastError, "", "拒绝原因要进 lastError")
+  rmSync(dir, { recursive: true, force: true })
+  ok("log_write：空 message 拒绝，且 lastError 有原因")
+}
+
+// ---- v0.1.3：显式成功不误报 ----
+{
+  const dir = mkdtempSync(path.join(os.tmpdir(), "dsh-eventlog-ok-"))
+  const h = host(dir)
+  const capture = h.handlers.find((item) => item.name === "session/event")
+  capture.handler({ header: { id: 's' } }, { type: 'tool/call', data: { callId: 'c9', name: 'read' } })
+  capture.handler(
+    { header: { id: 's' } },
+    { type: 'tool/result', data: { message: { isError: false, toolCallId: 'c9' }, error: { name: 'NotFatal' } } },
+  )
+  const errs = await h.defs.get('log_query').execute({ code: 'TOOL-ERROR' })
+  assert.equal(errs.matched, 0, "isError:false 时不得记 TOOL-ERROR")
+  rmSync(dir, { recursive: true, force: true })
+  ok("自动捕获：显式 isError:false 且带 error 字段时不误报")
+}
+
 console.log(`eventlog: ${passed} 项通过`)
