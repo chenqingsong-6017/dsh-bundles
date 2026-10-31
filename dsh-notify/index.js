@@ -24,7 +24,7 @@ import path from 'node:path'
 import os from 'node:os'
 
 export const name = 'dsh-notify'
-export const inject = ['tools']
+export const inject = ['tools', 'subprocess']
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const RANGES = { today: 1, '7d': 7, '30d': 30, all: null }

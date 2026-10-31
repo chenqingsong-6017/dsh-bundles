@@ -112,4 +112,4 @@ plugin_manager remove_bundle   target = @local/dsh-notify
 - 原生 Toast 的 AppUserModelID 固定用 `DeepSeek Harness`；若系统要求注册 AUMID 才能显示，回退的托盘气泡仍然可用；
 - 只处理 `turn/end` 级别的事件；子代理/后台任务的完成通知没有单独做；
 - `sound: false` 只静音 Toast 本身；托盘气泡的提示音由系统控制，无法静音。
-- **依赖 `subprocess` 服务**：`ctx.get('subprocess')` 拿不到时 `canToast = false`，通知降级为只写日志（`toastAvailable: false`）。2026-10-31 实测：web profile 下就是这种状态——223 条记录里 `sent = 2`，桌面一次都没弹过。要真弹必须跑在能拿到 subprocess 的 profile 里。
+- **依赖 `subprocess` 服务**：`canToast` 需要 `ctx.get('subprocess')`。v0.1.0 的 `inject` 只声明了 `['tools']`，而 cordis 4.x 的 `ctx.get` 只返回「提供者已激活」的实现（`cordis/lib/index.js`：`strict` 检查 `impl.fiber.state === 2`），`apply()` 时服务尚未就绪 → `canToast` 永久 false，10-27 起所有通知只写日志。v0.1.1 起 `inject` 补上 `'subprocess'`，cordis 会保证服务先就绪；判断逻辑本身不变，拿不到时仍降级为只写日志（fail-safe）。
