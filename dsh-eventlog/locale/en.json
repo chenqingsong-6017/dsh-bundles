@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Event Log",
+    "description": "Windows Event Viewer style: channel + level + stable event code, rolled daily on D:. Records silent failures and operational events only; never injected into the prompt, queried on demand."
+  }
+}
