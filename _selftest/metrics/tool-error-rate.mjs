@@ -1,0 +1,220 @@
+#!/usr/bin/env node
+/**
+ * 工具错误率仪表 —— 「可靠性工程」的第一个可复现基线。
+ *
+ * 为什么需要它：DSH 的 audit 只记副作用白名单，读类工具不计，不能当错误率用；
+ * 全量调用与报错只存在于会话事件日志（<DSH_HOME>/sessions/**​/session.v4.jsonl.zstd）。
+ *
+ * 指标定义（唯一口径，写死在这里，别在别处另算一套）：
+ *   errorRate = isError 的 tool/result 数 / tool/call 数
+ *   成功 = 工具返回 isError:false 且没抛异常；用户 steer、回合中止不计入错误率（另有统计）。
+ *
+ * 用法：
+ *   node tool-error-rate.mjs                 # 最近 7 天
+ *   node tool-error-rate.mjs --days 30 --json
+ *   node tool-error-rate.mjs --fail-over 0.02  # CI/收工用：超过阈值退出 1
+ *
+ * 输出：分类型 / 分工具 / 分天，以及错误签名 Top N（归一化后按次数）。
+ * 基线文件：$DSH_METRICS_DIR/tool-error-rate-baseline.json + history.jsonl
+ */
+import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import zlib from 'node:zlib'
+
+const argv = process.argv.slice(2)
+const arg = (name, dflt) => {
+  const i = argv.indexOf('--' + name)
+  return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : dflt
+}
+const flag = (name) => argv.includes('--' + name)
+
+const HOME = process.env.DSH_HOME || process.env.USERPROFILE + '\\.dsh'
+const SESSIONS = path.join(HOME, 'sessions')
+const METRICS_DIR = process.env.DSH_METRICS_DIR || 'D:\\AI\\dsh-data\\metrics'
+const DAYS = Number(arg('days', 7))
+const TOP = Number(arg('top', 12))
+const FAIL_OVER = arg('fail-over', null)
+const SINCE_AT = arg('since', null)
+const SINCE = SINCE_AT ? Date.parse(SINCE_AT) : Date.now() - DAYS * 86400000
+/** 窗口标签：改规则后用 --since 只统计「规则生效之后」，避免 7 天滚动窗口把旧数据混进来稀释效果。 */
+const WINDOW = SINCE_AT ? ('自 ' + new Date(SINCE).toISOString().slice(0, 16).replace('T', ' ')) : (DAYS + ' 天')
+if (SINCE_AT && Number.isNaN(SINCE)) { console.error('--since 不是合法时间：' + SINCE_AT); process.exit(2) }
+const JSON_OUT = flag('json')
+
+const MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
+/** 会话日志是「多帧 zstd 拼接」：单个 frame 只有头一行，必须按魔数切帧逐帧解压。 */
+function decodeSession(file) {
+  const buf = readFileSync(file)
+  const offs = []
+  for (let i = 0; i < buf.length - 4; i++) {
+    if (buf[i] === MAGIC[0] && buf[i + 1] === MAGIC[1] && buf[i + 2] === MAGIC[2] && buf[i + 3] === MAGIC[3]) offs.push(i)
+  }
+  let out = ''
+  for (let k = 0; k < offs.length; k++) {
+    const end = k + 1 < offs.length ? offs[k + 1] : buf.length
+    try { out += zlib.zstdDecompressSync(buf.subarray(offs[k], end)).toString('utf8') } catch { /* 截断帧忽略 */ }
+  }
+  return out
+}
+
+function listSessionFiles(root) {
+  const files = []
+  if (!existsSync(root)) return files
+  for (const ws of readdirSync(root)) {
+    const wsd = path.join(root, ws)
+    let st; try { st = statSync(wsd) } catch { continue }
+    if (!st.isDirectory()) continue
+    for (const s of readdirSync(wsd)) {
+      const sd = path.join(wsd, s)
+      let st2; try { st2 = statSync(sd) } catch { continue }
+      if (!st2.isDirectory()) continue
+      for (const f of readdirSync(sd)) {
+        const fp = path.join(sd, f)
+        let st3; try { st3 = statSync(fp) } catch { continue }
+        if (st3.isFile() && st3.size > 1024) files.push(fp)
+      }
+    }
+  }
+  return files
+}
+
+/** 错误分类学：按「谁该修」分，而不是按报错文本分。 */
+function classify(msg) {
+  const m = msg.toLowerCase()
+  if (/non-public ip|fetch failed|getaddrinfo|enotfound|econnrefused|econnreset|socket hang up|tls handshake|cross-origin redirect/.test(m)) return 'network 通道'
+  if (/cannot modify|cannot read|fs_stale_version|ebusy|eperm|being used by another/.test(m)) return 'filesystem 写冲突/歧义'
+  if (/expected a semicolon|expected ','|unexpected character|unterminated|requires parens|invalid time value/.test(m)) return 'code 语法/逻辑'
+  if (/matched \d+ times|expected |old_string was not found|must differ|offset \d+ is out of range/.test(m)) return 'edit 用法失误'
+  if (/timeout|deadline reached/.test(m)) return 'timeout 超时'
+  if (/aborted|abort/.test(m)) return 'aborted 被打断'
+  if (/session has ended|start_session/.test(m)) return 'session 生命周期'
+  if (/not found|no such file|enoent/.test(m)) return 'not-found 路径错'
+  if (/validation|invalid|schema|arguments/.test(m)) return 'validation 参数错'
+  return 'code/other'
+}
+
+/** 归一化错误签名：去路径、去 id、去数字，便于聚合。 */
+function signature(text) {
+  return text
+    .replace(/[A-Za-z]:\\[^\s"']+/g, '<path>')
+    .replace(/\b[0-9a-f]{8,}\b/g, '<id>')
+    .replace(/\b\d{3,}\b/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .slice(0, 110)
+}
+
+const DENIED = /dsh-hooks 拦截/
+let denials = 0
+const calls = new Map()
+const kindCount = new Map()
+const toolErr = new Map()
+const toolCalls = new Map()
+const sigCount = new Map()
+const perDay = new Map()
+let totalCalls = 0
+let totalErrors = 0
+let steers = 0
+let abortedTurns = 0
+let fileCount = 0
+
+for (const file of listSessionFiles(SESSIONS)) {
+  let txt
+  try { txt = decodeSession(file) } catch { continue }
+  fileCount++
+  const localCalls = new Map()
+  for (const line of txt.split('\n')) {
+    if (line.length < 16) continue
+    let ev
+    try { ev = JSON.parse(line) } catch { continue }
+    const t = typeof ev.time === 'number' ? ev.time : null
+    if (t === null || t < SINCE) continue
+    const d = ev.data || {}
+    if (ev.type === 'tool/call') {
+      localCalls.set(d.callId, d.name)
+      totalCalls++
+      toolCalls.set(d.name, (toolCalls.get(d.name) || 0) + 1)
+      const day = new Date(t).toISOString().slice(0, 10)
+      const cur = perDay.get(day) || { calls: 0, errors: 0 }
+      cur.calls++
+      perDay.set(day, cur)
+    } else if (ev.type === 'tool/result') {
+      const msg = d.message || {}
+      if (!msg.isError) continue
+      const tool = localCalls.get(msg.toolCallId) || '<unknown>'
+      const text = (msg.content && msg.content[0] && msg.content[0].text) || String(msg.error || '')
+      // 护栏拦截是「预期结果」，不是缺陷：单列，不拉高错误率
+      if (DENIED.test(text)) { denials++; continue }
+      const kind = classify(text)
+      totalErrors++
+      kindCount.set(kind, (kindCount.get(kind) || 0) + 1)
+      toolErr.set(tool, (toolErr.get(tool) || 0) + 1)
+      const sig = signature(text)
+      sigCount.set(sig, (sigCount.get(sig) || 0) + 1)
+      const day = new Date(t).toISOString().slice(0, 10)
+      const cur = perDay.get(day) || { calls: 0, errors: 0 }
+      cur.errors++
+      perDay.set(day, cur)
+    } else if (ev.type === 'agent/inbox/spliced') {
+      if (Array.isArray(d.inserted) && d.inserted.length && d.target === 'next-step') steers++
+    } else if (ev.type === 'turn/end') {
+      const kind = (d.reason && d.reason.kind) || 'completed'
+      if (kind !== 'completed') abortedTurns++
+    }
+  }
+}
+
+const rate = totalCalls ? totalErrors / totalCalls : 0
+const pct = (x) => (100 * x).toFixed(2) + '%'
+const sorted = (m) => [...m.entries()].sort((a, b) => b[1] - a[1])
+
+const report = {
+  generatedAt: new Date().toISOString(),
+  window: WINDOW,
+  since: SINCE_AT ? new Date(SINCE).toISOString() : null,
+  windowDays: DAYS,
+  sessions: fileCount,
+  totalCalls,
+  totalErrors,
+  errorRate: +rate.toFixed(4),
+  steers,
+  abortedTurns,
+  guardDenials: denials,
+  byKind: sorted(kindCount).map(([k, v]) => ({ kind: k, count: v, share: +(v / (totalErrors || 1)).toFixed(4) })),
+  byTool: sorted(toolErr).slice(0, TOP).map(([tool, errs]) => ({ tool, errs, calls: toolCalls.get(tool) || 0, rate: +((toolCalls.get(tool) || 1) ? errs / (toolCalls.get(tool) || 1) : 0).toFixed(4) })),
+  perDay: [...perDay.entries()].sort().map(([day, v]) => ({ day, calls: v.calls, errors: v.errors, rate: +(v.errors / (v.calls || 1)).toFixed(4) })),
+  topSignatures: sorted(sigCount).slice(0, TOP).map(([sig, count]) => ({ count, sig })),
+}
+
+if (JSON_OUT) {
+  console.log(JSON.stringify(report, null, 2))
+} else {
+  console.log('工具错误率仪表  ' + report.window + ' · ' + report.sessions + ' 个会话')
+  console.log('--------------------------------------------------')
+  console.log('调用 ' + totalCalls + ' · 报错 ' + totalErrors + ' · 错误率 ' + pct(rate))
+  console.log('中途 steer ' + steers + ' · 未完成回合 ' + abortedTurns + ' · 护栏拦截（不计入错误率）' + denials)
+  console.log('')
+  console.log('[分类型]')
+  for (const k of report.byKind) console.log('  ' + (100 * k.share).toFixed(1).padStart(5) + '%  ' + String(k.count).padStart(4) + '  ' + k.kind)
+  console.log('')
+  console.log('[分工具 · 错误数]')
+  for (const t of report.byTool) console.log('  ' + String(t.errs).padStart(4) + '/' + String(t.calls).padStart(5) + '  ' + (100 * t.rate).toFixed(1).padStart(5) + '%  ' + t.tool)
+  console.log('')
+  console.log('[分天]')
+  for (const d of report.perDay) console.log('  ' + d.day + '  ' + d.errors + '/' + d.calls + '  ' + pct(d.rate))
+  console.log('')
+  console.log('[错误签名 Top]')
+  for (const s of report.topSignatures) console.log('  ' + String(s.count).padStart(3) + '  ' + s.sig)
+}
+
+try {
+  mkdirSync(METRICS_DIR, { recursive: true })
+  writeFileSync(path.join(METRICS_DIR, 'tool-error-rate-baseline.json'), JSON.stringify(report, null, 2))
+  appendFileSync(path.join(METRICS_DIR, 'tool-error-rate-history.jsonl'), JSON.stringify({ at: report.generatedAt, days: DAYS, calls: totalCalls, errors: totalErrors, rate: report.errorRate }) + '\n')
+} catch (e) {
+  console.error('基线落盘失败：' + e.message)
+}
+
+if (FAIL_OVER !== null && rate > Number(FAIL_OVER)) {
+  console.error('\n✗ 错误率 ' + pct(rate) + ' 超过阈值 ' + FAIL_OVER)
+  process.exit(1)
+}
