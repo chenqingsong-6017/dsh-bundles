@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-skill-forge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "engines": {
     "node": ">=22.19.0"
@@ -8,11 +8,15 @@
   "type": "module",
   "description": "Forge reusable SKILL.md knowledge out of finished work and register it in the native DSH skill catalog (Hermes-style /learn + curator, without letting the plugin call a model).",
   "exports": {
-    ".": "./index.js"
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
     "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
     "README.md"
   ],
   "dsh": {
