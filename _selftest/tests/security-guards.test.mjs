@@ -72,6 +72,8 @@ const CASES = [
   ['self', 'pwsh', { command: 'Copy-Item C:/tmp/x.json C:/Users/x/.dsh/hooks.json' }, 2, 'pwsh 改护栏配置'],
   ['self', 'pwsh', { command: 'Get-Content D:/AI/dsh-bundles/dsh-hooks/examples/guard-danger.mjs' }, 0, '读护栏'],
   ['self', 'pwsh', { command: 'node --check D:/AI/dsh-bundles/dsh-hooks/examples/guard-self.mjs' }, 0, '检查护栏语法'],
+  ['self', 'pwsh', { command: 'git add dsh-hooks/examples/guard-self.mjs 2>&1 | Out-String' }, 0, 'git add + 2>&1 不写护栏（误报回归）'],
+  ['self', 'pwsh', { command: 'echo hacked > D:/AI/dsh-bundles/dsh-hooks/examples/guard-self.mjs' }, 2, '重定向写护栏必须拦'],
   ['gui', 'cua_driver_native__launch_app', { path: 'C:/Windows/System32/cmd.exe' }, 2, 'GUI 起系统二进制'],
   ['gui', 'cua_driver_native__launch_app', { path: 'D:/tmp/x.hta' }, 2, 'GUI 起脚本'],
   ['gui', 'cua_driver_native__launch_app', { name: 'notepad' }, 0, 'GUI 起普通应用'],
