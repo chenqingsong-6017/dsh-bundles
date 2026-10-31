@@ -11,7 +11,9 @@
         # 注入预算：每轮系统提示里最多花多少字符。
         # v1.2：pinned 全文常驻；其余一律出「id + tag + 日期 + 摘要」索引行，
         # 装不下的条目在块尾「⚠ 另有 N 条未注入」里逐条点名（不再静默丢弃）。
-        maxInjectChars: 1500
+        # v3.22（2026-10-31）：1500 → 2500。51 条记忆 8454 字，1500 只够 6 条全文 + 8 条索引，
+        # 其余 33 条只剩 id 可见；提到 2500 后约能全文展开 15 条。代价约每轮 +500 tokens。
+        maxInjectChars: 2500
         # v2.2：scope 加分（cwd 命中条目在召回时加权 ×1.4；对不上不加分、不过滤）
         # 映射表可覆盖，默认 plugin-dev→D:\AI\dsh-bundles / data-infra→D:\AI\dsh-data / dsh-date→D:\AI-date\dsh-date
         # scopeRoots:
