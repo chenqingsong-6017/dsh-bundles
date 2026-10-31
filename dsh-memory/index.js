@@ -1586,9 +1586,17 @@ export function apply(ctx, config) {
    * 三条同时成立才收：来源=规则文件 / kind=rule / 与现有记忆相似度 < 0.7。
    * 预算不够时先归档「最低价值」条目（status=deprecated + archivedAt，可逆，不物理删）。
    */
-  function lowestValueCandidate() {
+  // v3.25：加 minAgeDays —— 普通写入腾地方时只归档「至少 N 天没动过」的条目，
+  // 避免刚写进来的记忆立刻被后续写入挤掉。规则入库通道保持 minAgeDays=0（原行为）。
+  function lowestValueCandidate(minAgeDays = 0) {
+    const cutoff = minAgeDays > 0 ? Date.now() - minAgeDays * 86400000 : 0
     const pool = activeEntries().filter(
-      (entry) => entry.pinned !== true && (entry.usedCount ?? 0) === 0 && entry.kind !== 'rule' && entry.status !== 'draft',
+      (entry) =>
+        entry.pinned !== true &&
+        (entry.usedCount ?? 0) === 0 &&
+        entry.kind !== 'rule' &&
+        entry.status !== 'draft' &&
+        (cutoff === 0 || Date.parse(String(entry.updatedAt ?? entry.addedAt ?? '')) < cutoff),
     )
     if (pool.length === 0) return null
     return pool
@@ -1596,16 +1604,18 @@ export function apply(ctx, config) {
       .sort((a, b) => a.imp - b.imp)[0].entry
   }
 
-  function makeRoom(size) {
+  function makeRoom(size, opts) {
+    const reason = typeof opts?.reason === 'string' ? opts.reason : 'auto-archive: 为规则自动入库腾预算'
+    const minAgeDays = Number.isFinite(opts?.minAgeDays) ? opts.minAgeDays : 0
     const archived = []
     let guard = 0
     while (usedChars() + size > maxBytes && guard < 20) {
       guard += 1
-      const victim = lowestValueCandidate()
+      const victim = lowestValueCandidate(minAgeDays)
       if (victim === null) return { ok: false, archived }
       victim.status = 'deprecated'
       victim.archivedAt = new Date().toISOString()
-      victim.archiveReason = 'auto-archive: 为规则自动入库腾预算'
+      victim.archiveReason = reason
       archived.push(victim.id)
     }
     return { ok: usedChars() + size <= maxBytes, archived }
@@ -2221,7 +2231,15 @@ export function apply(ctx, config) {
         (entry) => typeof entry.supersededBy === 'string' && entry.supersededBy !== '',
       ).length,
       archived: state.entries.length - entries.length,
-      health: storeHealth,
+      // v3.25（考虑以后）：容量预警——撞墙前先让人看见，而不是等 memory_add 报错。
+      health:
+        storeHealth !== 'ok'
+          ? storeHealth
+          : usedChars() / maxBytes >= 0.95
+            ? 'full'
+            : usedChars() / maxBytes >= 0.85
+              ? 'near-full'
+              : 'ok',
       ...(corruptCopy !== '' ? { healthNote: corruptCopy } : {}),
       usedChars: usedChars(),
       maxBytes,
@@ -2292,7 +2310,13 @@ export function apply(ctx, config) {
   const renderList = (_args, value) => {
     const entries = Array.isArray(value?.entries) ? value.entries : []
     const healthWarn =
-      value?.health === 'corrupt' ? `\n⚠ 记忆库损坏保护中（原文件已另存：${value?.healthNote ?? '未知'}），写入已禁用，修好后重载插件。` : ''
+      value?.health === 'corrupt'
+        ? `\n⚠ 记忆库损坏保护中（原文件已另存：${value?.healthNote ?? '未知'}），写入已禁用，修好后重载插件。`
+        : value?.health === 'full'
+          ? '\n⚠ 存储 ≥95%：下次写入会先归档「30 天没动过、从未被检索命中」的条目腾地方（可 memory_restore 恢复）。建议先 memory_audit 看重复项。'
+          : value?.health === 'near-full'
+            ? '\n（存储已达 85%：写入会先归档低价值条目腾地方，归档可 memory_restore 恢复。）'
+            : ''
     const archivedCount = value?.archived ?? 0
     const hiddenHint =
       archivedCount > 0 && value?.includeArchived !== true
@@ -2641,10 +2665,23 @@ export function apply(ctx, config) {
           }
           return { entry: publicEntry(duplicate), deduped: true, usedChars: usedChars(), maxBytes }
         }
+        // v3.25（考虑以后）：存储撞墙时先尝试归档，而不是直接拒绝写入。
+        // 只归档「≥30 天没更新、从未被检索命中、非 pinned / 非规则」的条目 —— 可逆（memory_restore 能恢复，history 有记录）。
+        // 归档不出足够空间才报错，并在错误里点名候选，让人看见而不是静默丢。
         if (usedChars() + raw.length > maxBytes) {
-          throw new Error(
-            `记忆已占用 ${usedChars()} / ${maxBytes} 字符，再加会超预算。先用 memory_list 看看，用 memory_remove 删掉过时的，或 memory_update 精简。`,
-          )
+          const room = makeRoom(raw.length, { reason: 'auto-archive: 为新记忆腾预算', minAgeDays: 30 })
+          if (!room.ok) {
+            const candidates = activeEntries()
+              .filter((entry) => entry.pinned !== true && (entry.usedCount ?? 0) === 0 && entry.kind !== 'rule' && entry.status !== 'draft')
+              .map((entry) => entry.id)
+              .slice(0, 10)
+            throw new Error(
+              `记忆已占用 ${usedChars()} / ${maxBytes} 字符，归档腾地方后仍不够（需 ${raw.length} 字符）。` +
+                (candidates.length > 0
+                  ? `可归档候选（从未用过、非规则）：${candidates.join(' ')}。用 memory_remove 精确删，或 memory_update 精简长条目。`
+                  : '已没有「从未使用过」的可归档条目了，只能 memory_remove 或 memory_update 精简。')
+            )
+          }
         }
         const now = new Date().toISOString()
         const derivedStale =

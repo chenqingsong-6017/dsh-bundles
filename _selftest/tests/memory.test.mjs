@@ -192,7 +192,7 @@ assert.equal(normalized.usedCount, 3)
 ok('normalizeEntry 保留 v2 字段')
 
 const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-test-'))
-const host = (dir) => {
+const host = (dir, extra) => {
   const defs = new Map()
   const layers = []
   const handlers = new Map()
@@ -203,7 +203,7 @@ const host = (dir) => {
     get: () => undefined,
     systemPrompt: { context: (layer) => { layers.push(layer); return () => {} } },
   }
-  apply(ctx, { storeDir: dir, maxInjectChars: 1500 })
+  apply(ctx, { storeDir: dir, maxInjectChars: 1500, ...(extra ?? {}) })
   return { defs, layers, handlers }
 }
 const first = host(tmpDir)
@@ -1681,6 +1681,33 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(typeof stTight.droppedFullChars, 'number', '出局条目全量字符数要报出来')
   assert.ok(stTight.indexedChars > 0 || stTight.droppedFullChars > 0, '预算紧张时要走索引或出局')
   ok('v3.24 注入收益度量：stats 带全文/索引/出局三类字符数')
+}
+
+// v3.25（考虑以后）：存储撞墙时先归档「30 天没动过、从未被检索命中」的条目，而不是直接拒绝写入
+{
+  const d4 = mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-cap-'))
+  const old = new Date(Date.now() - 60 * 86400000).toISOString()
+  const big = 'Z'.repeat(120)
+  writeFileSync(
+    path.join(d4, 'memory.json'),
+    JSON.stringify({
+      entries: [
+        { id: 'm1', text: big, kind: 'fact', usedCount: 0, addedAt: old, updatedAt: old },
+        { id: 'm2', text: big, kind: 'fact', usedCount: 0, addedAt: old, updatedAt: old },
+      ],
+    }),
+    'utf8',
+  )
+  const h4 = host(d4, { maxBytes: 280 })
+  const r = await h4.defs.get('memory_add').execute({ text: '新记忆'.repeat(20), kind: 'note' })
+  assert.ok(r.entry, '撞墙时归档旧条目后应写入成功')
+  const after = await h4.defs.get('memory_list').execute({ includeArchived: true })
+  assert.ok(after.archived >= 1, '应至少归档一条 30 天前的低价值条目')
+  // 新条目不能被自己刚触发的归档挤掉
+  const mine = after.entries.find((e) => e.id === r.entry.id)
+  assert.ok(mine && !mine.status, '刚写入的条目必须仍在生效区')
+  rmSync(d4, { recursive: true, force: true })
+  ok('v3.25 撞墙归档：只动 30 天前的低价值条目，写入成功且新条目不被挤掉')
 }
 
 console.log(`memory: ${passed} 项通过`)
