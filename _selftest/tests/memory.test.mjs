@@ -1500,6 +1500,38 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   rmSync(storeTmp, { recursive: true, force: true })
 }
 
+// ---- v3.26 captureRuleFiles：单独关掉「规则文件沉淀」，默认行为不变 ----
+{
+  const runCapture = async (extraConfig) => {
+    const workTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-rule-'))
+    const storeTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-rule-store-'))
+    writeFileSync(path.join(workTmp, 'AGENTS.md'), '- 部署前必须跑 npm run check 并确认输出\n', 'utf8')
+    const defs = new Map()
+    const layers = []
+    const handlers = new Map()
+    const ctx = {
+      tools: { register: (d) => { defs.set(d.name, d); return () => {} } },
+      effect: (fn) => fn(),
+      on: (name, h) => { handlers.set(name, h); return () => {} },
+      get: (name) => (name === 'workingDirectory' ? { get: () => workTmp } : undefined),
+      systemPrompt: { context: (layer) => { layers.push(layer); return () => {} } },
+    }
+    apply(ctx, { storeDir: storeTmp, maxInjectChars: 1500, ...extraConfig })
+    layers[0].text({ agent: { session: { id: 's-rule' } } })
+    const ts = handlers.get('agent/turn-stopping')
+    await ts({ agent: { id: 's-rule', session: { deriveMessages: () => [{ role: 'user', content: [{ type: 'text', text: '今天天气不错' }] }] } } })
+    const listed = await defs.get('memory_list').execute({})
+    rmSync(workTmp, { recursive: true, force: true })
+    rmSync(storeTmp, { recursive: true, force: true })
+    return listed.entries.filter((entry) => entry.text.includes('部署前必须跑'))
+  }
+  const off = await runCapture({ captureRuleFiles: false })
+  assert.equal(off.length, 0, 'captureRuleFiles:false 时规则文件不再自动入库')
+  const on = await runCapture({})
+  assert.equal(on.length, 1, '默认（不配）仍保留规则文件沉淀，向后兼容')
+  ok('v3.26 captureRuleFiles：可单独关闭规则文件沉淀，默认行为不变')
+}
+
 // ---- v3.20 归档分文件冷存（archive.json）：主库只留生效、列表默认不吐归档、归档可恢复 ----
 {
   const sepDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-archive-'))

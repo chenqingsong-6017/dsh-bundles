@@ -20,6 +20,11 @@
         #   plugin-dev: ['D:\AI\dsh-bundles']
         # v2.2：自动沉淀候选（影子模式，只写 candidates.json，不直接入库；false 可关）
         captureCandidates: true
+        # v3.26：规则文件沉淀（从 AGENTS.md / .dsh/rules 自动抽硬规则进库）单独开关。
+        # 本机规则已由 AGENTS.md 与 .dsh/rules 每轮注入，再沉淀只会重复占存储预算
+        # （2026-10-31 实测：清掉的规则在重启后被重新自动入库）→ 本 profile 关掉。
+        # 保留 captureCandidates，用户消息里的偏好仍会自动进候选池。
+        captureRuleFiles: false
         # v2.3：相关性覆盖率下限（top 分数 ÷ 查询 idf 总和，0-1，语料规模无关）；低于它宁可不注入相关全文
         # 默认 0.15（用 36 题微基准校准：正例最低 0.186、负例最高 0.128）；想更保守可调 0.18-0.2
         # relevanceFloor: 0.15

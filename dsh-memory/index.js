@@ -1514,6 +1514,9 @@ export function apply(ctx, config) {
       ? config.scopeRoots
       : DEFAULT_SCOPE_ROOTS
   const captureCandidates = config?.captureCandidates !== false
+  // v3.26：规则文件沉淀（从 AGENTS.md / .dsh/rules 抽硬规则自动入库）可单独关闭。
+  // 工作区规则已由规则文件每轮注入时，再沉淀只会重复占预算 → 本 profile 关掉。
+  const captureRuleFiles = config?.captureRuleFiles !== false
   // v3.10（A11）：relevanceFloor <= 0 等于把相关性门槛关掉（会把无关记忆当相关注入），忽略这种配置。
   const relevanceFloor = Number.isFinite(config?.relevanceFloor) && config.relevanceFloor > 0 ? config.relevanceFloor : undefined
   const candidateFile = path.join(storeDir, 'candidates.json')
@@ -3589,6 +3592,7 @@ export function apply(ctx, config) {
         // v3.17：规则文件沉淀（补「写入覆盖」缺口 —— 今天两个实测失败都是「库里根本没记」）。
         // 只对还没进候选池、也不在记忆库里的硬规则行下手；每回合最多 MAX_CANDIDATES_PER_TURN 条。
         // 没有工作区上下文（测试 / 无 cwd 会话）时不扫规则文件 —— 否则会把全局 AGENTS.md 也灌进候选池。
+        if (!captureRuleFiles) return
         try {
           if (lastKnownCwd === '') throw new Error('no-cwd')
           const taken = new Set()

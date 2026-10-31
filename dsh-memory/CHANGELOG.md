@@ -3,6 +3,25 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v3.26.0 — 2026-10-31
+
+### Added
+- `captureRuleFiles` 配置开关（默认 `true`，向后兼容）：单独控制「规则文件沉淀」（从 `AGENTS.md` / `.dsh/rules` 抽硬规则自动入库），与 `captureCandidates`（用户消息沉淀）解耦。
+- 本机 desktop profile 设为 `false`：规则已由 AGENTS/rules 每轮注入，重复入库只占存储预算（实测：清掉的规则在重启后被自动写回）。
+
+### Changed
+- `package.json` 版本从 3.21.0 补到 3.26.0（3.22–3.25 的功能此前只进了代码与提交信息，manifest/CHANGELOG 未同步，见下面补记）。
+
+### Verification
+- 单测新增 `captureRuleFiles` 集成断言：关掉时规则文件不入库，默认时仍入库；验证门通过。
+
+### 补记 v3.23–v3.25（2026-10-31，按提交信息回填）
+
+- **v3.23** `inject:false`：只参与检索、不占每轮注入预算；前置只留硬规则。
+- **v3.24** 参数交叉校验（如 `maxInjectChars` > `maxBytes` 时告警）+ 注入收益度量（学 Google ADK 的成对校验与 `_prompt_chars_saved`）。
+- **v3.25** 容量策略：撞墙先归档（≥30 天且未命中，可逆）+ `health` 分级预警（85% / 95%）。
+- 修复：`memory_add` 漏接 `inject:false`（schema 声明了但 execute 没映射）。
+
 ## v3.21.0 — 2026-10-30
 
 ### Added
