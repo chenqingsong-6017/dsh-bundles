@@ -66,9 +66,9 @@ function pad(n) {
   return String(n).padStart(2, '0')
 }
 
-/** 目录名用的时间戳：20261027-223501 */
+/** 目录名用的时间戳：20261027-223501234（毫秒级；同一秒内的备份名字序必须仍然等于创建序） */
 function stamp(date = new Date()) {
-  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}${String(date.getMilliseconds()).padStart(3, '0')}`
 }
 
 function shortSha(sha) {
@@ -562,6 +562,25 @@ export function apply(ctx, config) {
     return { restored: restored.length, removed }
   }
 
+  /** 备份目录的创建时间（毫秒）。名字可能同秒或被人工重命名，排序只能看文件系统时间。 */
+  function backupCreatedMs(root, name) {
+    try {
+      const st = statSync(path.join(root, name))
+      return Number.isFinite(st.birthtimeMs) && st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs
+    } catch {
+      return 0
+    }
+  }
+
+  /** 按创建时间升序排序（同时间用名字兜底，保证确定性）。 */
+  function sortByCreatedAt(root, names) {
+    return names.sort((a, b) => {
+      const diff = backupCreatedMs(root, a) - backupCreatedMs(root, b)
+      if (diff !== 0) return diff
+      return a < b ? -1 : a > b ? 1 : 0
+    })
+  }
+
   function pruneBackups(sourceName) {
     const root = path.join(backupsDir, sourceName)
     if (!existsSync(root)) return 0
@@ -572,7 +591,7 @@ export function apply(ctx, config) {
         entries = readdirSync(root, { withFileTypes: true })
           .filter((entry) => entry.isDirectory() && prefixFilter(entry.name))
           .map((entry) => entry.name)
-          .sort()
+        entries = sortByCreatedAt(root, entries)
       } catch {
         return
       }
@@ -596,10 +615,10 @@ export function apply(ctx, config) {
     const root = path.join(backupsDir, sourceName)
     if (!existsSync(root)) return []
     try {
-      return readdirSync(root, { withFileTypes: true })
+      const names = readdirSync(root, { withFileTypes: true })
         .filter((entry) => entry.isDirectory() && !entry.name.startsWith('safety-'))
         .map((entry) => entry.name)
-        .sort()
+      return sortByCreatedAt(root, names)
     } catch {
       return []
     }

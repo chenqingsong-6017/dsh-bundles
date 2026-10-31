@@ -14,7 +14,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawn as nodeSpawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -279,6 +279,21 @@ ok('prune=true 时清掉本地独有文件', `删除 ${result.files.removed} 个
 
 section('回滚')
 
+// 回归（2026-10-31 实测抓到）：两次备份若落在同一秒，旧实现按目录名字排序，
+// 而名字里的 shortSha / 'baseline' 后缀可能让“名字序”与“创建序”相反 →
+// 回滚会还原更旧的一份（真机现场：本该回 1.0.0，实际回了 0.9.0）。
+// 这里把两份备份改名成名字序与创建序相反，回滚必须仍按创建时间选最新。
+const backupRoot = path.join(store, 'backups', 'demo')
+const backupNames = readdirSync(backupRoot).filter((name) => !name.startsWith('safety-'))
+const versionOf = (name) => JSON.parse(readFileSync(path.join(backupRoot, name, 'tree', 'package.json'), 'utf8')).version
+const olderName = backupNames.find((name) => versionOf(name) === '0.9.0')
+const newerName = backupNames.find((name) => versionOf(name) === '1.0.0')
+assert.ok(olderName && newerName, `备份应含 0.9.0 与 1.0.0 各一份：${backupNames.join(', ')}`)
+renameSync(path.join(backupRoot, olderName), path.join(backupRoot, '99999999-000000000-zzz'))
+await new Promise((resolve) => setTimeout(resolve, 60))
+renameSync(path.join(backupRoot, newerName), path.join(backupRoot, '00000000-000000000-aaa'))
+ok('把两份备份改成「名字序与创建序相反」', '用于验证回滚选最新')
+
 result = await tool('updater_rollback').execute({ name: 'demo', confirm: true })
 assert.equal(result.status, 'restored', JSON.stringify(result).slice(0, 400))
 assert.ok(result.safetyBackup && existsSync(result.safetyBackup), '回滚前应有安全备份')
@@ -287,6 +302,7 @@ ok('回滚成功', `还原 ${result.files} 个文件`)
 const rolledManifest = JSON.parse(readFileSync(path.join(localPlugin, 'package.json'), 'utf8'))
 assert.equal(rolledManifest.version, '1.0.0')
 ok('回滚后版本回到 1.0.0')
+ok('回滚按创建时间选最新备份（名字序反转也不受影响）')
 
 // ------------------------------------------------------------ 校验门
 
