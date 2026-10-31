@@ -1,3 +1,27 @@
+
+## v4.0.0 — 2026-11-01
+
+标题：「考虑以后」——把结构改在**不可逆**的地方，不碰昂贵的结构。依据 2026-11-01 源码级调研（mem0 v3 删掉约 4000 行图存储、Letta 退回 Markdown、LangMem 图模块 159/182 行是注释、arXiv 2608.28978 图记忆 F1 0.417<扁平 0.468）。
+
+### Added
+- `invalidAt`：事实失效时刻（YYYY-MM-DD / ISO）。到点后**不注入、不检索，但留档不删**，与 Graphiti 双时间戳里真正有用的那一半对齐。
+- `entities[]`：纯字符串实体标签（去重、最多 12 条、每条 40 字），进 BM25 词表。**不建实体表、不抽 LLM、不建边**——它是将来真要做关系层时唯一现成的锚点（mem0 v3 同款思路）。
+- `sources[]` 结构化归一：`file:line` / `session:<id>` / URL 三种形态，去重截断；卡片导出同步输出。
+- `memory_audit.growth` 触发线指标：条目数、平均字数、注入占比、实体/来源覆盖、失效数、**stage**（flat / hybrid-search / tiered-inject / entity-layer）与 `nextTrigger` 文案；同时输出 `schemaVersion`。
+- `migrateState()` + `SCHEMA_VERSION = 2`：加载即迁移、只升不降、内容一律不动，迁移结果随下一次 persist 落盘（读的时候不改文件）。
+- `memory_export` 回读校验：导出后回读前 5 张卡确认 `id` 可解析，返回 `verified` —— 导出物是脱离 DSH 也能读的资产，必须可验证。
+- `memory_add` **写入冲突硬门**：同 scope + 相似度 ≥ 0.88 + 双方生效时直接拒绝，逼出三条明确出路 `supersede` / `allowDuplicate` / `status: draft`。依据：mem0/Letta/Graphiti 唯一有共识的一条是「冲突必须显式处理」。
+
+### Changed
+- `scope` 收敛：只允许 `global` 或小写 slug（`normalizeScope`），路径/中文/大写一律报错——历史上 8 种取值混用、10 条没有 scope，趁 60 条先立格式。
+- 显式 `supersede` 不再被「文本完全一致」的去重捷径吞掉：意图是推翻旧条就必须真走推翻路径（旧条回写 `supersededBy` + `invalidAt` + `deprecated`）。
+- 卡片导出补全 `entities` / `sources` / `invalidAt` / `workspaces` 四段 frontmatter；YAML 值统一加引号（路径含反斜杠、URL 含冒号，裸写会被解析坏）。
+- `memory_search` 与注入渲染口径统一：失效条目不参与，`total` 也只算可检索条目。
+
+### Verification
+- 单测：**131 项通过**（新增 v4.0 五组：纯函数 / 冲突四条路径 / invalidAt 不注入不检索 / audit 触发线 / 导出回读）。
+- `node --check index.js` 通过；`npm run check` 三道门见验证记录。
+- **生效需重启 DSH**（插件 index.js 只在启动时求值）。
 # CHANGELOG
 
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。

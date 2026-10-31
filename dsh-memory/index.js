@@ -80,7 +80,23 @@ export function isStaleEntry(entry, today = localDateOf()) {
  * 避免两处判断漂移（历史教训：只判 supersededBy 时 deprecated 条目仍算生效，预算虚高）。
  */
 export function isArchivedEntry(entry) {
-  return (typeof entry?.supersededBy === 'string' && entry.supersededBy !== '') || entry?.status === 'deprecated'
+  return (
+    (typeof entry?.supersededBy === 'string' && entry.supersededBy !== '') ||
+    entry?.status === 'deprecated' ||
+    isInvalidEntry(entry)
+  )
+}
+
+/**
+ * v4.0：一条记忆是否「已失效」——invalidAt 到了。
+ * 对齐 Graphiti 双时间戳里真正有用的那一半（valid_from/invalid_to），但不引入任何实体/边：
+ * 一条事实「从某天起不再成立」照样能表达，旧条目留档不删（可反查历史）。
+ */
+export function isInvalidEntry(entry, now = Date.now()) {
+  const raw = typeof entry?.invalidAt === 'string' ? entry.invalidAt.trim() : ''
+  if (raw === '') return false
+  const stamp = DATE_ONLY.test(raw) ? Date.parse(raw + 'T00:00:00Z') : Date.parse(raw)
+  return Number.isFinite(stamp) && stamp <= now
 }
 const COMPOSITE_IMPORTANCE_WEIGHT = 0.5
 const COMPOSITE_RECENCY_WEIGHT = 0.3
@@ -91,6 +107,21 @@ const CANDIDATE_LIMIT = 50
 const COMPACT_PEEK_CHARS = 14
 const SIMILAR_HINT_FLOOR = 0.62
 const MAX_SIMILAR_HINT = 2
+// v4.0（考虑以后）：写入冲突硬门。相似度 ≥ 此值 + 同 scope + 双方都生效 → 拒绝写入，
+// 逼调用方三选一：supersede（推翻旧条）/ allowDuplicate（明确要并存）/ status=draft（先存疑）。
+// 依据 2026-11-01 调研：mem0/Letta/Graphiti 唯一有共识的是「变更留痕 + 冲突要显式处理」，不是加图。
+const CONFLICT_FLOOR = 0.88
+// v4.0：实体标签（纯字符串，无实体表、无边、不抽 LLM）。mem0 v3 同款——
+// 当下最便宜，且是将来真要做关系层时唯一现成的锚点。现在不打，几千条之后没法回头补。
+const MAX_ENTITIES = 12
+const MAX_ENTITY_CHARS = 40
+// v4.0：来源条目上限（sources 是「可反查原文」的最小载体：文件:行号 / 会话 id / URL）。
+const MAX_SOURCES = 8
+// v4.0：持久化 schema 版本。迁移只写脚本、不手改数据；老条目自动补默认值，永不重写历史。
+const SCHEMA_VERSION = 2
+// v4.0：scope 收敛为「global 或小驼峰 slug」。历史上 8 种取值混用、10 条没有 scope；
+// 工作区还在加，再长下去治理不动，所以趁 60 条时先立格式。
+const SCOPE_SLUG = /^[a-z][a-z0-9-]{0,31}$/
 const DEFAULT_SCOPE_ROOTS = {
   'plugin-dev': ['D:\\AI\\dsh-bundles'],
   'data-infra': ['D:\\AI\\dsh-data'],
@@ -396,7 +427,17 @@ function storeLocation(overrideDir) {
 
 // v3.20：补 archivedAt / archiveReason —— v3.19 的自动归档会写它们，但 normalizeEntry 不认识，
 // 结果「load→persist」一轮就把归档时间和原因洗掉（归档历史只剩 status=deprecated 一个标记）。
-const OPTIONAL_STRING_FIELDS = ['tag', 'scope', 'kind', 'migratedFrom', 'validFrom', 'supersededBy', 'archivedAt', 'archiveReason']
+const OPTIONAL_STRING_FIELDS = [
+  'tag',
+  'scope',
+  'kind',
+  'migratedFrom',
+  'validFrom',
+  'invalidAt',
+  'supersededBy',
+  'archivedAt',
+  'archiveReason',
+]
 const OPTIONAL_NUMBER_FIELDS = ['usedCount']
 
 // v2.6 信任字段（学 OKF v0.2 / simple-agent-memory）：把「确认的事实」「未证实的猜测」「过期待重验」分开。
@@ -424,6 +465,67 @@ export function cleanAliases(input) {
     if (aliases.length >= MAX_ALIASES) break
   }
   return aliases
+}
+
+/**
+ * v4.0（考虑以后）：store schema 迁移。只升不降，老条目形状由 normalizeEntry 补齐，**内容一律不动**。
+ * 迁移只写脚本、不手改数据——这是「数据能活过插件重写」的最低保证。
+ */
+export function migrateState(input, target = SCHEMA_VERSION) {
+  const from = Number.isInteger(input?.version) && input.version > 0 ? input.version : 1
+  if (from >= target) return { state: input, from, to: from, changed: false }
+  const entries = Array.isArray(input?.entries) ? input.entries.map((entry) => normalizeEntry(entry)) : []
+  return { state: { ...input, version: target, entries }, from, to: target, changed: true }
+}
+
+/** v4.0：实体标签清洗——去重、截断、限条数。纯字符串，不建实体表。 */
+export function cleanEntities(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  const seen = new Set()
+  for (const raw of value) {
+    if (typeof raw !== 'string') continue
+    const label = raw.trim().slice(0, MAX_ENTITY_CHARS)
+    if (label === '') continue
+    const key = label.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push(label)
+    if (out.length >= MAX_ENTITIES) break
+  }
+  return out
+}
+
+/**
+ * v4.0：来源清洗。约定三种形态（不强制 schema，但渲染与导出按此排序）：
+ *   file:line（如 index.js:429）· session:<id> · https://…（URL）
+ * 认不出的原样保留——宁可不规范，也不丢证据。
+ */
+export function cleanSources(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  const seen = new Set()
+  for (const raw of value) {
+    if (typeof raw !== 'string') continue
+    const item = raw.trim()
+    if (item === '' || seen.has(item)) continue
+    seen.add(item)
+    out.push(item.slice(0, 400))
+    if (out.length >= MAX_SOURCES) break
+  }
+  return out
+}
+
+/** v4.0：scope 规范化——只允许 global 或小写 slug；非法值直接报错（早失败好过脏数据扩散）。 */
+export function normalizeScope(value) {
+  if (typeof value !== 'string') return ''
+  const scope = value.trim().toLowerCase()
+  if (scope === '') return ''
+  if (scope === 'global') return 'global'
+  if (!SCOPE_SLUG.test(scope)) {
+    throw new Error('scope 只能是 global 或小写 slug（a-z 开头，可含数字与连字符），收到：' + String(value))
+  }
+  return scope
 }
 
 export function normalizeEntry(input) {
@@ -461,8 +563,12 @@ export function normalizeEntry(input) {
   if (typeof input.verifiedAt === 'string' && input.verifiedAt !== '') out.verifiedAt = input.verifiedAt
   if (typeof input.staleAfter === 'string' && DATE_ONLY.test(input.staleAfter)) out.staleAfter = input.staleAfter
   if (Array.isArray(input.sources)) {
-    const sources = input.sources.filter((item) => typeof item === 'string' && item.trim() !== '')
+    const sources = cleanSources(input.sources)
     if (sources.length > 0) out.sources = sources
+  }
+  if (Array.isArray(input.entities)) {
+    const entities = cleanEntities(input.entities)
+    if (entities.length > 0) out.entities = entities
   }
   if (input.pinned === true) out.pinned = true
   // v3.23：inject:false = 只检索、不注入（事实/历史类条目用）。缺省等于 true。
@@ -537,6 +643,8 @@ export function renderMemory(allEntries, options) {
       // v3.23：inject:false 的条目只参与 memory_search，不占每轮注入预算。
       // 依据 Anthropic 官方 context engineering：前置只留硬规则，事实/历史类走 just-in-time 检索。
       entry?.inject !== false &&
+      // v4.0：invalidAt 已到的条目只留档，不进提示（与 memory_search 的口径一致）。
+      !isInvalidEntry(entry) &&
       applicableAt(entry, cwd),
   )
 
@@ -969,7 +1077,9 @@ const EXPANSION_WEIGHT = 0.2
 function bm25Doc(entry) {
   const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
   const aliasText = Array.isArray(entry.aliases) ? entry.aliases.join(' ') : ''
-  const terms = tokenize(`${entry.text} ${tagText} ${aliasText}`)
+  // v4.0：实体标签也进检索词表——它是最便宜的关系信号（不建表、不抽 LLM，但能让人名/项目名召回）。
+  const entityText = Array.isArray(entry.entities) ? entry.entities.join(' ') : ''
+  const terms = tokenize(`${entry.text} ${tagText} ${aliasText} ${entityText}`)
   let length = 0
   for (const count of terms.values()) length += count
   return { entry, terms, length, tagText: tagText.toLowerCase(), aliasTerms: new Set(tokenize(aliasText).keys()) }
@@ -1329,6 +1439,9 @@ export const memoryEntrySchema = {
     paths: { type: 'array', items: { type: 'string' } },
     workspaces: { type: 'array', items: { type: 'string' } },
     aliases: { type: 'array', items: { type: 'string' } },
+    // v4.0：实体标签（纯字符串）与失效时刻（对齐双时间戳里可用的那一半）。
+    entities: { type: 'array', items: { type: 'string' } },
+    invalidAt: { type: 'string' },
   },
   required: ['id', 'text', 'addedAt', 'updatedAt'],
   additionalProperties: false,
@@ -1340,6 +1453,11 @@ export const memoryEntrySchema = {
  * 而不是只有 agent 才读得到的 JSON。JSON 仍是权威存储（检索 / 预算 / 基准一律不动），
  * 这里只做单向镜像，不参与检索与注入。
  */
+/** v4.0：YAML 标量安全引号——路径含反斜杠、URL 含冒号，裸写会被解析坏。 */
+function yamlScalar(value) {
+  return '"' + String(value ?? '').replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+}
+
 export function cardMarkdown(entry, today = localDateOf()) {
   const lines = ['---']
   lines.push('id: ' + entry.id)
@@ -1360,6 +1478,21 @@ export function cardMarkdown(entry, today = localDateOf()) {
   if (typeof entry.addedAt === 'string' && entry.addedAt !== '') lines.push('created: ' + entry.addedAt.slice(0, 10))
   if (typeof entry.updatedAt === 'string' && entry.updatedAt !== '') lines.push('updated: ' + entry.updatedAt.slice(0, 10))
   if (Array.isArray(entry.aliases) && entry.aliases.length > 0) lines.push('aliases: [' + entry.aliases.join(', ') + ']')
+  // v4.0：把「以后」需要的字段一起导出去（sources/entities/invalidAt/workspaces）——
+  // 导出物是脱离 DSH 也能读的资产，字段不全等于将来迁移时丢信息。
+  if (typeof entry.invalidAt === 'string' && entry.invalidAt !== '') lines.push('invalidAt: ' + entry.invalidAt)
+  if (Array.isArray(entry.entities) && entry.entities.length > 0) {
+    lines.push('entities:')
+    for (const entity of entry.entities) lines.push('  - ' + yamlScalar(entity))
+  }
+  if (Array.isArray(entry.workspaces) && entry.workspaces.length > 0) {
+    lines.push('workspaces:')
+    for (const workspace of entry.workspaces) lines.push('  - ' + yamlScalar(workspace))
+  }
+  if (Array.isArray(entry.sources) && entry.sources.length > 0) {
+    lines.push('sources:')
+    for (const source of entry.sources) lines.push('  - ' + yamlScalar(source))
+  }
   lines.push('---', '', String(entry.text ?? ''), '')
   return lines.join('\n')
 }
@@ -1543,10 +1676,13 @@ export function apply(ctx, config) {
   const relevanceFloor = Number.isFinite(config?.relevanceFloor) && config.relevanceFloor > 0 ? config.relevanceFloor : undefined
   const candidateFile = path.join(storeDir, 'candidates.json')
 
-  let state = { version: 1, nextId: 1, entries: [] }
+  // v4.0：新库直接以当前 schema 版本开局；老库在 load() 里由 migrateState 升级。
+  let state = { version: SCHEMA_VERSION, nextId: 1, entries: [] }
   let candidates = { version: 1, nextId: 1, items: [] }
   // 数据安全：解析失败不覆盖，改名留证并进入只读保护态（P0-1）。
   let storeHealth = 'ok'
+  // v4.0：本次加载是否发生了 schema 迁移（from→to），给诊断用。
+  let schemaUpgraded = null
   let corruptCopy = ''
   // v3.9：加载时因字段不合法被丢弃的条目，原文件已另存到这里（只提示，不改数据）。
   let droppedCopyPath = ''
@@ -2051,6 +2187,13 @@ export function apply(ctx, config) {
         version: Number.isInteger(parsed?.version) && parsed.version > 0 ? parsed.version : 1,
         entries: kept,
       }
+      // v4.0：加载即迁移（只升不降）。迁移本身不落盘，跟着下一次 persist 一起写，
+      // 避免「读的时候顺手改文件」这种危险副作用。
+      const migrated = migrateState(state)
+      if (migrated.changed) {
+        state = migrated.state
+        schemaUpgraded = { from: migrated.from, to: migrated.to }
+      }
       // v3.10（B02）：记下这次的磁盘指纹，persist 据此判断「别的进程写过了没有」。
       lastSignature = storeSignature()
     } catch (error) {
@@ -2460,10 +2603,12 @@ export function apply(ctx, config) {
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 20) : 5
         // v2.7：query 里出现 m\d+ 就按 id 直取。注入块一直写着「用 memory_search 按 id 取全文」，
         // 但 BM25 不认 id——实测搜 m33 命中 0/63。文档与实现不一致，这里补上。
+        // v4.0：invalidAt 已到的条目不再参与检索（留档不删，memory_list includeArchived 仍可见）。
+        const searchable = state.entries.filter((entry) => !isInvalidEntry(entry))
         const idHits = [...new Set(query.match(/m\d+/g) ?? [])]
-          .map((id) => state.entries.find((entry) => entry.id === id))
+          .map((id) => searchable.find((entry) => entry.id === id))
           .filter((entry) => entry !== undefined)
-        const scored = scoreEntries(state.entries, query)
+        const scored = scoreEntries(searchable, query)
           .filter((item) => item.score > 0.0001 && !idHits.some((entry) => entry.id === item.entry.id))
           .sort(
             (a, b) =>
@@ -2477,7 +2622,7 @@ export function apply(ctx, config) {
         // v3.15：搜索侧补「证据充分性」信号（学 arXiv 2610.22668：相关 ≠ 充分证据）。
         // 之前只滤 score>0.0001，问「MySQL 索引优化」也会吐 8 条 —— 有结果不等于有答案。
         // 不砍结果（砍了会把「库里没有」误报成「有但不相关」），只给结论加一个可判读的信号。
-        const coverageReport = relevanceCoverage(state.entries, query)
+        const coverageReport = relevanceCoverage(searchable, query)
         const agreeWithRanking = coverageReport.topId != null && scored.length > 0 && scored[0].entry.id === coverageReport.topId
         const gate = gateDecision({
           coverage: coverageReport.coverage,
@@ -2490,7 +2635,7 @@ export function apply(ctx, config) {
         const coverage = Math.round(coverageReport.coverage * 1000) / 1000
         return {
           query,
-          total: state.entries.length,
+          total: searchable.length,
           matched: scored.length,
           confidence,
           coverage,
@@ -2554,7 +2699,29 @@ export function apply(ctx, config) {
           sources: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Evidence backing the fact: URLs or file paths. Never invent them.',
+            description:
+              'Evidence backing the fact. Prefer the structured forms: "file:line", "session:<id>", or a URL. Never invent them.',
+          },
+          entities: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'v4.0: entity labels this fact is about (people, projects, files, concepts), e.g. ["dsh-memory","Obsidian"]. Plain strings — no entity table, no automatic extraction. They are the cheap anchor for future relationship queries.',
+          },
+          invalidAt: {
+            type: 'string',
+            description:
+              'v4.0: YYYY-MM-DD (or ISO time) from which this fact stops being true. The entry is kept for history but no longer injected or returned by memory_search.',
+          },
+          supersede: {
+            type: 'boolean',
+            description:
+              'v4.0: when this write collides with a highly similar active entry (same scope), pass true to replace it — the old entry is marked invalid + superseded, never deleted.',
+          },
+          allowDuplicate: {
+            type: 'boolean',
+            description:
+              'v4.0: bypass the conflict gate when two similar entries are genuinely both wanted (e.g. they belong to different contexts).',
           },
           workspaces: {
             type: 'array',
@@ -2635,12 +2802,22 @@ export function apply(ctx, config) {
         if (args?.staleAfter !== undefined && args.staleAfter !== '' && !DATE_ONLY.test(String(args.staleAfter))) {
           throw new Error('staleAfter 需要 YYYY-MM-DD 格式。')
         }
+        if (args?.invalidAt !== undefined && args.invalidAt !== '') {
+          const rawInvalid = String(args.invalidAt)
+          if (!DATE_ONLY.test(rawInvalid) && Number.isNaN(Date.parse(rawInvalid))) {
+            throw new Error('invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
+          }
+        }
+        // v4.0：scope 收敛（global 或小写 slug）。早失败好过再攒出 8 种混用取值。
+        const incomingScope = normalizeScope(args?.scope)
         // v3.9 两处修正：
         // 1) 只跟**生效**条目去重。原来会命中已 superseded 的条目，返回「已存在」、正文却永不注入（B03）。
         // 2) 命中时把这次新给的字段合并进去。原来只回写 pinned/status/staleAfter/sources，
         //    aliases/tags/scope/kind/importance/workspaces 全被吞掉（B04）——而 aliasHint 教的正是「再 add 一次补别名」。
         const duplicate = state.entries.find((entry) => isActive(entry) && entry.text === raw)
-        if (duplicate) {
+        // v4.0：显式 supersede 不能被「文本完全一致」的去重捷径吞掉 —— 调用方的意图是「换掉旧条」，
+        // 必须真的走推翻路径（旧条标失效 + 新条入库），而不是返回旧条说「已存在」。
+        if (duplicate && args?.supersede !== true) {
           let changed = false
           const unionInto = (field, incoming) => {
             if (!Array.isArray(incoming)) return
@@ -2657,8 +2834,9 @@ export function apply(ctx, config) {
           unionInto('workspaces', args?.workspaces)
           unionInto('paths', args?.paths)
           unionInto('sources', args?.sources)
-          if (typeof args?.scope === 'string' && args.scope.trim() !== '' && duplicate.scope !== args.scope.trim()) {
-            duplicate.scope = args.scope.trim()
+          unionInto('entities', args?.entities)
+          if (incomingScope !== '' && duplicate.scope !== incomingScope) {
+            duplicate.scope = incomingScope
             changed = true
           }
           if (typeof args?.kind === 'string' && args.kind.trim() !== '' && duplicate.kind !== args.kind.trim()) {
@@ -2729,20 +2907,58 @@ export function apply(ctx, config) {
           ...(typeof args?.staleAfter === 'string' && args.staleAfter !== '' ? { staleAfter: args.staleAfter } : {}),
           ...(derivedStale !== '' ? { staleAfter: derivedStale } : {}),
           ...(Array.isArray(args?.sources) ? { sources: args.sources } : {}),
+          ...(Array.isArray(args?.entities) ? { entities: args.entities } : {}),
+          ...(typeof args?.invalidAt === 'string' && args.invalidAt !== '' ? { invalidAt: args.invalidAt } : {}),
           ...(Array.isArray(args?.workspaces) ? { workspaces: args.workspaces } : {}),
           addedAt: now,
           updatedAt: now,
         })
         // v2.7（A-MEM 邻居演化的零模型版）：写入前找出高度相似的在库条目，把判断权交回模型。
         // 只提示、不自动合并——dsh-memory 一贯原则是「给候选不自动改」。
-        const similar = activeEntries()
+        const neighbours = activeEntries()
           .filter((item) => item.text !== raw)
           .map((item) => ({ entry: item, similarity: textSimilarity(item.text, raw) }))
-          .filter((item) => item.similarity >= SIMILAR_HINT_FLOOR)
           .sort((a, b) => b.similarity - a.similarity)
-          .slice(0, MAX_SIMILAR_HINT)
+        const similar = neighbours.filter((item) => item.similarity >= SIMILAR_HINT_FLOOR).slice(0, MAX_SIMILAR_HINT)
+        // v4.0：写入冲突**硬**检测。调研（mem0/Letta/Graphiti）唯一有共识的一条是「冲突必须显式处理」，
+        // 而不是像旧版那样只提示一句、模型可以当没看见。同 scope（任一侧无 scope 视为不限）+ 高度相似
+        // + 双方都生效 → 直接拒绝，逼出三个明确选项；draft 与 allowDuplicate 是合法逃生口。
+        const scopeOf = (item) => (typeof item?.scope === 'string' ? item.scope : '')
+        const conflict = neighbours.find(
+          (item) =>
+            item.similarity >= CONFLICT_FLOOR &&
+            item.entry.status !== 'draft' &&
+            (incomingScope === '' || scopeOf(item.entry) === '' || incomingScope === scopeOf(item.entry)),
+        )
+        // 文本完全一致 + 显式 supersede：把那条当作冲突对象处理（否则 neighbours 会把它过滤掉）。
+        const resolvedConflict =
+          conflict ?? (args?.supersede === true && duplicate ? { entry: duplicate, similarity: 1 } : undefined)
+        if (resolvedConflict && args?.supersede !== true && args?.allowDuplicate !== true && args?.status !== 'draft') {
+          throw new Error(
+            '写入冲突：与 ' +
+              resolvedConflict.entry.id +
+              ' 相似度 ' +
+              Math.round(resolvedConflict.similarity * 100) +
+              '%，内容高度重复。三选一：\n' +
+              '  1) memory_add 加 supersede: true —— 推翻旧条（旧条标失效、留档不删）\n' +
+              '  2) memory_add 加 allowDuplicate: true —— 明确要两条并存（分属不同上下文）\n' +
+              '  3) memory_add 加 status: "draft" —— 先存成待证实\n' +
+              '旧条：' +
+              resolvedConflict.entry.id +
+              ' ' +
+              String(resolvedConflict.entry.text).slice(0, 80),
+          )
+        }
         state.nextId += 1
         state.entries.push(entry)
+        // v4.0：supersede 把被推翻的旧条标记失效（留档不删，可 memory_restore / memory_history 反查）。
+        if (args?.supersede === true && resolvedConflict) {
+          const stamp = new Date().toISOString()
+          resolvedConflict.entry.supersededBy = entry.id
+          resolvedConflict.entry.invalidAt = stamp
+          resolvedConflict.entry.status = 'deprecated'
+          resolvedConflict.entry.updatedAt = stamp
+        }
         persist()
         return {
           entry: publicEntry(entry),
@@ -2798,6 +3014,15 @@ export function apply(ctx, config) {
           },
           staleAfter: { type: 'string', description: 'YYYY-MM-DD re-check date; empty string clears it.' },
           sources: { type: 'array', items: { type: 'string' }, description: 'New evidence list; empty array clears it.' },
+          entities: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'v4.0: new entity labels (plain strings); empty array clears them.',
+          },
+          invalidAt: {
+            type: 'string',
+            description: 'v4.0: YYYY-MM-DD (or ISO) from which the fact stops being true; empty string clears it.',
+          },
           workspaces: {
             type: 'array',
             items: { type: 'string' },
@@ -2859,6 +3084,7 @@ export function apply(ctx, config) {
             ...(entry.pinned ? { pinned: true } : {}),
             ...(typeof entry.migratedFrom === 'string' ? { migratedFrom: entry.migratedFrom } : {}),
             ...(Array.isArray(entry.sources) ? { sources: entry.sources } : {}),
+            ...(Array.isArray(entry.entities) ? { entities: entry.entities } : {}),
             ...(Array.isArray(entry.aliases) ? { aliases: entry.aliases } : {}),
             // v3.9：原来只抄了 tag/tags/scope/kind/paths/workspaces/pinned/sources/aliases，
             // importance 和 staleAfter 被丢掉 —— supersede 一次，重要度从 10 掉到按 kind 推导的 4（B05）。
@@ -2888,7 +3114,7 @@ export function apply(ctx, config) {
           if (aliases.length > 0) entry.aliases = aliases
           else delete entry.aliases
         }
-        if (typeof args?.scope === 'string' && args.scope.trim() !== '') entry.scope = args.scope.trim()
+        if (typeof args?.scope === 'string' && args.scope.trim() !== '') entry.scope = normalizeScope(args.scope)
         if (typeof args?.kind === 'string' && args.kind.trim() !== '') entry.kind = args.kind.trim()
         if (Array.isArray(args?.workspaces)) {
           const workspaces = args.workspaces.filter((item) => typeof item === 'string' && item.trim() !== '')
@@ -2909,9 +3135,25 @@ export function apply(ctx, config) {
           else entry.staleAfter = args.staleAfter
         }
         if (Array.isArray(args?.sources)) {
-          const sources = args.sources.filter((item) => typeof item === 'string' && item.trim() !== '')
+          const sources = cleanSources(args.sources)
           if (sources.length > 0) entry.sources = sources
           else delete entry.sources
+        }
+        // v4.0：实体标签与失效时刻（两条都是「今天不存、将来补不回来」的信息）。
+        if (Array.isArray(args?.entities)) {
+          const entities = cleanEntities(args.entities)
+          if (entities.length > 0) entry.entities = entities
+          else delete entry.entities
+        }
+        if (typeof args?.invalidAt === 'string') {
+          if (args.invalidAt === '') delete entry.invalidAt
+          else {
+            const rawInvalid = args.invalidAt.trim()
+            if (!DATE_ONLY.test(rawInvalid) && Number.isNaN(Date.parse(rawInvalid))) {
+              throw new Error('invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
+            }
+            entry.invalidAt = rawInvalid
+          }
         }
         if (args?.verified === true) {
           entry.verifiedBy = 'agent'
@@ -3365,8 +3607,25 @@ export function apply(ctx, config) {
               required: ['withAliases', 'missing', 'missingIds'],
               additionalProperties: false,
             },
+            // v4.0（考虑以后）：触发线指标。升级动作靠数据触发，不靠感觉。
+            growth: {
+              type: 'object',
+              properties: {
+                entries: { type: 'integer' },
+                avgChars: { type: 'integer' },
+                injectRatio: { type: 'number' },
+                entitiesCovered: { type: 'integer' },
+                sourcesCovered: { type: 'integer' },
+                invalid: { type: 'integer' },
+                stage: { type: 'string' },
+                nextTrigger: { type: 'string' },
+              },
+              required: ['entries', 'avgChars', 'injectRatio', 'entitiesCovered', 'sourcesCovered', 'invalid', 'stage', 'nextTrigger'],
+              additionalProperties: false,
+            },
+            schemaVersion: { type: 'integer' },
           },
-          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget'],
+          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget', 'growth', 'schemaVersion'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -3383,6 +3642,11 @@ export function apply(ctx, config) {
             `别名覆盖：${value?.aliases?.withAliases ?? 0} 条有 / ${value?.aliases?.missing ?? 0} 条缺${(value?.aliases?.missingIds ?? []).length > 0 ? ' —— ' + value.aliases.missingIds.join(' ') : ''}（缺别名的条目在换皮问法下召回不到，用 memory_update 补）`,
             `（未证实条目在注入时带 ❓，过期待重验带 ⏰；复核后用 memory_update verified:true 清除标记）`,
             `最常用：${mostUsed.map((item) => `${item.id}×${item.usedCount}`).join(' ') || '（还没有使用记录）'}`,
+            (() => {
+              const growth = value?.growth
+              if (!growth) return ''
+              return `规模 ${growth.entries} 条 / 平均 ${growth.avgChars} 字 / 注入占比 ${Math.round((growth.injectRatio ?? 0) * 100)}% / 实体覆盖 ${growth.entitiesCovered} 条 / 来源覆盖 ${growth.sourcesCovered} 条 / 已失效 ${growth.invalid} 条 ⇒ 阶段 ${growth.stage}；下一条触发线：${growth.nextTrigger}`
+            })(),
           ]
           return [text(lines.join('\n'))]
         },
@@ -3465,6 +3729,32 @@ export function apply(ctx, config) {
           stale: stale.slice(0, limit),
           mostUsed,
           budget: { usedChars: usedChars(), maxBytes, injectedChars: renderOnce('', undefined, undefined, lastKnownCwd).length },
+          // v4.0：规模判据（E 报告的 <300 / 300–3000 / >3000 三段）+ 触发线文案。
+          growth: (() => {
+            const entries = state.entries.length
+            const avgChars = entries === 0 ? 0 : Math.round(usedChars() / entries)
+            const injected = renderOnce('', undefined, undefined, lastKnownCwd).length
+            const stage = entries > 3000 ? 'entity-layer' : entries > 1000 ? 'tiered-inject' : entries > 300 ? 'hybrid-search' : 'flat'
+            const nextTrigger =
+              entries <= 300
+                ? '>300 条 → 上混合检索（语义/时间信号）'
+                : entries <= 1000
+                  ? '>1000 条 → 注入改三层（核心/近期/索引）'
+                  : entries <= 3000
+                    ? '>3000 条 → 评估实体层（以 entities 为锚）'
+                    : '已过 3000 条：按 §4.5 触发线升级存储与检索'
+            return {
+              entries,
+              avgChars,
+              injectRatio: Math.round((injected / Math.max(1, maxInjectChars)) * 1000) / 1000,
+              entitiesCovered: active.filter((entry) => Array.isArray(entry.entities) && entry.entities.length > 0).length,
+              sourcesCovered: active.filter((entry) => Array.isArray(entry.sources) && entry.sources.length > 0).length,
+              invalid: state.entries.filter((entry) => typeof entry.invalidAt === 'string' && entry.invalidAt !== '').length,
+              stage,
+              nextTrigger,
+            }
+          })(),
+          schemaVersion: Number.isInteger(state.version) && state.version > 0 ? state.version : SCHEMA_VERSION,
         }
       },
     }),
@@ -3665,6 +3955,8 @@ export function apply(ctx, config) {
             dir: { type: 'string' },
             written: { type: 'integer' },
             skipped: { type: 'integer' },
+            // v4.0：round-trip 校验——导出物必须能被读回来，否则只是「看起来导出成功」。
+            verified: { type: 'integer' },
             entries: {
               type: 'array',
               items: {
@@ -3675,14 +3967,14 @@ export function apply(ctx, config) {
               },
             },
           },
-          required: ['dir', 'written', 'skipped', 'entries'],
+          required: ['dir', 'written', 'skipped', 'verified', 'entries'],
           additionalProperties: false,
         },
         render(_args, value) {
           const list = Array.isArray(value?.entries) ? value.entries : []
           const lines = list.slice(0, 12).map((item) => '- ' + item.id + ' → ' + item.file)
           const more = list.length > 12 ? '\n… 另有 ' + (list.length - 12) + ' 个' : ''
-          return [text('已导出 ' + (value?.written ?? 0) + ' 张卡片到 ' + (value?.dir ?? '') + '（跳过 ' + (value?.skipped ?? 0) + ' 条已失效）\n' + lines.join('\n') + more)]
+          return [text('已导出 ' + (value?.written ?? 0) + ' 张卡片到 ' + (value?.dir ?? '') + '（跳过 ' + (value?.skipped ?? 0) + ' 条已失效；回读校验 ' + (value?.verified ?? 0) + '/5 通过）\n' + lines.join('\n') + more)]
         },
       },
       async execute(args) {
@@ -3702,7 +3994,16 @@ export function apply(ctx, config) {
           writeFileSync(target, cardMarkdown(entry), 'utf8')
           written.push({ id: entry.id, file: target })
         }
-        return { dir: targetDir, written: written.length, skipped, entries: written.slice(0, 200) }
+        // v4.0：抽前 5 张卡回读，确认 frontmatter 里的 id 对得上（导出不可读 = 迁移时会丢）。
+        let verified = 0
+        for (const item of written.slice(0, 5)) {
+          try {
+            if (readFileSync(item.file, 'utf8').includes('id: ' + item.id + '\n')) verified += 1
+          } catch (error) {
+            // 读不回来就是校验失败，不抛错
+          }
+        }
+        return { dir: targetDir, written: written.length, skipped, verified, entries: written.slice(0, 200) }
       },
     }),
   )

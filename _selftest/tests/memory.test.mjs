@@ -34,6 +34,13 @@ import {
   stripHarnessBlocks,
   collectRuleFiles,
   isStaleEntry,
+  isArchivedEntry,
+  isInvalidEntry,
+  cleanEntities,
+  cleanSources,
+  normalizeScope,
+  migrateState,
+  textSimilarity as sim,
 } from '../../dsh-memory/index.js'
 
 let passed = 0
@@ -1768,6 +1775,75 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(mine && !mine.status, '刚写入的条目必须仍在生效区')
   rmSync(d4, { recursive: true, force: true })
   ok('v3.25 撞墙归档：只动 30 天前的低价值条目，写入成功且新条目不被挤掉')
+}
+
+
+// ---- v4.0（考虑以后）：失效时刻 / 实体 / 来源 / 冲突硬门 / schema 迁移 / 触发线指标 ----
+{
+  assert.equal(isInvalidEntry({ invalidAt: '2000-01-01' }), true, '过去的日期 = 已失效')
+  assert.equal(isInvalidEntry({ invalidAt: '2999-01-01' }), false, '未来的日期 = 仍生效')
+  assert.equal(isInvalidEntry({}), false, '没有 invalidAt = 不失效')
+  assert.equal(isArchivedEntry({ invalidAt: '2000-01-01' }), true, '失效条目按归档口径处理')
+  assert.deepEqual(cleanEntities(['抖音', '抖音', ' DSH ', '', 'dsh']), ['抖音', 'DSH'], '实体标签去重（忽略大小写）并 trim')
+  assert.deepEqual(cleanSources(['https://x', ' https://x ', 'index.js:429']), ['https://x', 'index.js:429'], '来源去重并 trim')
+  assert.equal(normalizeScope('Global'), 'global')
+  assert.throws(() => normalizeScope('D:\\AI'), /scope/, '路径不能当 scope')
+  const migrated = migrateState({ version: 1, entries: [{ id: 'm1', text: '旧条目', invalidAt: '2999-01-01' }] })
+  assert.equal(migrated.changed, true)
+  assert.equal(migrated.state.version, 2)
+  assert.equal(migrated.state.entries[0].invalidAt, '2999-01-01', '迁移不能丢已有字段')
+  ok('v4.0 纯函数：invalidAt / entities / sources / scope / migrateState')
+}
+
+{
+  const d = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-v40-'))
+  const h = host(d)
+  const textA = '这是一条很长的测试记忆内容，用来验证冲突检测是否生效，内容需要足够长'
+  const textB = textA + '。'
+  assert.ok(sim(textA, textB) >= 0.88, '两条测试文本的相似度必须高到能触发冲突门，实际 ' + sim(textA, textB))
+  const first = await h.defs.get('memory_add').execute({ text: textA, entities: ['抖音', 'dsh-memory'], sources: ['index.js:429'] })
+  assert.deepEqual(first.entry.entities, ['抖音', 'dsh-memory'], '实体标签要落库')
+  assert.deepEqual(first.entry.sources, ['index.js:429'], '来源要落库')
+  // 冲突硬门：默认拒绝，并点名三条出路
+  await assert.rejects(() => h.defs.get('memory_add').execute({ text: textB }), /写入冲突/, '高度相似必须被拒')
+  const draft = await h.defs.get('memory_add').execute({ text: textB, status: 'draft' })
+  assert.ok(draft.entry && draft.entry.id !== first.entry.id, 'draft 是合法逃生口')
+  const dup = await h.defs.get('memory_add').execute({ text: textB, allowDuplicate: true })
+  assert.ok(dup.entry && dup.entry.id !== first.entry.id, 'allowDuplicate 是合法逃生口')
+  const sup = await h.defs.get('memory_add').execute({ text: textB, supersede: true })
+  const listed = await h.defs.get('memory_list').execute({ includeArchived: true })
+  const oldOne = listed.entries.find((entry) => entry.id === first.entry.id)
+  assert.equal(oldOne.supersededBy, sup.entry.id, 'supersede 要回写旧条的 supersededBy')
+  assert.ok(typeof oldOne.invalidAt === 'string' && oldOne.invalidAt !== '', 'supersede 同时写 invalidAt')
+  assert.ok(!listed.entries.filter((entry) => entry.id === first.entry.id).some((entry) => !entry.supersededBy), '旧条已不再生效')
+  ok('v4.0 冲突硬门：默认拒绝 / draft / allowDuplicate / supersede 四条路径')
+
+  // invalidAt：过去的失效条目不再注入与检索，但仍在库里（留档不删）
+  await h.defs.get('memory_add').execute({ text: '已经过期的约定：旧版接口要传 token', invalidAt: '2000-01-01', allowDuplicate: true })
+  const found = await h.defs.get('memory_search').execute({ query: '旧版接口要传 token' })
+  assert.ok(!(found.matches ?? []).some((item) => String(item.text).includes('旧版接口')), '失效条目不应被检索到')
+  const block = h.layers[0].text({})
+  assert.ok(!block.includes('已经过期的约定'), '失效条目不应注入')
+  ok('v4.0 invalidAt：失效条目不注入、不检索，但留档')
+
+  await h.defs.get('memory_add').execute({
+    text: '实体覆盖测试条目：Obsidian 画像要用 entities 落锚点',
+    entities: ['Obsidian'],
+    sources: ['https://help.obsidian.md/properties'],
+  })
+  const audit = await h.defs.get('memory_audit').execute({})
+  assert.ok(audit.growth && typeof audit.growth.stage === 'string', '审计要带规模判据')
+  assert.equal(audit.schemaVersion, 2, 'schema 版本要可见')
+  assert.ok(audit.growth.entitiesCovered >= 1 && audit.growth.sourcesCovered >= 1)
+  ok('v4.0 memory_audit 带触发线指标（stage / nextTrigger / schemaVersion）')
+
+  const exported = await h.defs.get('memory_export').execute({})
+  assert.ok(exported.verified >= 1, '导出必须能回读校验')
+  const cards = exported.entries.map((item) => readFileSync(item.file, 'utf8'))
+  assert.ok(cards.some((card) => card.includes('entities:')), '导出卡片要带实体标签')
+  assert.ok(cards.some((card) => card.includes('sources:')), '导出卡片要带来源')
+  ok('v4.0 导出卡片补全 entities/sources/invalidAt 且可回读')
+  rmSync(d, { recursive: true, force: true })
 }
 
 console.log(`memory: ${passed} 项通过`)
