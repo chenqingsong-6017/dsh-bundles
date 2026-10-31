@@ -3,6 +3,15 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v3.27.0 — 2026-10-31
+
+### Fixed
+- **用户消息沉淀的注入污染**：v3.1 只剥 `<memory>` 块，`<path-rules>` / `<available_skills>` / `<system-reminder>` 里的规则文本会被当成「用户偏好」抓进候选池（实测：关掉规则文件沉淀后仍冒出候选 c19，内容就是 `.dsh/rules/core.md` 被注入的那句）。
+- 新增导出 `stripHarnessBlocks(text)`：沉淀前先整块剥掉四类注入块；污染门同步补上这些标记作为最后一道防线。
+
+### Verification
+- 单测新增：注入块剥离（大小写 / 带属性 / 多块混排）与 `extractCandidates` 不再从注入文本出候选；验证门通过。
+
 ## v3.26.0 — 2026-10-31
 
 ### Added

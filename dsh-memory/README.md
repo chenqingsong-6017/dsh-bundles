@@ -206,6 +206,7 @@ node D:\AI\dsh-bundles\_selftest\memory-eval.mjs --fixture  # 只跑夹具（不
 - 映射：`plugin-dev → D:\AI\dsh-bundles`、`data-infra → D:\AI\dsh-data`、`dsh-date → D:\AI-date\dsh-date`（可配置覆盖）；
 - 命中的条目得分 ×1.4，**对不上不加分也不过过滤**（避免跨目录工作时误伤）；
 - 配置里 `captureCandidates: false` 可关自动沉淀；`captureRuleFiles: false`（v3.26）只关「规则文件沉淀」，保留用户消息沉淀。
+- v3.27：沉淀前用 `stripHarnessBlocks()` 整块剥掉 `<memory>` / `<path-rules>` / `<available_skills>` / `<system-reminder>`，避免把注入的规则当成用户偏好。
 
 ### 自动沉淀候选（影子模式）
 

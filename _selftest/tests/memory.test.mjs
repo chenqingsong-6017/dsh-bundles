@@ -31,6 +31,7 @@ import {
   cardMarkdown,
   slugOf,
   extractRuleCandidates,
+  stripHarnessBlocks,
   collectRuleFiles,
   isStaleEntry,
 } from '../../dsh-memory/index.js'
@@ -1530,6 +1531,33 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const on = await runCapture({})
   assert.equal(on.length, 1, '默认（不配）仍保留规则文件沉淀，向后兼容')
   ok('v3.26 captureRuleFiles：可单独关闭规则文件沉淀，默认行为不变')
+}
+
+// ---- v3.27 注入块剥离：不让 <path-rules> 等注入内容被当成用户偏好 ----
+{
+  const injected = [
+    '<path-rules>',
+    '本工作区插件源码在 D:\\AI\\dsh-bundles\\；新增或修改插件必须同时配测试，改完跑 npm run check。',
+    '</path-rules>',
+    '<MEMORY attr="1">',
+    '用户要求：所有回答用中文。',
+    '</MEMORY>',
+    '<available_skills>',
+    'skill: office —— 处理 Office 文档。',
+    '</available_skills>',
+    '<system-reminder>',
+    'Instructions from: AGENTS.md —— 删任何东西前先三查。',
+    '</system-reminder>',
+    '以后回答都先给结论。',
+  ].join('\n')
+  const stripped = stripHarnessBlocks(injected)
+  assert.equal(stripped, '以后回答都先给结论。', '四类注入块与大小写/属性都要剥干净：' + stripped)
+  assert.equal(stripHarnessBlocks(''), '', '空输入不炸')
+  assert.ok(stripHarnessBlocks('<path-rules>未闭合').includes('path-rules'), '未闭合时保留原文，不吞用户内容')
+  const cands = extractCandidates(stripHarnessBlocks(injected))
+  assert.equal(cands.some((item) => item.text.includes('插件源码')), false, '注入的规则不能出候选')
+  assert.ok(cands.some((item) => item.text.includes('先给结论')), '真实用户偏好仍会被抓到')
+  ok('v3.27 stripHarnessBlocks：注入块剥离，真实偏好不受影响')
 }
 
 // ---- v3.20 归档分文件冷存（archive.json）：主库只留生效、列表默认不吐归档、归档可恢复 ----

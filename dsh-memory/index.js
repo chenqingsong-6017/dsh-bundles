@@ -257,6 +257,24 @@ export function textSimilarity(left, right) {
   return union === 0 ? 0 : shared / union
 }
 
+/**
+ * v3.27：先整块剥掉 DSH 注入进 user 消息的运行时块。
+ *
+ * 起因（2026-10-31 实测）：关掉「规则文件沉淀」后仍冒出候选 c19，内容正是 core.md 的
+ * 「新增插件必须同时配测试」——它是被 <path-rules> 注入进 user 消息后，又被用户消息沉淀抓到的。
+ * v3.1 只剥了 <memory>，漏了其余注入块。这里是「沉淀前」的清洗，污染门（extractCandidates 内）
+ * 只作最后一道防线。
+ */
+const HARNESS_BLOCK_TAGS = ['memory', 'path-rules', 'available_skills', 'system-reminder']
+
+export function stripHarnessBlocks(text) {
+  let out = String(text ?? '')
+  for (const tag of HARNESS_BLOCK_TAGS) {
+    out = out.replace(new RegExp('<' + tag + '(?:\\s[^>]*)?>[\\s\\S]*?</' + tag + '>', 'gi'), ' ')
+  }
+  return out.trim()
+}
+
 /** 从用户消息里按规则抽「值得沉淀」的候选事实；纯规则、零模型调用。 */
 export function extractCandidates(text) {
   const raw = String(text ?? '').replace(/\s+/g, ' ').trim()
@@ -275,6 +293,10 @@ export function extractCandidates(text) {
       clause.includes('📌') ||
       clause.includes('<memory>') ||
       clause.includes('</memory>') ||
+      clause.includes('<path-rules>') ||
+      clause.includes('</path-rules>') ||
+      clause.includes('<available_skills>') ||
+      clause.includes('<system-reminder>') ||
       clause.includes('不要逐条复述') ||
       clause.includes('用 memory_search 按 id')
     ) {
@@ -3576,14 +3598,14 @@ export function apply(ctx, config) {
           .reverse()
           .find((message) => message?.role === 'user' && Array.isArray(message.content))
         if (lastUser === undefined) return
-        const text = lastUser.content
-          .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-          .map((part) => part.text)
-          .join(' ')
-          // v3.1：DSH 会把 <memory> 注入块并进 user 消息，不剥掉就会抓自己的提示语
-          // （实测抓出「把它们当背景，不要逐条复述」——记忆自我污染，越确认越蠢）。
-          .replace(/<memory>[\s\S]*?<\/memory>/g, ' ')
-          .trim()
+        // v3.1/v3.27：DSH 会把 <memory> / <path-rules> / 技能目录 / 系统提醒等注入块并进 user 消息。
+        // 不剥掉就会把「注入的规则」当「用户偏好」沉淀（实测抓出过记忆提示语与 core.md 规则）。
+        const text = stripHarnessBlocks(
+          lastUser.content
+            .filter((part) => part?.type === 'text' && typeof part.text === 'string')
+            .map((part) => part.text)
+            .join(' '),
+        )
         if (text === '') return
         const scope = currentScopeOf(payload)
         for (const candidate of extractCandidates(text)) {
