@@ -1118,7 +1118,7 @@ export function apply(ctx, config) {
     tools.register({
       name: 'updater_apply',
       description:
-        'Stages an upstream update for one registered source: shallow-clones the remote, resolves the plugin subdir, validates the bundle statically (package.json, dsh.bundle.patch, entry export form, node --check syntax), diffs it against the local directory, backs the local directory up, then copies the new files in. Pass dryRun to only clone, validate and diff with nothing written. This does NOT reload the plugin and does NOT remove local-only files unless prune is true; reload with plugin_manager remove_bundle + install_bundle afterwards.',
+        'Stages an upstream update for one registered source: shallow-clones the remote, resolves the plugin subdir, validates the bundle statically (package.json, dsh.bundle.patch, entry export form, node --check syntax), diffs it against the local directory, backs the local directory up, then copies the new files in. Pass dryRun to only clone, validate and diff with nothing written. This does NOT reload the plugin and does NOT remove local-only files unless prune is true; reload with plugin_manager remove_bundle + install_bundle afterwards. Provide name before confirm in the arguments.',
       parameters: {
         type: 'object',
         properties: {

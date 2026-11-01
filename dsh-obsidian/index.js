@@ -869,7 +869,7 @@ export function apply(ctx, config) {
   ctx.effect(() =>
     ctx.tools.register({
       name: 'obsidian_write',
-      description: 'Controlled write into the vault (P2): only inside the write allowlist (default 00-Inbox/ai-drafts/), create mode never overwrites, and hash/mtime conflict aborts. Modes: create / append / section-replace. Use it to draft cards for human review, not to edit human-owned notes.',
+      description: 'Controlled write into the vault (P2): only inside the write allowlist (default 00-Inbox/ai-drafts/), create mode never overwrites, and hash/mtime conflict aborts. Modes: create / append / section-replace. Use it to draft cards for human review, not to edit human-owned notes. Provide path before content in the arguments.',
       parameters: {
         type: 'object',
         properties: {
