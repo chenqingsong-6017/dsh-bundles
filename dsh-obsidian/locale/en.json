@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Obsidian index",
-    "description": "Read-only: indexes the local Obsidian vault into D:\AI\dsh-data\obsidian\index.json and exposes search / note / status. Writing is P2."
+    "description": "Indexes the local Obsidian vault into D:\AI\dsh-data\obsidian\index.json (search / note / status). P2 write is allowlisted, no-overwrite and conflict-abort."
   }
 }

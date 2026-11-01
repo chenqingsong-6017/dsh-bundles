@@ -2,6 +2,22 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.2.0 — 2026-11-01
+
+### Added
+- `obsidian_write`：受控写（P2）。白名单（默认 `00-Inbox/ai-drafts/`）+ `create` 绝不覆盖 + `expectedHash` / `expectedMtime` 冲突即放弃；支持 `create` / `append` / `section` 三种模式，`section` 只替换指定标题下的正文。
+- 原子写：tmp + rename，与 `index.json` 同一套路。
+- `obsidian_status` 新增 `memoryPointers`：扫 `memory.json` 里的 `vault://相对路径` 指针，报总数与断链（仿 Basic Memory 的 `sync_status`）。
+- 新纯函数并导出：`normalizeVaultPath` / `isWriteAllowed` / `sha256` / `sectionRange` / `applySection` / `parseMemoryPointers`。
+
+### Changed
+- 受保护目录硬拒：`.obsidian/`、`90-Shared/91-Templates/` 即使配进白名单也不许写。
+- 配置新增 `writeEnabled`（默认 true）/ `writeAllowlist` / `memoryPath`。
+
+### Design
+- 依据：Basic Memory（文件是权威源、DB 是派生索引）与 obsidian-mcp-server（默认 `overwrite=false`、写路径白名单、section 局部替换）。思路借鉴，代码未复制（Basic Memory 为 AGPL v3）。
+- 冲突策略是「放弃」不是「合并」：两处同时改时宁可这一轮不写，也不猜谁对。
+
 ## v0.1.0 — 2026-11-01
 
 ### Added

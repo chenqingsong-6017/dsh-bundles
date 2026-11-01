@@ -4,14 +4,20 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   apply,
+  applySection,
   buildIndex,
   extractLinks,
+  isWriteAllowed,
   listVault,
   makeSnippet,
   normalizeTarget,
+  normalizeVaultPath,
   parseFrontmatter,
+  parseMemoryPointers,
   safeResolve,
   scoreNote,
+  sectionRange,
+  sha256,
   splitFrontmatter,
 } from "../../dsh-obsidian/index.js"
 
@@ -128,7 +134,7 @@ put('.git/config', '')
 // ---- 4 个工具真调用 ----
 {
   const h = host(vault, store)
-  assert.deepEqual([...h.defs.keys()].sort(), ['obsidian_index', 'obsidian_note', 'obsidian_search', 'obsidian_status'])
+  assert.deepEqual([...h.defs.keys()].sort(), ['obsidian_index', 'obsidian_note', 'obsidian_search', 'obsidian_status', 'obsidian_write'])
   const built = await h.defs.get("obsidian_index").execute({})
   assert.equal(built.ok, true)
   assert.equal(built.notes, 4)
@@ -187,6 +193,93 @@ put('.git/config', '')
   const built = await h.defs.get("obsidian_index").execute({})
   assert.equal(built.ok, false, "vault 不在时重建要返回 ok:false，而不是抛")
   ok("fail-safe：vault 不存在时三个工具都返回 ok:false、不抛")
+}
+
+// ---- P2 受控写：纯函数 ----
+{
+  assert.equal(normalizeVaultPath('  .\\00-Inbox\\ai-drafts\\a '), '00-Inbox/ai-drafts/a.md')
+  assert.equal(normalizeVaultPath('"00-Inbox/ai-drafts/x.md"'), '00-Inbox/ai-drafts/x.md')
+  assert.equal(isWriteAllowed('00-Inbox/ai-drafts/x.md').allowed, true)
+  assert.equal(isWriteAllowed('10-Life/x.md').allowed, false)
+  assert.equal(isWriteAllowed('90-Shared/91-Templates/x.md').allowed, false, '模板目录受保护')
+  assert.equal(isWriteAllowed('.obsidian/app.json').allowed, false)
+  const body = ['# 标题', '', '## 观测', '', '- 旧', '', '## 关系', '', '- 旧关系', ''].join('\n')
+  const range = sectionRange(body, '观测')
+  assert.equal(range.startLine, 2)
+  assert.equal(range.endLine, 6)
+  assert.equal(sectionRange(body, '## 不存在'), null)
+  const next = applySection(body, '观测', '- 新\n- 又一条')
+  assert.ok(next.includes('- 新'))
+  assert.ok(!next.split('\n').includes('- 旧'), '旧段落被替换')
+  assert.ok(next.includes('## 关系'), '同级后面的段落保留')
+  assert.equal(applySection(body, '没有这个标题', 'x'), null)
+  assert.equal(sha256('abc'), sha256('abc'))
+  assert.notEqual(sha256('abc'), sha256('abd'))
+  assert.deepEqual(parseMemoryPointers('见 vault://10-Life/13-Life-Plan.md 和 vault://20-Learning/x.md。'), ['10-Life/13-Life-Plan.md', '20-Learning/x.md'])
+  assert.deepEqual(parseMemoryPointers('没有指针'), [])
+  ok('受控写纯函数：路径归一 / 白名单 / section 定位与替换 / 哈希 / 指针解析')
+}
+
+// ---- P2 受控写：工具真调用 ----
+{
+  const memFile = path.join(root, "memory.json")
+  writeFileSync(memFile, JSON.stringify({ entries: [
+    { id: 'm1', text: '细节见 vault://00-Inbox/ai-drafts/ok.md' },
+    { id: 'm2', text: '断的 vault://99-Gone/x.md' },
+  ] }), 'utf8')
+  const h = host(vault, store, { memoryPath: memFile })
+  const write = h.defs.get("obsidian_write")
+
+  const created = await write.execute({ path: "00-Inbox/ai-drafts/ok", content: '---\nreview: pending\n---\n# 草稿\n' })
+  assert.equal(created.ok, true)
+  assert.equal(created.created, true)
+  assert.equal(created.path, '00-Inbox/ai-drafts/ok.md')
+  assert.ok(existsSync(path.join(vault, '00-Inbox/ai-drafts/ok.md')))
+
+  const again = await write.execute({ path: "00-Inbox/ai-drafts/ok.md", content: 'x' })
+  assert.equal(again.ok, false)
+  assert.equal(again.code, 'file_exists', 'create 绝不覆盖')
+
+  const appended = await write.execute({ path: "00-Inbox/ai-drafts/ok.md", content: '追加行', mode: 'append' })
+  assert.equal(appended.ok, true)
+  assert.ok(readFileSync(path.join(vault, '00-Inbox/ai-drafts/ok.md'), 'utf8').includes('追加行'))
+
+  const missingSection = await write.execute({ path: "00-Inbox/ai-drafts/ok.md", content: '- 新观测', mode: 'section', section: '观测' })
+  assert.equal(missingSection.ok, false)
+  assert.equal(missingSection.code, 'section_not_found')
+
+  await write.execute({ path: "00-Inbox/ai-drafts/sec.md", content: '# 卡\n\n## 观测\n\n- 旧观测\n\n## 关系\n\n- 旧关系\n' })
+  const replaced = await write.execute({ path: "00-Inbox/ai-drafts/sec.md", content: '- 新观测', mode: 'section', section: '观测' })
+  assert.equal(replaced.ok, true)
+  const secBody = readFileSync(path.join(vault, '00-Inbox/ai-drafts/sec.md'), 'utf8')
+  assert.ok(secBody.includes('- 新观测'), '新内容写入')
+  assert.ok(!secBody.split('\n').includes('- 旧观测'), '旧段落被替换')
+  assert.ok(secBody.includes('## 关系'), '同级段保留')
+
+  const denied = await write.execute({ path: "10-Life/Me.md", content: 'x' })
+  assert.equal(denied.ok, false)
+  assert.equal(denied.code, 'denied')
+
+  const template = await write.execute({ path: "90-Shared/91-Templates/person.md", content: 'x' })
+  assert.equal(template.ok, false)
+  assert.equal(template.code, 'denied')
+
+  const escape = await write.execute({ path: "../outside.md", content: 'x' })
+  assert.equal(escape.ok, false)
+  assert.equal(escape.code, 'escape')
+
+  const conflict = await write.execute({ path: "00-Inbox/ai-drafts/sec.md", content: 'x', mode: 'append', expectedHash: 'deadbeef' })
+  assert.equal(conflict.ok, false)
+  assert.equal(conflict.code, 'conflict')
+
+  const st = await h.defs.get("obsidian_status").execute({})
+  assert.equal(st.ok, true)
+  assert.equal(st.memoryPointers.checked, true)
+  assert.equal(st.memoryPointers.total, 2)
+  assert.equal(st.memoryPointers.broken.length, 1, '断指针要报出来')
+  assert.equal(st.memoryPointers.broken[0].pointer, '99-Gone/x.md')
+
+  ok("工具：write 新建/拒覆盖/追加/section 替换/白名单/模板/越界/冲突 + status 指针漂移")
 }
 
 rmSync(root, { recursive: true, force: true })

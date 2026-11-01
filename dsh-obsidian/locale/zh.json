@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Obsidian 索引",
-    "description": "只读：把 D:\AI-date\obsidian\vault 扫成索引（D 盘 index.json），提供检索 / 读单篇 / 状态；写入归 P2，另做。"
+    "description": "把 D:\AI-date\obsidian\vault 扫成索引（D 盘 index.json），提供检索 / 读单篇 / 状态；P2 受控写只允许白名单目录、默认不覆盖、冲突即放弃。"
   }
 }

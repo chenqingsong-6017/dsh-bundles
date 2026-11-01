@@ -1,16 +1,17 @@
 /**
- * dsh-obsidian v0.1.0 —— Obsidian 库的只读索引（P1：只读，绝不写库）。
+ * dsh-obsidian v0.2.0 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
  *
  * 为什么需要它：vault 是人的成品层，AI 要查画像/日志/调研结论时只能 glob + read 逐个翻；
  * 库一大就会问「哪张卡讲过 X」「断链断在哪」。这个插件把 vault 扫成一份索引（落在 D 盘），
  * 提供 search / note / status 三个只读工具。写入归 P2（受控写），另做。
  *
  * 三条约束（与 _research/obsidian-vault-plan-2026-11.md §5 一致）：
- * ① 只读：绝不写 vault；唯一写入是 <storeDir>/index.json（临时文件 + rename 原子替换）；
+ * ① 写只走 obsidian_write：白名单内、create 绝不覆盖、hash/mtime 不符即放弃；索引写 <storeDir>/index.json（临时文件 + rename 原子替换）；
  * ② fail-safe：扫描/解析失败只记 lastError，绝不抛给会话；
  * ③ 不重复：检索用词项打分，够用就行；向量/图谱等有触发线再说。
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 
 export const name = 'dsh-obsidian'
@@ -19,6 +20,7 @@ export const inject = ['tools']
 export const INDEX_VERSION = 1
 const DEFAULT_VAULT = 'D:\\AI-date\\obsidian\\vault'
 const DEFAULT_STORE = 'D:\\AI\\dsh-data\\obsidian'
+const DEFAULT_MEMORY = 'D:\\AI\\dsh-data\\memory\\memory.json'
 const INDEX_FILE = 'index.json'
 const MAX_NOTE_BYTES = 512 * 1024
 const MAX_TEXT_CHARS = 8000
@@ -343,10 +345,95 @@ export function safeResolve(vaultDir, relPath) {
   return abs
 }
 
+export const DEFAULT_WRITE_ALLOWLIST = ['00-Inbox/ai-drafts/']
+const WRITE_DENY_PREFIXES = ['.obsidian/', '90-Shared/91-Templates/']
+const POINTER_RE = /vault:\/\/([^\s)\]"'，,；;。、：！？」）】]+)/g
+
+/** vault 相对路径归一：去引号 / 反斜杠转正斜杠 / 去前导 ./ 与 / / 自动补 .md */
+export function normalizeVaultPath(relPath) {
+  let rel = String(relPath ?? '').trim().replace(/^["']+|["']+$/g, '').replace(/\\/g, '/')
+  while (rel.startsWith('./')) rel = rel.slice(2)
+  rel = rel.replace(/^\/+/, '')
+  if (rel !== '' && !rel.toLowerCase().endsWith('.md')) rel += '.md'
+  return rel
+}
+
+/** 写白名单判定：受保护前缀优先拒，其次必须命中 allowlist */
+export function isWriteAllowed(relPath, allowlist) {
+  const rel = String(relPath ?? '').replace(/\\/g, '/')
+  const denied = WRITE_DENY_PREFIXES.find((prefix) => rel === prefix.slice(0, -1) || rel.startsWith(prefix))
+  if (denied) return { allowed: false, reason: '受保护目录：' + denied }
+  const list = Array.isArray(allowlist) && allowlist.length > 0 ? allowlist.map(String) : DEFAULT_WRITE_ALLOWLIST
+  const hit = list.find((prefix) => rel.startsWith(String(prefix).replace(/\\/g, '/')))
+  if (!hit) return { allowed: false, reason: '不在写白名单内（允许写：' + list.join(' / ') + '）' }
+  return { allowed: true, reason: '' }
+}
+
+/** 内容指纹：冲突检测用（Basic Memory 同源思路：sha256 作 generation） */
+export function sha256(value) {
+  return createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex')
+}
+
+/** 定位 section 区间：标题行之后到下一个同级或更高级标题之前 */
+export function sectionRange(body, section) {
+  const bare = String(section ?? '').trim().replace(/^#+\s*/, '')
+  if (bare === '') return null
+  const lines = String(body ?? '').split(/\r?\n/)
+  let start = -1
+  let level = 0
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = /^(#{1,6})\s+(.+?)\s*$/.exec(lines[i])
+    if (!match || match[2].trim() !== bare) continue
+    start = i
+    level = match[1].length
+    break
+  }
+  if (start === -1) return null
+  let end = lines.length
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const match = /^(#{1,6})\s+/.exec(lines[i])
+    if (match && match[1].length <= level) { end = i; break }
+  }
+  return { startLine: start, endLine: end, level }
+}
+
+/** 按 section 局部替换，返回新正文；找不到标题返回 null（绝不整篇覆盖） */
+export function applySection(body, section, content) {
+  const range = sectionRange(body, section)
+  if (!range) return null
+  const lines = String(body ?? '').split(/\r?\n/)
+  const blockLines = String(content ?? '').replace(/\r\n/g, '\n').split('\n')
+  const merged = [...lines.slice(0, range.startLine + 1), '', ...blockLines, '', ...lines.slice(range.endLine)]
+  const out = []
+  for (const line of merged) {
+    if (line === '' && out.length > 0 && out[out.length - 1] === '') continue
+    out.push(line)
+  }
+  return out.join('\n').replace(/\n+$/, '') + '\n'
+}
+
+/** 从记忆文本里抽 vault:// 指针（约定写法：vault://相对路径） */
+export function parseMemoryPointers(value) {
+  const found = new Set()
+  const source = String(value ?? '')
+  POINTER_RE.lastIndex = 0
+  let match
+  while ((match = POINTER_RE.exec(source)) !== null) {
+    const cleaned = match[1].replace(/[.,;:!?]+$/, '')
+    if (cleaned !== '') found.add(cleaned)
+  }
+  return [...found]
+}
+
 export function apply(ctx, config) {
   const vaultDir = strValue(config?.vaultDir) || DEFAULT_VAULT
   const storeDir = strValue(config?.storeDir) || DEFAULT_STORE
   const buildOnStart = config?.buildOnStart !== false
+  const memoryPath = strValue(config?.memoryPath) || DEFAULT_MEMORY
+  const writeEnabled = config?.writeEnabled !== false
+  const writeAllowlist = Array.isArray(config?.writeAllowlist) && config.writeAllowlist.length > 0
+    ? config.writeAllowlist.map(String)
+    : DEFAULT_WRITE_ALLOWLIST
   let lastError = ''
 
   const note = (error) => { lastError = errText(error).slice(0, 240) }
@@ -418,6 +505,39 @@ export function apply(ctx, config) {
     }
   }
 
+  /** 记忆指针漂移检查：memory.json 里的 vault:// 指针还能不能落到真实文件（仿 Basic Memory sync_status） */
+  function memoryPointerReport() {
+    const report = { file: memoryPath, checked: false, ok: true, total: 0, broken: [], sample: [] }
+    try {
+      if (!existsSync(memoryPath)) { report.error = '记忆文件不存在：' + memoryPath; return report }
+      const parsed = JSON.parse(readFileSync(memoryPath, 'utf8'))
+      const entries = Array.isArray(parsed?.entries) ? parsed.entries : []
+      const owners = new Map()
+      for (const entry of entries) {
+        for (const pointer of parseMemoryPointers(entry?.text)) {
+          if (!owners.has(pointer)) owners.set(pointer, [])
+          owners.get(pointer).push(String(entry?.id ?? ''))
+        }
+      }
+      report.checked = true
+      report.total = owners.size
+      for (const [pointer, ids] of owners) {
+        const abs = safeResolve(vaultDir, normalizeVaultPath(pointer))
+        if (abs !== null && existsSync(abs)) {
+          if (report.sample.length < 5) report.sample.push(pointer)
+        } else {
+          report.broken.push({ pointer, memoryIds: ids.slice(0, 5) })
+        }
+      }
+      report.ok = report.broken.length === 0
+    } catch (error) {
+      note(error)
+      report.ok = false
+      report.error = lastError
+    }
+    return report
+  }
+
   // 启动时顺带建一次索引（只读扫库，失败不影响启动）
   if (buildOnStart) {
     try { ensureIndex(false) } catch (error) { note(error) }
@@ -447,6 +567,7 @@ export function apply(ctx, config) {
             indexStale: { type: 'boolean' },
             indexBytes: { type: 'integer' },
             newestMtime: { type: 'string' },
+            memoryPointers: { type: 'object', additionalProperties: true },
             lastError: { type: 'string' },
           },
           required: ['ok', 'vault', 'notes', 'bases', 'attachments', 'links', 'brokenLinks', 'parseErrors'],
@@ -482,6 +603,7 @@ export function apply(ctx, config) {
             indexBytes: bytes,
             newestMtime: liveNewest ? new Date(liveNewest).toISOString() : '',
             lastError,
+            memoryPointers: memoryPointerReport(),
             live: { notes: listing.notes.length, bases: listing.bases.length, attachments: listing.attachments },
           }
         } catch (error) {
@@ -676,6 +798,124 @@ export function apply(ctx, config) {
         } catch (error) {
           note(error)
           return { ok: false, path: strValue(args?.path), lastError }
+        }
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'obsidian_write',
+      description: 'Controlled write into the vault (P2): only inside the write allowlist (default 00-Inbox/ai-drafts/), create mode never overwrites, and hash/mtime conflict aborts. Modes: create / append / section-replace. Use it to draft cards for human review, not to edit human-owned notes.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Vault-relative path, e.g. 00-Inbox/ai-drafts/2026-11-01-draft.md' },
+          content: { type: 'string', description: 'Markdown to write; in section mode it replaces the body under that heading.' },
+          mode: { type: 'string', enum: ['create', 'append', 'section'], description: 'create (default, fails when the file exists) / append (add to end) / section (replace one heading block).' },
+          section: { type: 'string', description: 'Heading text for section mode, e.g. 观测 or ## 观测.' },
+          expectedHash: { type: 'string', description: 'Optional sha256 of the current file; mismatch aborts with code=conflict.' },
+          expectedMtime: { type: 'number', description: 'Optional current mtime in ms; mismatch aborts with code=conflict.' },
+        },
+        required: ['path', 'content'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            code: { type: 'string' },
+            path: { type: 'string' },
+            absPath: { type: 'string' },
+            action: { type: 'string' },
+            created: { type: 'boolean' },
+            bytesBefore: { type: 'integer' },
+            bytesAfter: { type: 'integer' },
+            hash: { type: 'string' },
+            mtime: { type: 'string' },
+            allowlist: { type: 'array', items: { type: 'string' } },
+            lastError: { type: 'string' },
+          },
+          required: ['ok', 'path'],
+          additionalProperties: true,
+        },
+        render(_args, value) {
+          if (value.ok !== true) return [text('写入被拒：' + (value.code ? value.code + ' · ' : '') + (value.lastError || '未知原因'))]
+          return [text(value.action + ' ' + value.path + '（' + value.bytesBefore + ' → ' + value.bytesAfter + ' 字节）')]
+        },
+      },
+      async execute(args) {
+        try {
+          if (!writeEnabled) return { ok: false, code: 'write_disabled', path: '', lastError: '受控写已关闭（writeEnabled=false）' }
+          const rel = normalizeVaultPath(args?.path)
+          if (rel === '') return { ok: false, code: 'bad_path', path: '', lastError: 'path 为空' }
+          const content = String(args?.content ?? '')
+          if (content === '') return { ok: false, code: 'empty_content', path: rel, lastError: 'content 为空' }
+          const abs = safeResolve(vaultDir, rel)
+          if (!abs) return { ok: false, code: 'escape', path: rel, lastError: '路径越界：只允许 vault 内部路径' }
+          const gate = isWriteAllowed(rel, writeAllowlist)
+          if (!gate.allowed) return { ok: false, code: 'denied', path: rel, absPath: abs, allowlist: writeAllowlist, lastError: gate.reason }
+          const mode = ['create', 'append', 'section'].includes(String(args?.mode)) ? String(args?.mode) : 'create'
+          const exists = existsSync(abs)
+          let before = ''
+          let sizeBefore = 0
+          let info = null
+          if (exists) {
+            info = statSync(abs)
+            if (!info.isFile()) return { ok: false, code: 'not_a_file', path: rel, lastError: '目标不是普通文件' }
+            if (info.size > MAX_NOTE_BYTES) return { ok: false, code: 'too_large', path: rel, lastError: '文件超过 ' + MAX_NOTE_BYTES + ' 字节' }
+            before = readFileSync(abs, 'utf8')
+            sizeBefore = info.size
+          }
+          const expectedHash = strValue(args?.expectedHash).toLowerCase()
+          if (expectedHash !== '' && sha256(before) !== expectedHash) {
+            return { ok: false, code: 'conflict', path: rel, lastError: '内容已变（expectedHash 不符），本次放弃写入' }
+          }
+          const expectedMtime = Number(args?.expectedMtime)
+          if (exists && Number.isFinite(expectedMtime) && expectedMtime > 0 && Math.abs(info.mtimeMs - expectedMtime) > 1000) {
+            return { ok: false, code: 'conflict', path: rel, lastError: '文件在预期之外被改过（expectedMtime 不符），本次放弃写入' }
+          }
+          let next = ''
+          let created = false
+          if (!exists) {
+            if (mode === 'section') return { ok: false, code: 'no_file', path: rel, lastError: 'section 模式要求文件已存在' }
+            next = content
+            created = true
+          } else if (mode === 'create') {
+            return { ok: false, code: 'file_exists', path: rel, lastError: '目标已存在；create 绝不覆盖（改内容请用 section 或 append）' }
+          } else if (mode === 'append') {
+            next = before.endsWith('\n') ? before + content : before + '\n' + content
+          } else {
+            const section = strValue(args?.section)
+            if (section === '') return { ok: false, code: 'bad_section', path: rel, lastError: 'section 模式必须给 section 标题' }
+            const replaced = applySection(before, section, content)
+            if (replaced === null) return { ok: false, code: 'section_not_found', path: rel, lastError: '找不到标题：' + section }
+            next = replaced
+          }
+          mkdirSync(path.dirname(abs), { recursive: true })
+          const tmp = abs + '.tmp-' + process.pid
+          writeFileSync(tmp, next, 'utf8')
+          renameSync(tmp, abs)
+          const after = statSync(abs)
+          const action = created ? '新建' : mode === 'append' ? '追加' : '局部替换'
+          return {
+            ok: true,
+            code: '',
+            path: path.relative(path.resolve(vaultDir), abs).split(path.sep).join('/'),
+            absPath: abs,
+            action,
+            created,
+            bytesBefore: sizeBefore,
+            bytesAfter: Buffer.byteLength(next, 'utf8'),
+            hash: sha256(next),
+            mtime: new Date(after.mtimeMs).toISOString(),
+            allowlist: writeAllowlist,
+            lastError,
+          }
+        } catch (error) {
+          note(error)
+          return { ok: false, code: 'error', path: strValue(args?.path), lastError }
         }
       },
     }),

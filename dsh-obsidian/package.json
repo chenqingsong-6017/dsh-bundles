@@ -1,12 +1,12 @@
 {
   "name": "@local/dsh-obsidian",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "engines": {
     "node": ">=22.19.0"
   },
   "type": "module",
-  "description": "Read-only index of the local Obsidian vault (P1): search / read / status, index.json on D:, never writes the vault.",
+  "description": "Index of the local Obsidian vault: P1 read-only search/read/status, P2 controlled write (allowlist, no-overwrite, conflict-abort) into 00-Inbox/ai-drafts.",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
