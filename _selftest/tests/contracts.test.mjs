@@ -11,9 +11,10 @@ const CHECKER = path.join(WORKSPACE, '_ops', 'icd-check.mjs')
 
 let passed = 0
 const ok = (label) => { passed += 1; console.log('  ✓ ' + label) }
-const run = (root, extra) => {
+const run = (root, extra, envExtra) => {
   const args = [CHECKER, '--root', root].concat(extra || [])
-  const r = spawnSync(process.execPath, args, { encoding: 'utf8', env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 60000 })
+  const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', ...(envExtra || {}) }
+  const r = spawnSync(process.execPath, args, { encoding: 'utf8', env, timeout: 60000 })
   return { status: r.status, out: (r.stdout || '') + (r.stderr || '') }
 }
 
@@ -44,12 +45,10 @@ const makeFixture = (docText, opts) => {
       name: '测试错误率',
       definition: '测试用',
       unit: 'ratio',
-      format: { kind: 'percent', digits: 2 },
+      format: (opts && opts.probe) ? { kind: 'raw', suffix: ' 字符' } : { kind: 'percent', digits: 2 },
       window: '30 天',
-      budgetingMethod: 'Occurrences',
-      timeWindow: { durationDays: (opts && opts.durationDays) || 30, anchor: 'rolling' },
-      emptyDayPolicy: 'no-data',
-      source: { kind: 'file', path: 'baseline.json', field: 'errorRate', freshnessDays: 7 },
+      ...((opts && opts.probe) ? {} : { timeWindow: { durationDays: (opts && opts.durationDays) || 30, anchor: 'rolling' }, emptyDayPolicy: 'no-data', budgetingMethod: 'Occurrences' }),
+      source: (opts && opts.probe) ? { kind: 'probe', probe: 'alwaysBudgetUsed' } : { kind: 'file', path: 'baseline.json', field: 'errorRate', freshnessDays: 7 },
       thresholds: { warn: 0.05 },
       docKeywords: ['错误率'],
       ...((opts && opts.metricExtra) || {}),
@@ -144,6 +143,21 @@ const cleanup = (root) => { try { rmSync(root, { recursive: true, force: true })
   assert.equal(r.status, 1, '窗口不一致必须失败')
   assert.match(r.out, /两份基线/)
   ok('窗口与基线不一致 → 失败')
+  cleanup(root)
+}
+// 探针源（probe）：与 system-health 同口径现算，文档 marker 必须与现算值一致。
+{
+  const root = makeFixture('<!--metric:toolErrorRate-->10 字符<!--/metric-->\n', { probe: true, dropBaseline: true })
+  const rulesDir = path.join(root, 'rules')
+  mkdirSync(rulesDir, { recursive: true })
+  writeFileSync(path.join(rulesDir, 'a.md'), '---\nid: a\nalways: true\n---\n' + 'x'.repeat(10))
+  const okRun = run(root, [], { DSH_RULES_DIR: rulesDir })
+  assert.equal(okRun.status, 0, '探针值与 marker 一致应通过：' + okRun.out)
+  writeFileSync(path.join(root, 'DOC.md'), '<!--metric:toolErrorRate-->9 字符<!--/metric-->\n')
+  const bad = run(root, [], { DSH_RULES_DIR: rulesDir })
+  assert.equal(bad.status, 1, '探针值与 marker 不一致必须失败')
+  assert.match(bad.out, /权威源是 10 字符/)
+  ok('探针源：现值可校验（一致绿/不一致红）')
   cleanup(root)
 }
 console.log('contracts: ' + passed + ' 组通过')
