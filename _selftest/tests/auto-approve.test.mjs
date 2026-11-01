@@ -91,6 +91,8 @@ const mod = await import('../../dsh-auto-approve/index.js')
     ['vssadmin delete shadows', 'bash', { command: 'vssadmin delete shadows /all /quiet' }],
     ['写 .ssh', 'write', { file_path: 'C:\\Users\\x\\.ssh\\config' }],
     ['写 .credentials', 'write', { file_path: 'D:\\proj\\.credentials.yaml' }],
+    ['命令追加写 .ssh', 'pwsh', { command: 'echo hi >> ~/.ssh/authorized_keys' }],
+    ['Copy-Item 写 .ssh', 'pwsh', { command: 'Copy-Item C:\\tmp\\k C:\\Users\\x\\.ssh\\id_rsa' }],
   ]
   for (const [label, toolName, args] of hits) {
     const verdict = mod.decideCall({ toolName, args })
@@ -110,6 +112,12 @@ const mod = await import('../../dsh-auto-approve/index.js')
     ['vssadmin list shadows', 'bash', { command: 'vssadmin list shadows' }],
     ['只读 .ssh', 'read', { file_path: 'C:\\Users\\x\\.ssh\\config' }],
     ['format 这个词出现在脚本名里', 'bash', { command: 'pnpm run format', description: '代码格式化' }],
+    // 2026-11-01 线上误报：只读列目录被当成「写 .ssh」直接拒绝
+    ['只读列 .ssh', 'pwsh', { command: 'ls ~/.ssh/' }],
+    ['Get-ChildItem 列 .ssh', 'pwsh', { command: 'Get-ChildItem C:\\Users\\x\\.ssh' }],
+    // 2026-11-01 线上误报：写一个叫 .credentials-guide.md 的文档被当成写凭据
+    ['写凭据说明文档', 'write', { file_path: 'D:\\AI-date\\dsh-date\\dsh-创建\\docs\\.credentials-guide.md' }],
+    ['命令里只读凭据', 'pwsh', { command: 'type C:\\Users\\x\\.dsh\\.credentials.yaml' }],
   ]
   for (const [label, toolName, args] of misses) {
     const verdict = mod.decideCall({ toolName, args })
@@ -277,7 +285,7 @@ const mod = await import('../../dsh-auto-approve/index.js')
     assert.ok(status.files.some((entry) => entry.scope === 'user' && entry.exists && entry.rules === 1))
     assert.equal(status.projectRules, 3)
     assert.equal(status.userRules, 1)
-    assert.equal(status.builtinRules, 5)
+    assert.equal(status.builtinRules, 7)
     assert.ok(status.stats.checks >= 7, '每次 pre-execute 都计一次')
     assert.ok(status.stats.deny >= 3)
     assert.ok(status.stats.allow >= 1)
@@ -289,7 +297,7 @@ const mod = await import('../../dsh-auto-approve/index.js')
     const statusText = statusTool.output.render({}, status).map((block) => block.text).join('\n')
     assert.match(statusText, /dsh-auto-approve 已启用/)
     assert.match(statusText, /最近判断/)
-    assert.match(statusText, /内置红线 5 条/)
+    assert.match(statusText, /内置红线 7 条/)
     ok('status：规则文件 / 条数 / 统计 / 最近 20 条 / 人话渲染')
 
     // check：干跑 + 人话输出

@@ -35,7 +35,6 @@ const DECISIONS = ['allow', 'ask', 'deny']
 const SEVERITY = { deny: 0, ask: 1, allow: 2 }
 const SOURCE_LABEL = { project: '项目规则', user: '用户规则', builtin: '内置红线', classifier: 'v2 分类器' }
 const DECISION_LABEL = { allow: '放行', ask: '需人工确认', deny: '拒绝', none: '不干预' }
-const WRITE_TOOLS = /^(write|edit|multi_edit|apply_patch|patch|bash|pwsh|run_code|terminal|terminal_send|exec)$/i
 /**
  * 内置红线只查「命令/代码文本」和「路径参数」，不查整段参数 JSON。
  * 理由：write/edit 的 content、bash 的 description 里出现 rm -rf / 或 .ssh/ 只是文字，
@@ -43,7 +42,6 @@ const WRITE_TOOLS = /^(write|edit|multi_edit|apply_patch|patch|bash|pwsh|run_cod
  */
 const COMMAND_FIELDS = ['command', 'code', 'script', 'text']
 const PATH_FIELDS = ['file_path', 'filePath', 'path', 'target', 'target_path', 'new_path', 'old_path']
-const REDLINE_FIELDS = [...PATH_FIELDS, ...COMMAND_FIELDS]
 
 const text = (value) => ({ type: 'text', text: value })
 
@@ -100,22 +98,44 @@ export const BUILTIN_REDLINES = [
     reason: '命令行里有 vssadmin delete shadows，会删掉系统还原点与卷影备份。',
   },
   {
-    id: 'ssh-write',
+    id: 'ssh-write-path',
     name: '写 .ssh 目录',
     decision: 'deny',
-    tools: WRITE_TOOLS,
+    tools: /^(write|edit|multi_edit|apply_patch|patch)$/i,
     match: /[\\/]\.ssh[\\/]/i,
-    fields: REDLINE_FIELDS,
-    reason: '这次调用会写 .ssh 目录，可能改动私钥或免密登录配置。',
+    fields: PATH_FIELDS,
+    reason: '这次调用要写 .ssh 目录，可能改动私钥或免密登录配置。',
   },
   {
-    id: 'credentials-write',
+    // 命令/代码里只认「写动作 → .ssh 路径」这个组合，不认孤立出现的 .ssh。
+    // 否则 `ls ~/.ssh/`、`Get-ChildItem ~/.ssh` 这类纯只读命令会被误拒（2026-11-01 实测）。
+    id: 'ssh-write-shell',
+    name: '命令写 .ssh 目录',
+    decision: 'deny',
+    tools: /^(bash|pwsh|run_code|terminal|terminal_send|exec)$/i,
+    match: /(?:>>?|set-content|add-content|out-file|new-item|copy-item|move-item|rename-item|remove-item|\bcp\b|\bmv\b|\bscp\b|\brsync\b|writefilesync|appendfilesync|createwritestream|writefile|copyfile|renamesync)[^|;]{0,120}[\\/]\.ssh[\\/]/i,
+    fields: COMMAND_FIELDS,
+    reason: '命令里有写操作指向 .ssh 目录，可能改动私钥或免密登录配置。',
+  },
+  {
+    id: 'credentials-write-path',
     name: '写凭据文件',
     decision: 'deny',
-    tools: WRITE_TOOLS,
-    match: /\.credentials\b/i,
-    fields: REDLINE_FIELDS,
-    reason: '这次调用会写 .credentials 凭据文件。',
+    tools: /^(write|edit|multi_edit|apply_patch|patch)$/i,
+    // 只认整段文件名 .credentials / .credentials.yaml 这类后缀；
+    // `.credentials-guide.md` 是文档不是凭据，不能被拦（2026-11-01 实测）。
+    match: /[\\/]\.credentials(\.[a-z0-9]+)?$/i,
+    fields: PATH_FIELDS,
+    reason: '这次调用要写 .credentials 凭据文件。',
+  },
+  {
+    id: 'credentials-write-shell',
+    name: '命令写凭据文件',
+    decision: 'deny',
+    tools: /^(bash|pwsh|run_code|terminal|terminal_send|exec)$/i,
+    match: /(?:>>?|set-content|add-content|out-file|new-item|copy-item|move-item|rename-item|remove-item|\bcp\b|\bmv\b|\bscp\b|writefilesync|appendfilesync|createwritestream|writefile|copyfile)[^|;]{0,120}\.credentials(\.[a-z0-9]+)?/i,
+    fields: COMMAND_FIELDS,
+    reason: '命令里有写操作指向 .credentials 凭据文件。',
   },
 ]
 
