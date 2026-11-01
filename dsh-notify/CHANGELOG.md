@@ -2,6 +2,17 @@
 
 本文件于 2026-10-31 按「改到谁补谁」的规则建立；v0.1.0 为存量版本补记。
 
+## v0.1.2 — 2026-11-01
+
+### Added
+- 统一契约（工具面就绪度）：`notify_status` 增加 `ready` / `unavailableReason`。判据就是既有的 `toastAvailable`（`canToast = win32 && subprocess`），不可用时 render 首行显示「不可用：<reason>」。
+- `notify` 的失败返回增加稳定错误码 `code`：成功为 `''`，失败为 `NOTIFY_TRANSPORT_UNAVAILABLE`（脚本按码命中，不再正则匹配自然语言）；render 同时带上 code。
+
+### Verification
+- `_selftest/tests/notify.test.mjs` 8 项全过（含新增的契约断言：schema required 含两字段、不可用分支 render 文案、`notify` required 含 `code`）。
+- `_selftest/schema-check.mjs`：`notify` / `notify_status` PASS；另用一次性脚本真跑 `execute()` 核对「返回键 == schema keys」，两工具全过。
+- 未做真机（运行中进程内）验证：本插件行未重载，`ready` 的真机取值待 profile 重组后确认。
+
 ## v0.1.1 — 2026-10-31
 
 ### Fixed

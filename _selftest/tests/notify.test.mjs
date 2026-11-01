@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
-import { shouldNotify, describeOutcome, xmlEscape, compact, buildToastScript, buildBalloonScript, dayOf } from '../../dsh-notify/index.js'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { shouldNotify, describeOutcome, xmlEscape, compact, buildToastScript, buildBalloonScript, dayOf, apply } from '../../dsh-notify/index.js'
+import { makeMockContext } from '../plugin-smoke.mjs'
 
 let passed = 0
 const ok = (label) => {
@@ -96,3 +100,27 @@ assert.equal(dayOf(Date.parse('2026-10-26T13:25:11Z'), 'Asia/Shanghai'), '2026-1
 assert.equal(dayOf(Date.parse('2026-10-26T23:30:00Z'), 'Asia/Shanghai'), '2026-10-27')
 assert.equal(dayOf(Number.NaN, 'UTC'), '')
 ok('dayOf：按指定时区切日，跨边界正确')
+
+// ---- 契约（统一规格 2026-11-01）：status 报 ready，notify 失败给稳定 code ----
+{
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-notify-'))
+  try {
+    const { ctx, registered } = makeMockContext()
+    apply(ctx, { storeDir: dir, timeZone: 'Asia/Shanghai' })
+    const status = registered.find((definition) => definition.name === 'notify_status')
+    assert.ok(status, 'notify_status 必须注册')
+    assert.ok(status.output.schema.required.includes('ready'), 'status schema 必须含 ready')
+    assert.ok(status.output.schema.required.includes('unavailableReason'), 'status schema 必须含 unavailableReason')
+
+    // 不可用分支的 render：必须出现「不可用：<reason>」
+    const sample = { ready: false, unavailableReason: '测试原因', transport: 'log', toastAvailable: false, lastSentAt: '', lastError: '' }
+    const blocks = status.output.render({}, sample)
+    assert.ok(blocks[0].text.includes('不可用：测试原因'), `render 要显示「不可用：<reason>」，实际：${blocks[0].text}`)
+
+    const notify = registered.find((definition) => definition.name === 'notify')
+    assert.ok(notify.output.schema.required.includes('code'), 'notify 的失败返回必须有 code（脚本要能按码命中）')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+ok('契约：notify_status 带 ready/unavailableReason，notify 失败带 code')

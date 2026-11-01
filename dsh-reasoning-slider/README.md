@@ -29,6 +29,14 @@
 
 挂载点：官方扩展槽 `conversation.input.right`（list），注册 id `reasoning-slider`、`order: 20`。
 
+## 工具
+
+| 工具 | 作用 |
+|---|---|
+| `reasoning_status` | 诊断口（2026-11-01 统一契约）：只报 `ready` / `unavailableReason` / `note`。纯客户端插件没有服务端工具 → 恒 `ready=true`、`unavailableReason=""` |
+
+滑条本身不走工具面（`lib/client.js` 直接调会话 RPC），所以这个工具只回答「你ready吗」，不承担任何功能。
+
 ## 安装与卸载
 
 ```text
@@ -58,3 +66,6 @@ plugin_manager remove_bundle   target = @local/dsh-reasoning-slider
   - 控制台错误：**0**（修复前为 2 条组件崩溃）
   - 清理：临时诊断路由 `/dsh-rs-report`、`/dsh-rs-state`、`/dsh-rs-url` 已全部删除（现均 404），client 里的上报代码同步移除
   - 静态检查：`node --check` 两个半边通过；package/locale JSON 可解析；icon.svg 合法
+- 统一契约（2026-11-01）：Host 半体新增 `reasoning_status`（`ready` / `unavailableReason` / `note`），
+  单测 `_selftest/tests/reasoning-slider.test.mjs` 覆盖「三字段在 required 里 + 返回值与 schema 严格同构 + note 讲清是客户端插件」；
+  新增工具要等 profile 重组后才会进工具列表，**本次未做真机验证**（滑条侧代码一字未改）。

@@ -518,6 +518,8 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
             sessionsRoot: { type: 'string' },
             storeDir: { type: 'string' },
             storeFile: { type: 'string' },
@@ -545,13 +547,16 @@ export function apply(ctx, config) {
                 file: { type: 'string' },
                 lines: { type: 'integer' },
                 calls: { type: 'integer' },
+                code: { type: 'string' },
                 error: { type: 'string' },
               },
-              required: ['file', 'lines', 'calls', 'error'],
+              required: ['file', 'lines', 'calls', 'code', 'error'],
               additionalProperties: false,
             },
           },
           required: [
+            'ready',
+            'unavailableReason',
             'sessionsRoot',
             'storeDir',
             'storeFile',
@@ -573,6 +578,9 @@ export function apply(ctx, config) {
           return [
             text(
               [
+                value?.ready === true
+                  ? '状态：就绪（价格表已配置，会话日志可读）'
+                  : `不可用：${value?.unavailableReason || '未知原因'}`,
                 `会话日志：${value?.sessionsRoot ?? '?'}`,
                 `索引存档：${value?.storeFile ?? '?'}（${fmtTokens(value?.storeBytes ?? 0)}B）`,
                 `已索引：${value?.indexedFiles ?? 0} 个会话文件 / ${value?.totalCalls ?? 0} 次模型调用`,
@@ -581,7 +589,7 @@ export function apply(ctx, config) {
                 `时区：${value?.timeZone ?? '系统默认'}`,
                 `模型：${models.length > 0 ? models.join(', ') : '（未知）'}`,
                 `运行时：node ${value?.diagnostics?.node ?? '?'} / electron ${value?.diagnostics?.electron ?? '?'} / zstd ${value?.diagnostics?.zstd ?? '?'}`,
-                `探针（${value?.probe?.file ?? '无文件'}）：lines ${value?.probe?.lines ?? 0} / calls ${value?.probe?.calls ?? 0}${value?.probe?.error ? ` / error: ${value.probe.error}` : ''}`,
+                `探针（${value?.probe?.file ?? '无文件'}）：lines ${value?.probe?.lines ?? 0} / calls ${value?.probe?.calls ?? 0}${value?.probe?.code ? ` / code: ${value.probe.code}` : ''}${value?.probe?.error ? ` / error: ${value.probe.error}` : ''}`,
               ].join('\n'),
             ),
           ]
@@ -589,6 +597,20 @@ export function apply(ctx, config) {
       },
       async execute() {
         await ensureFresh()
+        // 就绪判据（只查配置与可读性，不发网络）：① 价格表是否配置；② 会话日志根目录是否可读。
+        // 有一条不成立就 ready=false，把原因写进 unavailableReason —— 别让调用方自己猜。
+        let sessionsReadable = false
+        try {
+          readdirSync(sessions)
+          sessionsReadable = true
+        } catch {
+          sessionsReadable = false
+        }
+        const pricesConfigured = Boolean(prices)
+        const reasons = []
+        if (!pricesConfigured) reasons.push('未配置价格表（只能报 token，不报成本）')
+        if (!sessionsReadable) reasons.push(`会话日志目录读不到：${sessions}`)
+        const ready = reasons.length === 0
         let storeBytes = 0
         try {
           storeBytes = statSync(storeFile).size
@@ -596,19 +618,33 @@ export function apply(ctx, config) {
           storeBytes = 0
         }
         // 实时探针：对第一个会话文件当场解析一次，用来区分「扫描没跑」和「解压/解析没出数」。
-        let probe = { file: '', lines: 0, calls: 0, error: '' }
+        let probe = { file: '', lines: 0, calls: 0, code: '', error: '' }
         const firstFile = listSessionFiles(sessions)[0]
         if (firstFile) {
           const label = sessionIdOf(firstFile)
           try {
             const parsed = await parseSessionFile(firstFile, { timeZone })
-            probe = { file: label, lines: parsed.lines ?? 0, calls: parsed.calls ?? 0, error: parsed.error ?? '' }
+            probe = {
+              file: label,
+              lines: parsed.lines ?? 0,
+              calls: parsed.calls ?? 0,
+              code: parsed.error ? 'USAGE_PARSE_FAILED' : '',
+              error: parsed.error ?? '',
+            }
           } catch (error) {
-            probe = { file: label, lines: 0, calls: 0, error: error instanceof Error ? error.message : String(error) }
+            probe = {
+              file: label,
+              lines: 0,
+              calls: 0,
+              code: 'USAGE_PARSE_FAILED',
+              error: error instanceof Error ? error.message : String(error),
+            }
           }
         }
         const files = Object.values(state.files)
         return {
+          ready,
+          unavailableReason: reasons.join('；'),
           sessionsRoot: sessions,
           storeDir,
           storeFile,
@@ -616,7 +652,7 @@ export function apply(ctx, config) {
           indexedFiles: files.length,
           totalCalls: Math.round(files.reduce((sum, entry) => sum + (entry?.calls ?? 0), 0)),
           lastScanAt: typeof state.lastScanAt === 'string' ? state.lastScanAt : '',
-          pricesConfigured: Boolean(prices),
+          pricesConfigured,
           currency,
           timeZone: timeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone ?? '',
           models: [

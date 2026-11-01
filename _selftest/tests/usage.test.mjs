@@ -3,7 +3,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { zstdCompressSync } from 'node:zlib'
-import { dayOf, sessionIdOf, listSessionFiles, parseSessionFile, priceFor, costOf, decompressSessionBuffer } from '../../dsh-usage/index.js'
+import { dayOf, sessionIdOf, listSessionFiles, parseSessionFile, priceFor, costOf, decompressSessionBuffer, apply } from '../../dsh-usage/index.js'
+import { makeMockContext } from '../plugin-smoke.mjs'
 
 let passed = 0
 const ok = (label) => {
@@ -141,6 +142,33 @@ try {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+}
+
+// ---- 契约（统一规格 2026-11-01）：status 报 ready，探针错误给稳定 code ----
+// 只验 schema + render，不跑 execute（execute 会真扫会话日志，测试不该依赖本机盘面）。
+{
+  const storeDir = mkdtempSync(join(tmpdir(), 'dsh-usage-store-'))
+  const { ctx, registered } = makeMockContext()
+  apply(ctx, { storeDir })
+  const status = registered.find((definition) => definition.name === 'usage_status')
+  assert.ok(status, 'usage_status 必须注册')
+  assert.ok(status.output.schema.required.includes('ready'), 'status schema 必须含 ready')
+  assert.ok(status.output.schema.required.includes('unavailableReason'), 'status schema 必须含 unavailableReason')
+  assert.ok(status.output.schema.properties.probe.required.includes('code'), '探针错误必须有稳定 code')
+
+  const sample = {
+    ready: false,
+    unavailableReason: '未配置价格表（只能报 token，不报成本）',
+    sessionsRoot: '/x',
+    storeFile: '/y',
+    models: [],
+    diagnostics: { node: '24', electron: '44', zstd: 'sync-available' },
+    probe: { file: 's1', lines: 0, calls: 0, code: 'USAGE_PARSE_FAILED', error: 'boom' },
+  }
+  const blocks = status.output.render({}, sample)
+  assert.ok(blocks[0].text.includes('不可用：未配置价格表'), `render 要显示「不可用：<reason>」，实际：${blocks[0].text}`)
+  rmSync(storeDir, { recursive: true, force: true })
+  ok('契约：usage_status 带 ready/unavailableReason，探针错误带 code')
 }
 
 console.log(`usage: ${passed} 项通过`)

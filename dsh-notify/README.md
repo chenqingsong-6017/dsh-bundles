@@ -61,6 +61,17 @@ The property 'InnerText' cannot be found on this object.
 | `notify` | 立刻给人类发一条通知（长任务中途汇报、请求关注） |
 | `notify_status` | 诊断：可用通道、最近实际通道、触发阈值、发送计数、日志位置、最近错误 |
 
+## 契约（2026-11-01 统一规格）
+
+| 字段 | 在哪 | 含义 |
+|---|---|---|
+| `ready` | `notify_status` | 桌面通知能不能真的弹出来。判据就是既有的 `toastAvailable`（`win32 && subprocess` 服务） |
+| `unavailableReason` | `notify_status` | `ready=false` 时的具体原因（「非 Windows 或无 subprocess 服务，通知只能落日志」）；就绪时为空串 |
+| `code` | `notify` | 失败时的**稳定错误码**：成功 `''`，失败 `NOTIFY_TRANSPORT_UNAVAILABLE`。脚本按码命中，不用正则匹配自然语言 |
+
+`notify_status` 的 render 在 `ready=false` 时首行显示 `不可用：<reason>`（`ready=true` 时显示 `状态：就绪`）。
+注意 `ready=false` ≠ 插件坏了：通知仍会写日志，只是不会弹窗。
+
 ## 配置
 
 ```yaml
@@ -105,6 +116,15 @@ plugin_manager remove_bundle   target = @local/dsh-notify
 | 失败检测 | 用 pwsh 7 发时正确返回失败（退出码 2），而不是假装成功 ✅ |
 | schema | `schema-check.mjs` 2 个工具 PASS ✅ |
 | 数据落盘 | `D:\AI\dsh-data\notify\`，C 盘无残留 ✅ |
+
+## 验证记录（2026-11-01，统一契约）
+
+| 项 | 结果 |
+|---|---|
+| 单测 | `_selftest/tests/notify.test.mjs` **8 项全过**（新增契约断言：`notify_status` required 含 `ready`/`unavailableReason`、不可用分支 render 出现「不可用：」、`notify` required 含 `code`）✅ |
+| schema | `_selftest/schema-check.mjs`：`notify` / `notify_status` 均 PASS ✅ |
+| 同构 | 一次性脚本真跑 `execute()` 核对「返回键 == schema keys」：两工具全过（`notify` 返回 `code=""`；`notify_status` 在无 subprocess 的假 ctx 下如实报 `ready=false` + 原因）✅ |
+| 真机 | **未做**：运行中的进程还没重载本插件行，`ready` 在真机的取值要等 profile 重组后再确认（`node --check` 与单测不能替代这一步）⏳ |
 
 ## 剩下的边界
 

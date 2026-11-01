@@ -27,7 +27,18 @@ DSH 把每个会话的完整事件流压缩存在：
 | 工具 | 作用 |
 |---|---|
 | `usage_report` | `range`（today / 7d / 30d / all）× `groupBy`（day / model / session）出报表，含总计；配了价格则带成本 |
-| `usage_status` | 诊断：索引存在哪、索引了多少会话文件/调用、最后扫描时间、价格表是否配置、运行时版本，以及对第一个会话文件的**实时探针**（lines / calls / error） |
+| `usage_status` | 诊断：`ready` / `unavailableReason`、索引存在哪、索引了多少会话文件/调用、最后扫描时间、价格表是否配置、运行时版本，以及对第一个会话文件的**实时探针**（lines / calls / code / error） |
+
+## 契约（2026-11-01 统一规格）
+
+| 字段 | 含义 |
+|---|---|
+| `ready` | 能不能给出**完整**报表：价格表已配置 **且** 会话日志根目录可读（只查配置与可读性，不发网络） |
+| `unavailableReason` | `ready=false` 时的原因，逐条用「；」列出（如「未配置价格表（只能报 token，不报成本）」）；就绪时为空串 |
+| `probe.code` | 探针的稳定错误码：正常 `''`，解压/解析失败 `USAGE_PARSE_FAILED`（细节仍在 `probe.error`） |
+
+`usage_status` 的 render 在 `ready=false` 时首行显示 `不可用：<reason>`（`ready=true` 时显示 `状态：就绪`）。
+`ready=false` 只代表「有一块能力现在给不出」，`usage_report` 本身照样能跑（没价格表就只报 token）。
 
 ## 配置
 
@@ -71,6 +82,15 @@ plugin_manager remove_bundle   target = @local/dsh-usage
 | 增量 | 第二次调用不重扫（指纹未变），索引文件 mtime 不变 ✅ |
 | 数据落盘 | `D:\AI\dsh-data\usage\usage.json`，C 盘无残留 ✅ |
 | schema | `schema-check.mjs` 2 个工具 PASS ✅ |
+
+## 验证记录（2026-11-01，统一契约）
+
+| 项 | 结果 |
+|---|---|
+| 单测 | `_selftest/tests/usage.test.mjs` **9 项全过**（新增契约断言：`usage_status` required 含 `ready`/`unavailableReason`、`probe` required 含 `code`、不可用分支 render 出现「不可用：」）✅ |
+| schema | `_selftest/schema-check.mjs`：`usage_report` / `usage_status` PASS ✅ |
+| 同构 | 一次性脚本真跑 `execute()`（本机真实数据）：`ready=true`、`unavailableReason=""`、返回键与 schema 严格同构 ✅ |
+| 真机 | **未做**：运行中的进程还没重载本插件行，工具面里的 `ready` 要等 profile 重组后再确认 ⏳ |
 
 ## 踩过的坑（重要）
 

@@ -352,12 +352,13 @@ export function apply(ctx, config) {
           type: 'object',
           properties: {
             sent: { type: 'boolean' },
+            code: { type: 'string' },
             transport: { type: 'string' },
             title: { type: 'string' },
             body: { type: 'string' },
             lastError: { type: 'string' },
           },
-          required: ['sent', 'transport', 'title', 'body', 'lastError'],
+          required: ['sent', 'code', 'transport', 'title', 'body', 'lastError'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -371,7 +372,7 @@ export function apply(ctx, config) {
             text(
               value?.sent
                 ? `已发送${label}：${value?.title ?? ''}\n${value?.body ?? ''}`
-                : `发送失败（${label}）：${value?.lastError || '未知原因'}`,
+                : `发送失败（${label}）${value?.code ? `[${value.code}] ` : ''}：${value?.lastError || '未知原因'}`,
             ),
           ]
         },
@@ -383,6 +384,8 @@ export function apply(ctx, config) {
         const ok = transport !== 'log' || !canToast
         return {
           sent: ok,
+          // 稳定错误码：脚本按 code 命中，不用去正则匹配自然语言。
+          code: ok ? '' : 'NOTIFY_TRANSPORT_UNAVAILABLE',
           transport,
           title,
           body,
@@ -403,6 +406,8 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
             transport: { type: 'string' },
             toastAvailable: { type: 'boolean' },
             minDurationMs: { type: 'integer' },
@@ -420,6 +425,8 @@ export function apply(ctx, config) {
             lastError: { type: 'string' },
           },
           required: [
+            'ready',
+            'unavailableReason',
             'transport',
             'toastAvailable',
             'minDurationMs',
@@ -445,6 +452,9 @@ export function apply(ctx, config) {
           return [
             text(
               [
+                value?.ready === true
+                  ? '状态：就绪（桌面通知通道可用）'
+                  : `不可用：${value?.unavailableReason || '未知原因'}`,
                 `通知通道：${value?.toastAvailable ? '可用（5.1 Toast → WinForms 气泡 回退）' : '仅日志（非 Windows 或无 subprocess）'}`,
                 `最近实际通道：${channel}`,
                 `触发：完成(≥${Math.round(num(value?.minDurationMs) / 1000)}s)=${value?.notifyOnComplete ? '开' : '关'} · 失败=${value?.notifyOnError ? '开' : '关'} · 中断=${value?.notifyOnInterrupt ? '开' : '关'}`,
@@ -478,8 +488,12 @@ export function apply(ctx, config) {
             }
           }
         }
+        // 判据就是既有的 toastAvailable：拿不到 WinRT Toast 通道时通知仍会写日志，但契约要如实说「不可用」。
+        const ready = canToast
         return {
-          transport: canToast ? 'toast' : 'log',
+          ready,
+          unavailableReason: ready ? '' : '非 Windows 或无 subprocess 服务，通知只能落日志（不会弹窗）',
+          transport: ready ? 'toast' : 'log',
           toastAvailable: canToast,
           minDurationMs,
           notifyOnComplete,

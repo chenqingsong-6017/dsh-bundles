@@ -9,3 +9,7 @@
         mode: launch
         headless: false
         executablePath: 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+    # 诊断行：本 bundle 自己的宿主半体（index.js），只提供 browser_status —— 报挂载状态，
+    # 不注册任何浏览器工具、不改上面两行的行为。挂载失败时它也照样加载，好让工具面能回答「为什么不可用」。
+    - id: browser-status
+      name: '@local/dsh-browser-bundle'
