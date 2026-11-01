@@ -66,4 +66,28 @@ const ok = (label) => { passed += 1; console.log('  ✓ ' + label) }
   ok('输入形态兼容与空输入')
 }
 
+// CLI 层 fail-safe（postmortem 0002）：空会话目录不得写 0 基线——0 样本会被误读成「错误率 0%」。
+{
+  const { spawnSync } = await import('node:child_process')
+  const { mkdtempSync, mkdirSync, existsSync } = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const cli = fileURLToPath(new URL('../metrics/tool-error-rate.mjs', import.meta.url))
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'metrics-empty-'))
+  const emptyHome = path.join(dir, 'home')
+  const outDir = path.join(dir, 'out')
+  mkdirSync(emptyHome, { recursive: true })
+  mkdirSync(outDir, { recursive: true })
+  const r = spawnSync(process.execPath, [cli, '--days', '30'], {
+    encoding: 'utf8',
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_HOME: emptyHome, DSH_METRICS_DIR: outDir },
+    timeout: 60000,
+  })
+  const out = (r.stdout || '') + (r.stderr || '')
+  assert.equal(r.status, 2, '空会话应 exit 2：' + out)
+  assert.match(out, /拒绝写空基线/)
+  assert.equal(existsSync(path.join(outDir, 'tool-error-rate-baseline.json')), false, '空基线不得落盘')
+  ok('空会话目录 → 拒绝写 0 基线')
+}
 console.log('metrics-stability: ' + passed + ' 组通过')
