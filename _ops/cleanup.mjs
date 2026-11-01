@@ -17,7 +17,8 @@
  *
  * 红线：D:\AI-date\workbuddy-date\学习 是用户的学习资料仓库，永不触碰。
  */
-import { existsSync, readdirSync, statSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, statSync, rmSync, lstatSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import path from 'node:path'
 
 const argv = process.argv.slice(2)
@@ -305,14 +306,52 @@ if (toDelete.length === 0) {
 
 let failed = 0
 let freed = 0
-for (const item of toDelete) {
+
+/**
+ * 删除一项：目录 → `cmd /c rmdir /s /q <绝对路径>`，文件 → 非递归 rmSync。
+ *
+ * 为什么目录不用 Node 的 rmSync({ recursive: true })：目录里若含 junction / 符号链接，
+ * 递归 API 可能顺着 reparse point 删到链接目标——插件仓源码正被 profile 里的 junction
+ * 指着（AGENTS.md 的规定：删带 junction / 符号链接的目录，只用 cmd /c rmdir /s /q）。
+ * rmdir 只处理目录项本身，不把链接目标当内容删。
+ *
+ * 返回 { ok, kind: 'dir' | 'file', error? }，让调用方区分「目录删失败」与「文件删失败」。
+ */
+function removeTarget(target) {
+  let st
   try {
-    rmSync(item.target, { recursive: true, force: true })
-    freed += item.bytes
+    st = lstatSync(target) // 用 lstat 判断这一项是目录还是文件（不跟随链接目标）
   } catch (error) {
-    failed += 1
-    console.error('删除失败: ' + item.target + ' —— ' + error.message)
+    return { ok: false, kind: 'file', error }
   }
+  if (!st.isDirectory()) {
+    try {
+      rmSync(target, { force: true }) // 非递归：只删文件；force 保留原来「不存在也不报错」的语义
+      return { ok: true, kind: 'file' }
+    } catch (error) {
+      return { ok: false, kind: 'file', error }
+    }
+  }
+  const res = spawnSync('cmd.exe', ['/c', 'rmdir', '/s', '/q', path.resolve(target)], {
+    windowsHide: true,
+    encoding: 'utf8',
+  })
+  if (!res.error && res.status === 0) return { ok: true, kind: 'dir' }
+  const message = res.error
+    ? res.error.message
+    : (res.stderr || res.stdout || '').trim() || 'rmdir 退出码 ' + res.status
+  return { ok: false, kind: 'dir', error: new Error(message) }
+}
+
+for (const item of toDelete) {
+  const result = removeTarget(item.target)
+  if (result.ok) {
+    freed += item.bytes
+    continue
+  }
+  failed += 1
+  const label = result.kind === 'dir' ? '目录删失败' : '文件删失败'
+  console.error(label + ': ' + item.target + ' —— ' + result.error.message)
 }
 console.log('')
 console.log('已删除 ' + (toDelete.length - failed) + ' 项（免审 ' + freeItems.length + ' + 点名 ' + uniqApproved.length + '），释放 ' + mb(freed) + ' MB')
