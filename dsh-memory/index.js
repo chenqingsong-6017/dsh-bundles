@@ -412,6 +412,12 @@ export function collectRuleFiles(cwd) {
 const MEMORY_HEADER =
   '以下是跨会话记住的用户/项目事实（越靠后越新）。把它们当背景，不要逐条复述；与用户本轮明确指令冲突时，以本轮指令为准。'
 
+/** 统一错误契约：所有抛出的错误都带 code（UPPER_SNAKE），调用方据此分支，不必解析中文文案。 */
+function fail(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
 const text = (value) => ({ type: 'text', text: value })
 
 function storeLocation(overrideDir) {
@@ -539,7 +545,7 @@ export function normalizeScope(value) {
   if (scope === '') return ''
   if (scope === 'global') return 'global'
   if (!SCOPE_SLUG.test(scope)) {
-    throw new Error('scope 只能是 global 或小写 slug（a-z 开头，可含数字与连字符），收到：' + String(value))
+    throw fail('MEMORY_SCOPE_INVALID', 'scope 只能是 global 或小写 slug（a-z 开头，可含数字与连字符），收到：' + String(value))
   }
   return scope
 }
@@ -1751,7 +1757,7 @@ export function apply(ctx, config) {
 
   const requireWritable = () => {
     if (storeHealth !== 'corrupt') return
-    throw new Error(
+    throw fail('MEMORY_STORE_CORRUPT', 
       `记忆库损坏保护中：原文件已另存为 ${corruptCopy || storeFile}。人工确认修复（把合法 JSON 改名回 ${storeFile}）并重载插件前，拒绝写入。`,
     )
   }
@@ -1949,7 +1955,7 @@ export function apply(ctx, config) {
       } catch (error) {
         // 临时文件清不掉就留着，下次覆盖
       }
-      throw new Error(`归档写入失败（${lastError?.message ?? 'rename failed'}）：${path.basename(targetFile)}`)
+      throw fail('MEMORY_ARCHIVE_WRITE_FAILED', `归档写入失败（${lastError?.message ?? 'rename failed'}）：${path.basename(targetFile)}`)
     }
   }
 
@@ -1963,7 +1969,7 @@ export function apply(ctx, config) {
     }
     const parsed = JSON.parse(raw)
     if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) {
-      throw new Error('store shape is not {entries: []}')
+      throw fail('MEMORY_STORE_SHAPE_INVALID', 'store shape is not {entries: []}')
     }
     const rawEntries = parsed.entries
     const kept = rawEntries
@@ -2095,7 +2101,7 @@ export function apply(ctx, config) {
           continue
         }
         if (Date.now() > deadline) {
-          throw new Error('另一个 DSH 进程正在写记忆（memory.json.lock 被占），等它写完重试一次即可。')
+          throw fail('MEMORY_STORE_LOCKED', '另一个 DSH 进程正在写记忆（memory.json.lock 被占），等它写完重试一次即可。')
         }
         sleepSync(25)
       }
@@ -2154,7 +2160,7 @@ export function apply(ctx, config) {
           // 临时文件清不掉就留着，下次覆盖
         }
         storeHealth = 'readonly'
-        throw new Error(
+        throw fail('MEMORY_STORE_WRITE_FAILED', 
           `记忆落盘失败（${lastError?.message ?? 'rename failed'}）。本次写入没有生效，别当成已保存；先用 memory_list 确认，修好磁盘/权限后重载插件。`,
         )
       }
@@ -2166,7 +2172,7 @@ export function apply(ctx, config) {
     } catch (error) {
       if (error instanceof Error && (error.message.startsWith('记忆落盘失败') || error.message.includes('memory.json.lock'))) throw error
       storeHealth = 'readonly'
-      throw new Error(`记忆落盘失败（${error?.message ?? 'unknown'}）。本次写入没有生效，别当成已保存。`)
+      throw fail('MEMORY_STORE_WRITE_FAILED', `记忆落盘失败（${error?.message ?? 'unknown'}）。本次写入没有生效，别当成已保存。`)
     } finally {
       releaseLock()
     }
@@ -2182,7 +2188,7 @@ export function apply(ctx, config) {
     try {
       const parsed = JSON.parse(raw)
       if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) {
-        throw new Error('store shape is not {entries: []}')
+        throw fail('MEMORY_STORE_SHAPE_INVALID', 'store shape is not {entries: []}')
       }
       const entries = parsed.entries
       const kept = entries
@@ -2631,7 +2637,7 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         const query = typeof args?.query === 'string' ? args.query.trim() : ''
-        if (query === '') throw new Error('memory_search 需要 query。')
+        if (query === '') throw fail('MEMORY_ARG_MISSING', 'memory_search 需要 query。')
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 20) : 5
         // v2.7：query 里出现 m\d+ 就按 id 直取。注入块一直写着「用 memory_search 按 id 取全文」，
         // 但 BM25 不认 id——实测搜 m33 命中 0/63。文档与实现不一致，这里补上。
@@ -2824,20 +2830,20 @@ export function apply(ctx, config) {
         requireWritable()
         refreshBeforeWrite()
         const raw = typeof args?.text === 'string' ? args.text.trim() : ''
-        if (raw === '') throw new Error('memory_add 需要 text。')
+        if (raw === '') throw fail('MEMORY_ARG_MISSING', 'memory_add 需要 text。')
         if (raw.length > MAX_TEXT_CHARS) {
-          throw new Error(`单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${raw.length}。请拆成多条或精简。`)
+          throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${raw.length}。请拆成多条或精简。`)
         }
         if (args?.status !== undefined && !MEMORY_STATUS.has(args.status)) {
-          throw new Error('status 只能是 draft | stable | deprecated，收到：' + String(args.status))
+          throw fail('MEMORY_ARG_INVALID', 'status 只能是 draft | stable | deprecated，收到：' + String(args.status))
         }
         if (args?.staleAfter !== undefined && args.staleAfter !== '' && !DATE_ONLY.test(String(args.staleAfter))) {
-          throw new Error('staleAfter 需要 YYYY-MM-DD 格式。')
+          throw fail('MEMORY_DATE_INVALID', 'staleAfter 需要 YYYY-MM-DD 格式。')
         }
         if (args?.invalidAt !== undefined && args.invalidAt !== '') {
           const rawInvalid = String(args.invalidAt)
           if (!DATE_ONLY.test(rawInvalid) && Number.isNaN(Date.parse(rawInvalid))) {
-            throw new Error('invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
+            throw fail('MEMORY_DATE_INVALID', 'invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
           }
         }
         // v4.0：scope 收敛（global 或小写 slug）。早失败好过再攒出 8 种混用取值。
@@ -2910,7 +2916,7 @@ export function apply(ctx, config) {
               .filter((entry) => entry.pinned !== true && (entry.usedCount ?? 0) === 0 && entry.kind !== 'rule' && entry.status !== 'draft')
               .map((entry) => entry.id)
               .slice(0, 10)
-            throw new Error(
+            throw fail('MEMORY_BUDGET_EXCEEDED', 
               `记忆已占用 ${usedChars()} / ${maxBytes} 字符，归档腾地方后仍不够（需 ${raw.length} 字符）。` +
                 (candidates.length > 0
                   ? `可归档候选（从未用过、非规则）：${candidates.join(' ')}。用 memory_remove 精确删，或 memory_update 精简长条目。`
@@ -2966,7 +2972,7 @@ export function apply(ctx, config) {
         const resolvedConflict =
           conflict ?? (args?.supersede === true && duplicate ? { entry: duplicate, similarity: 1 } : undefined)
         if (resolvedConflict && args?.supersede !== true && args?.allowDuplicate !== true && args?.status !== 'draft') {
-          throw new Error(
+          throw fail('MEMORY_CONFLICT', 
             '写入冲突：与 ' +
               resolvedConflict.entry.id +
               ' 相似度 ' +
@@ -3092,14 +3098,14 @@ export function apply(ctx, config) {
         refreshBeforeWrite()
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
         const next = typeof args?.text === 'string' ? args.text.trim() : ''
-        if (id === '') throw new Error('memory_update 需要 id。')
-        if (next === '') throw new Error('memory_update 需要新的 text；要删除请用 memory_remove。')
-        if (next.length > MAX_TEXT_CHARS) throw new Error(`单条记忆最多 ${MAX_TEXT_CHARS} 字符。`)
+        if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要 id。')
+        if (next === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要新的 text；要删除请用 memory_remove。')
+        if (next.length > MAX_TEXT_CHARS) throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符。`)
         const entry = state.entries.find((item) => item.id === id)
-        if (!entry) throw new Error(`没有这条记忆：${id}。先用 memory_list 查看。`)
+        if (!entry) throw fail('MEMORY_ID_NOT_FOUND', `没有这条记忆：${id}。先用 memory_list 查看。`)
         const projected = usedChars() - entry.text.length + next.length
         if (projected > maxBytes) {
-          throw new Error(`更新后会到 ${projected} / ${maxBytes} 字符，超预算。请精简或先删掉别的条目。`)
+          throw fail('MEMORY_BUDGET_EXCEEDED', `更新后会到 ${projected} / ${maxBytes} 字符，超预算。请精简或先删掉别的条目。`)
         }
         if (args?.supersede === true) {
           // 时序失效（Graphiti 式）：新条目生效，旧条目留档不删、不再注入。
@@ -3155,10 +3161,10 @@ export function apply(ctx, config) {
         }
         if (Number.isFinite(args?.importance)) entry.importance = Math.max(1, Math.min(10, Math.round(args.importance)))
         if (typeof args?.status === 'string' && !MEMORY_STATUS.has(args.status)) {
-          throw new Error('status 只能是 draft | stable | deprecated，收到：' + String(args.status))
+          throw fail('MEMORY_ARG_INVALID', 'status 只能是 draft | stable | deprecated，收到：' + String(args.status))
         }
         if (typeof args?.staleAfter === 'string' && args.staleAfter !== '' && !DATE_ONLY.test(args.staleAfter)) {
-          throw new Error('staleAfter 需要 YYYY-MM-DD（空串表示清除）。')
+          throw fail('MEMORY_DATE_INVALID', 'staleAfter 需要 YYYY-MM-DD（空串表示清除）。')
         }
         applyEntryFlags(entry, args)
         if (typeof args?.status === 'string') entry.status = args.status
@@ -3182,7 +3188,7 @@ export function apply(ctx, config) {
           else {
             const rawInvalid = args.invalidAt.trim()
             if (!DATE_ONLY.test(rawInvalid) && Number.isNaN(Date.parse(rawInvalid))) {
-              throw new Error('invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
+              throw fail('MEMORY_DATE_INVALID', 'invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
             }
             entry.invalidAt = rawInvalid
           }
@@ -3237,7 +3243,7 @@ export function apply(ctx, config) {
         requireWritable()
         refreshBeforeWrite()
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (id === '') throw new Error('memory_remove 需要 id。')
+        if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_remove 需要 id。')
         const before = state.entries.length
         state.entries = state.entries.filter((entry) => entry.id !== id)
         const removed = state.entries.length !== before
@@ -3283,7 +3289,7 @@ export function apply(ctx, config) {
         requireWritable()
         refreshBeforeWrite()
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
-        if (id === '') throw new Error('memory_restore 需要 id。')
+        if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_restore 需要 id。')
         const entry = state.entries.find((item) => item.id === id)
         if (!entry) {
           return { id, restored: false, reason: 'missing', usedChars: usedChars(), total: state.entries.length }
@@ -3292,10 +3298,10 @@ export function apply(ctx, config) {
           return { id, restored: false, reason: 'not-archived', usedChars: usedChars(), total: state.entries.length }
         }
         if (typeof entry.supersededBy === 'string' && entry.supersededBy !== '') {
-          throw new Error(`${id} 已被 ${entry.supersededBy} 取代，不能直接恢复（会同时存在两个版本）。要保留内容请用 memory_add 重写一条。`)
+          throw fail('MEMORY_SUPERSEDED', `${id} 已被 ${entry.supersededBy} 取代，不能直接恢复（会同时存在两个版本）。要保留内容请用 memory_add 重写一条。`)
         }
         if (usedChars() + entry.text.length > maxBytes) {
-          throw new Error(
+          throw fail('MEMORY_BUDGET_EXCEEDED', 
             `恢复后会到 ${usedChars() + entry.text.length} / ${maxBytes} 字符，超预算。先用 memory_remove 删掉别的，或调大 maxBytes。`,
           )
         }
@@ -3441,7 +3447,7 @@ export function apply(ctx, config) {
           return { purged: 0, remaining: state.entries.length, usedChars: usedChars(), ids: [], reason: 'no-archived' }
         }
         if (args?.confirm !== true) {
-          throw new Error(
+          throw fail('MEMORY_CONFIRM_REQUIRED', 
             `memory_purge 会**永久删除** ${targets.length} 条归档条目（不是归档，删了不可恢复）。确认后用 ${targets.length} 条 id 或 confirm:true 重试；先 memory_list({includeArchived:true}) 看一眼。`,
           )
         }
@@ -3495,20 +3501,20 @@ export function apply(ctx, config) {
         refreshBeforeWrite()
         // v3.9：先把重复 id 去掉再判「至少两个」。原来 [m1, m1] 能通过校验，把同一条合并两次（B16）。
         const ids = [...new Set(Array.isArray(args?.ids) ? args.ids.filter((id) => typeof id === 'string' && id !== '') : [])]
-        if (ids.length < 2) throw new Error('memory_merge 需要至少两个不同的 id。')
+        if (ids.length < 2) throw fail('MEMORY_ARG_INVALID', 'memory_merge 需要至少两个不同的 id。')
         const sources = ids.map((id) => state.entries.find((item) => item.id === id && isActive(item)))
-        if (sources.some((entry) => entry === undefined)) throw new Error('有 id 不存在或已失效，先用 memory_list 确认。')
+        if (sources.some((entry) => entry === undefined)) throw fail('MEMORY_ID_NOT_FOUND', '有 id 不存在或已失效，先用 memory_list 确认。')
         const first = sources[0]
         const mergedText =
           typeof args?.text === 'string' && args.text.trim() !== ''
             ? args.text.trim()
             : sources.map((entry) => entry.text.trim()).join('；')
         if (mergedText.length > MAX_TEXT_CHARS) {
-          throw new Error(`合并后最多 ${MAX_TEXT_CHARS} 字符（当前 ${mergedText.length}），请精简。`)
+          throw fail('MEMORY_TEXT_TOO_LONG', `合并后最多 ${MAX_TEXT_CHARS} 字符（当前 ${mergedText.length}），请精简。`)
         }
         const freed = sources.reduce((sum, entry) => sum + entry.text.length, 0)
         if (usedChars() - freed + mergedText.length > maxBytes) {
-          throw new Error(`合并后超预算（上限 ${maxBytes} 字符）。请先精简或删掉别的条目。`)
+          throw fail('MEMORY_BUDGET_EXCEEDED', `合并后超预算（上限 ${maxBytes} 字符）。请先精简或删掉别的条目。`)
         }
         const now = new Date().toISOString()
         // 别名继承：合并时把各来源的别名并起来，否则每合并一次「桥」就淡一次（v3.6 发现的稀疏化根因）。
@@ -3938,7 +3944,7 @@ export function apply(ctx, config) {
         // 没有工作区上下文（测试 / 无 cwd 会话）时不扫规则文件 —— 否则会把全局 AGENTS.md 也灌进候选池。
         if (!captureRuleFiles) return
         try {
-          if (lastKnownCwd === '') throw new Error('no-cwd')
+          if (lastKnownCwd === '') throw fail('MEMORY_CWD_UNAVAILABLE', 'no-cwd')
           const taken = new Set()
           for (const entry of state.entries) taken.add(entry.text)
           for (const item of candidates.items ?? []) taken.add(item.text)
@@ -4126,14 +4132,14 @@ export function apply(ctx, config) {
         if (action === 'accept' || action === 'reject') {
           const id = typeof args?.id === 'string' ? args.id.trim() : ''
           const item = candidates.items.find((entry) => entry.id === id && entry.status === 'pending')
-          if (item === undefined) throw new Error(`没有待确认的候选：${id}。先用 memory_candidates 查看。`)
+          if (item === undefined) throw fail('MEMORY_CANDIDATE_NOT_FOUND', `没有待确认的候选：${id}。先用 memory_candidates 查看。`)
           if (action === 'reject') {
             item.status = 'rejected'
             persistCandidates()
             return { action, pending: pendingCandidates().length, item: slim(item) }
           }
           if (usedChars() + item.text.length > maxBytes) {
-            throw new Error(`记忆已占用 ${usedChars()} / ${maxBytes} 字符，先清理过时条目再接受。`)
+            throw fail('MEMORY_BUDGET_EXCEEDED', `记忆已占用 ${usedChars()} / ${maxBytes} 字符，先清理过时条目再接受。`)
           }
           const now = new Date().toISOString()
           const entry = normalizeEntry({
@@ -4153,6 +4159,154 @@ export function apply(ctx, config) {
           return { action, pending: pendingCandidates().length, item: slim(item) }
         }
         return { action: 'list', pending: pendingCandidates().length, items: pendingCandidates().map(slim) }
+      },
+    }),
+  )
+
+  // ---- memory_status：ready 是真实探测（损坏保护 / 只读降级 / 主库可解析 / 数据目录可写）----
+  const probeStoreWritable = () => {
+    try {
+      if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true })
+    } catch (error) {
+      return { ok: false, reason: '记忆目录无法创建：' + (error?.message ?? 'unknown') }
+    }
+    // accessSync(W_OK) 在 Windows 上对目录太宽松，写一个探针文件再删掉才是真检查。
+    const probe = path.join(storeDir, '.status-probe-' + process.pid)
+    try {
+      writeFileSync(probe, 'ok', 'utf8')
+      unlinkSync(probe)
+      return { ok: true, reason: '' }
+    } catch (error) {
+      try {
+        unlinkSync(probe)
+      } catch (inner) {
+        // 探针文件删不掉就留着，下次覆盖
+      }
+      return { ok: false, reason: '记忆目录不可写：' + (error?.message ?? 'unknown') }
+    }
+  }
+
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_status',
+      description:
+        'Read-only health of the persistent memory store: whether it can be read and written right now, where the files are, how much of the budget is used, plus any corruption/read-only protection or config warning. Use it when a memory tool fails or a write seems not to persist.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
+            code: { type: 'string' },
+            storeDir: { type: 'string' },
+            storeFile: { type: 'string' },
+            storeExists: { type: 'boolean' },
+            storeBytes: { type: 'integer' },
+            storeWritable: { type: 'boolean' },
+            health: { type: 'string' },
+            corruptCopy: { type: 'string' },
+            schemaVersion: { type: 'integer' },
+            entries: { type: 'integer' },
+            active: { type: 'integer' },
+            archived: { type: 'integer' },
+            usedChars: { type: 'integer' },
+            maxBytes: { type: 'integer' },
+            maxInjectChars: { type: 'integer' },
+            configWarning: { type: 'string' },
+          },
+          required: [
+            'ready',
+            'storeDir',
+            'storeFile',
+            'storeExists',
+            'storeWritable',
+            'health',
+            'entries',
+            'active',
+            'archived',
+            'usedChars',
+            'maxBytes',
+            'maxInjectChars',
+          ],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          if (value?.ready === false) return [text('不可用：' + (value?.unavailableReason || '未知原因'))]
+          return [
+            text(
+              `记忆库可用：${value?.active ?? 0} 条生效 / ${value?.archived ?? 0} 条归档，存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入预算 ${value?.maxInjectChars ?? 0} 字符，库文件 ${value?.storeFile ?? '?'}`,
+            ),
+          ]
+        },
+      },
+      async execute() {
+        const problems = []
+        let code = ''
+        const note = (nextCode, reason) => {
+          problems.push(reason)
+          if (code === '') code = nextCode
+        }
+
+        if (storeHealth === 'corrupt') {
+          note(
+            'MEMORY_STORE_CORRUPT',
+            '记忆库损坏保护中：原文件已另存为 ' +
+              (corruptCopy || storeFile) +
+              '，写入被禁用；人工把合法 JSON 改名回原路径并重载插件后才恢复',
+          )
+        }
+        if (storeHealth === 'readonly') {
+          note('MEMORY_STORE_READONLY', '记忆库上次落盘失败，已降级为只读；修好磁盘/权限后重载插件')
+        }
+        if (config?.storeDir !== undefined && (typeof config.storeDir !== 'string' || config.storeDir.trim() === '')) {
+          note('MEMORY_CONFIG_INVALID', '配置 storeDir 无效（需要非空字符串），已回落到默认目录')
+        }
+
+        let storeExists = false
+        let storeBytes = 0
+        try {
+          storeExists = existsSync(storeFile)
+          if (storeExists) storeBytes = statSync(storeFile).size
+        } catch (error) {
+          note('MEMORY_STORE_UNREADABLE', '读不到记忆库文件：' + (error?.message ?? 'unknown'))
+        }
+        if (storeExists) {
+          try {
+            const parsed = JSON.parse(readFileSync(storeFile, 'utf8'))
+            if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) {
+              note('MEMORY_STORE_SHAPE_INVALID', '记忆库文件形状不是 {entries: []}')
+            }
+          } catch (error) {
+            note('MEMORY_STORE_UNREADABLE', '记忆库文件读不出合法 JSON：' + (error?.message ?? 'unknown'))
+          }
+        }
+
+        const writable = probeStoreWritable()
+        if (!writable.ok) note('MEMORY_STORE_UNWRITABLE', writable.reason)
+
+        const ready = problems.length === 0
+        const active = activeEntries().length
+        return {
+          ready,
+          unavailableReason: problems.join('；'),
+          ...(ready ? {} : { code: code || 'MEMORY_STORE_UNREADABLE' }),
+          storeDir,
+          storeFile,
+          storeExists,
+          storeBytes,
+          storeWritable: writable.ok,
+          health: storeHealth,
+          ...(corruptCopy !== '' ? { corruptCopy } : {}),
+          schemaVersion: Number.isInteger(state.version) ? state.version : SCHEMA_VERSION,
+          entries: state.entries.length,
+          active,
+          archived: state.entries.length - active,
+          usedChars: usedChars(),
+          maxBytes,
+          maxInjectChars,
+          ...(configWarning !== '' ? { configWarning } : {}),
+        }
       },
     }),
   )

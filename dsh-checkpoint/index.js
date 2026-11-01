@@ -28,7 +28,7 @@
  *     出来的路径可能漏抓。
  */
 
-import { promises as fsp, writeFileSync, readFileSync, renameSync, mkdirSync, existsSync } from 'node:fs'
+import { promises as fsp, writeFileSync, readFileSync, renameSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
@@ -45,6 +45,31 @@ const DESTRUCTIVE =
   /\b(?:Remove-Item|del|erase|rmdir|rm|Move-Item|mv|ren|Rename-Item|Clear-Content|Set-Content|Add-Content|Out-File|truncate)\b|(?:^|[\s;&|])sed\s+(?:-\w+\s+)*-i\b|>>?\s*\S/i
 
 const text = (value) => ({ type: 'text', text: value })
+
+/** 错误契约：给抛出的错误挂机器可读 code（UPPER_SNAKE），人话消息原样保留 */
+function failure(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
+/** status 用：storeDir 真能写吗（建目录 + 写探针再删；不碰快照存档） */
+function probeStoreWritable(dir) {
+  try {
+    mkdirSync(dir, { recursive: true })
+    const probe = path.join(dir, `.write-probe-${process.pid}-${Date.now()}`)
+    writeFileSync(probe, 'ok', 'utf8')
+    try {
+      unlinkSync(probe)
+    } catch {
+      // 探针删不掉不影响「可写」判定
+    }
+    return { ready: true, reason: '' }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ready: false, reason: `storeDir 不可写：${dir}（${message}）` }
+  }
+}
 
 /** 路径归一化：Windows 大小写不敏感，统一分隔符 */
 function normalizePath(value) {
@@ -487,10 +512,10 @@ export function apply(ctx, config) {
   async function deleteFile(target, policy) {
     const osPath = typeof fs.processPath === 'function' ? fs.processPath(target) : String(target?.displayPath ?? '')
     if (policy && policy.mode === 'read-only') {
-      throw new Error('当前沙箱策略是 read-only，拒绝删除文件。')
+      throw failure('SANDBOX_READ_ONLY', '当前沙箱策略是 read-only，拒绝删除文件。')
     }
     if (policy && policy.mode === 'workspace-write' && !isInside(policy.workspaceRoot, osPath)) {
-      throw new Error(`目标不在工作区内，拒绝删除：${osPath}`)
+      throw failure('OUTSIDE_WORKSPACE', `目标不在工作区内，拒绝删除：${osPath}`)
     }
     try {
       await fsp.unlink(osPath)
@@ -674,10 +699,11 @@ export function apply(ctx, config) {
         const all = args?.all === true
         const wanted = typeof args?.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
         if (!all && wanted === undefined) {
-          throw new Error('checkpoint_restore 需要 path（回滚单个目标），或传 all: true + confirm: true（回滚全部）。')
+          throw failure('MISSING_TARGET', 'checkpoint_restore 需要 path（回滚单个目标），或传 all: true + confirm: true（回滚全部）。')
         }
         if (all && args?.confirm !== true) {
-          throw new Error(
+          throw failure(
+            'CONFIRM_REQUIRED',
             `回滚全部（all: true）会重写/删除当前全部 ${records.size} 个快照目标，其中可能包含正在运行的插件源码。先看影响范围请用 checkpoint_diff 的 all: true；确认要回滚请显式传 confirm: true。只想丢弃快照、不动文件，用 checkpoint_forget。`,
           )
         }
@@ -686,7 +712,7 @@ export function apply(ctx, config) {
         if (!all) {
           targets = targets.filter(([, record]) => pathMatches(record.path, wanted))
           if (targets.length === 0) {
-            throw new Error(`没有匹配到快照：${wanted}。先用 checkpoint_list 查看可回滚的目标。`)
+            throw failure('NOT_FOUND', `没有匹配到快照：${wanted}。先用 checkpoint_list 查看可回滚的目标。`)
           }
         }
 
@@ -762,7 +788,7 @@ export function apply(ctx, config) {
         const all = args?.all === true
         const wanted = typeof args?.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
         if (!all && wanted === undefined) {
-          throw new Error('checkpoint_forget 需要 path（丢弃单个目标），或传 all: true（丢弃全部）。')
+          throw failure('MISSING_TARGET', 'checkpoint_forget 需要 path（丢弃单个目标），或传 all: true（丢弃全部）。')
         }
         const forgotten = []
         for (const [key, record] of [...records.entries()]) {
@@ -851,7 +877,8 @@ export function apply(ctx, config) {
         const sessionId = rawSession !== '' ? rawSession : undefined
         const olderThanDays = args?.olderThanDays
         if (sessionId === undefined && olderThanDays === undefined) {
-          throw new Error(
+          throw failure(
+            'MISSING_FILTER',
             'checkpoint_prune 至少需要一个过滤条件（sessionId 或 olderThanDays），不会无条件清空全部快照；想丢弃全部请用 checkpoint_forget 的 all: true。',
           )
         }
@@ -859,11 +886,12 @@ export function apply(ctx, config) {
           olderThanDays !== undefined &&
           (typeof olderThanDays !== 'number' || !Number.isFinite(olderThanDays) || olderThanDays <= 0)
         ) {
-          throw new Error('olderThanDays 必须是大于 0 的数字（单位：天）。')
+          throw failure('INVALID_ARGUMENT', 'olderThanDays 必须是大于 0 的数字（单位：天）。')
         }
         const dryRun = args?.dryRun !== false
         if (!dryRun && args?.confirm !== true) {
-          throw new Error(
+          throw failure(
+            'CONFIRM_REQUIRED',
             `真正清理（dryRun: false）会丢弃匹配的快照记录（只删记录、不改动任何用户文件），需要显式传 confirm: true。先看影响面请用默认的 dryRun: true。`,
           )
         }
@@ -1024,14 +1052,14 @@ export function apply(ctx, config) {
         const all = args?.all === true
         const wanted = typeof args?.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
         if (!all && wanted === undefined) {
-          throw new Error('checkpoint_diff 需要 path（对比单个目标），或传 all: true（对比全部）。')
+          throw failure('MISSING_TARGET', 'checkpoint_diff 需要 path（对比单个目标），或传 all: true（对比全部）。')
         }
 
         let targets = [...records.entries()]
         if (!all) {
           targets = targets.filter(([, record]) => pathMatches(record.path, wanted))
           if (targets.length === 0) {
-            throw new Error(`没有匹配到快照：${wanted}。先用 checkpoint_list 查看可对比的目标。`)
+            throw failure('NOT_FOUND', `没有匹配到快照：${wanted}。先用 checkpoint_list 查看可对比的目标。`)
           }
         }
 
@@ -1080,6 +1108,8 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
             snapshots: { type: 'integer' },
             totalBytes: { type: 'integer' },
             storeFile: { type: 'string' },
@@ -1111,27 +1141,28 @@ export function apply(ctx, config) {
             },
             lastSkip: { type: 'string' },
           },
-          required: ['snapshots', 'totalBytes', 'storeFile', 'events', 'skipped'],
+          required: ['ready', 'snapshots', 'totalBytes', 'storeFile', 'events', 'skipped'],
           additionalProperties: false,
         },
         render(_args, value) {
           const events = value?.events ?? {}
           const skipped = value?.skipped ?? {}
-          return [
-            text(
-              [
-                `快照 ${value?.snapshots ?? 0} 个，共 ${value?.totalBytes ?? 0} 字节`,
-                `存档：${value?.storeFile ?? '?'}`,
-                `前置事件 ${events.preExecute ?? 0} 次（write/edit ${events.inspected ?? 0}，shell 扫描 ${events.shellScanned ?? 0}），累计捕获 ${events.captured ?? 0}`,
-                `加载时丢弃失效快照 ${events.droppedOnLoad ?? 0} 个（文件与父目录都已不存在的旧路径）`,
-                `跳过：missing ${skipped.missing ?? 0} / notFile ${skipped.notFile ?? 0} / tooLarge ${skipped.tooLarge ?? 0} / unreadable ${skipped.unreadable ?? 0} / noPath ${skipped.noPath ?? 0} / outside ${skipped.outside ?? 0} / excluded ${skipped.excluded ?? 0}`,
-              ].join('\n'),
-            ),
+          const lines = [
+            `快照 ${value?.snapshots ?? 0} 个，共 ${value?.totalBytes ?? 0} 字节`,
+            `存档：${value?.storeFile ?? '?'}`,
+            `前置事件 ${events.preExecute ?? 0} 次（write/edit ${events.inspected ?? 0}，shell 扫描 ${events.shellScanned ?? 0}），累计捕获 ${events.captured ?? 0}`,
+            `加载时丢弃失效快照 ${events.droppedOnLoad ?? 0} 个（文件与父目录都已不存在的旧路径）`,
+            `跳过：missing ${skipped.missing ?? 0} / notFile ${skipped.notFile ?? 0} / tooLarge ${skipped.tooLarge ?? 0} / unreadable ${skipped.unreadable ?? 0} / noPath ${skipped.noPath ?? 0} / outside ${skipped.outside ?? 0} / excluded ${skipped.excluded ?? 0}`,
           ]
+          if (value?.ready === false) lines.unshift(`不可用：${value?.unavailableReason || '未知原因'}`)
+          return [text(lines.join('\n'))]
         },
       },
       async execute() {
+        const writability = probeStoreWritable(storeDir)
         return {
+          ready: writability.ready,
+          unavailableReason: writability.reason,
           snapshots: records.size,
           totalBytes,
           storeFile,

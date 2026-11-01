@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Repository Map",
-    "description": "A ranked map of the workspace: files ordered by how much their symbols are referenced, with a symbol outline and definition lookup (repo_map / repo_outline / repo_find_symbol)."
+    "description": "A ranked map of the workspace: files ordered by how much their symbols are referenced, with a symbol outline and definition lookup (repo_map / repo_outline / repo_find_symbol); repo_status reports scan-root readability and cache state."
   }
 }

@@ -787,6 +787,7 @@ function doPlan(config, args, guard, store) {
       renames: [],
       omitted: 0,
       truncated: false,
+      code: 'TARGET_REJECTED',
       hint: checked.error,
     }
   }
@@ -1170,14 +1171,14 @@ function doPlanFolders(args, guard, store) {
     hint: '',
   }
   const checked = validateTarget(args && args.target, guard, store)
-  if (checked.error) return { ...empty, target: typeof args?.target === 'string' ? args.target : '', hint: checked.error }
+  if (checked.error) return { ...empty, code: 'TARGET_REJECTED', target: typeof args?.target === 'string' ? args.target : '', hint: checked.error }
 
   const target = checked.resolved
   let entries
   try {
     entries = readdirSync(target, { withFileTypes: true })
   } catch (error) {
-    return { ...empty, target, hint: `这个目录读不到：${lockHint(error)}。` }
+    return { ...empty, code: 'TARGET_UNREADABLE', target, hint: `这个目录读不到：${lockHint(error)}。` }
   }
 
   const limit = Number.isInteger(args && args.limit) ? Math.min(Math.max(args.limit, 1), 60) : 30
@@ -1332,10 +1333,10 @@ function doApplyFolders(args, guard, store) {
   }
   const items = Array.isArray(args?.items) ? args.items : []
   if (items.length === 0) {
-    return { ...base, hint: '没给要归并的目录（items:[{from, into, name?}]）。先用 tidy_plan（kind=folders）看候选。' }
+    return { ...base, code: 'MISSING_INPUT', hint: '没给要归并的目录（items:[{from, into, name?}]）。先用 tidy_plan（kind=folders）看候选。' }
   }
   if (!Boolean(args && args.confirm)) {
-    return { ...base, hint: '目录归并会移动整个文件夹。先给用户看方案，得到同意后传 confirm:true。' }
+    return { ...base, code: 'CONFIRM_REQUIRED', hint: '目录归并会移动整个文件夹。先给用户看方案，得到同意后传 confirm:true。' }
   }
   const force = Boolean(args && args.force)
   const records = []
@@ -1455,9 +1456,9 @@ function doApplyRename(args, guard, store) {
     hint: '',
   }
   const list = Array.isArray(args?.renames) ? args.renames : []
-  if (list.length === 0) return { ...base, hint: '没给改名清单（renames:[{path, name}]）。' }
+  if (list.length === 0) return { ...base, code: 'MISSING_INPUT', hint: '没给改名清单（renames:[{path, name}]）。' }
   if (!Boolean(args && args.confirm)) {
-    return { ...base, hint: '改名会动文件名。先给用户看预览，得到同意后传 confirm:true。' }
+    return { ...base, code: 'CONFIRM_REQUIRED', hint: '改名会动文件名。先给用户看预览，得到同意后传 confirm:true。' }
   }
   const records = []
   const errors = []
@@ -1518,6 +1519,7 @@ function doApply(config, args, guard, store) {
         errors: [],
         manifest: '',
         remaining: 0,
+        code: 'CONFIRM_REQUIRED',
         hint: '清理不可撤销。请先把结果给用户看，得到明确同意后传 confirm:true 再执行。',
       }
     }
@@ -1585,6 +1587,7 @@ function doApply(config, args, guard, store) {
       errors: [],
       manifest: '',
       remaining: 0,
+      code: 'TARGET_REJECTED',
       hint: checked.error,
     }
   }
@@ -1599,6 +1602,7 @@ function doApply(config, args, guard, store) {
       errors: [],
       manifest: '',
       remaining: 0,
+      code: 'CONFIRM_REQUIRED',
       hint: '整理会移动文件。请先给用户看 tidy_plan 的方案，得到明确同意后传 confirm:true 再执行。',
     }
   }
@@ -1813,7 +1817,7 @@ function doPlanEmpty(args, guard, store) {
     hint: '',
   }
   const checked = validateTarget(args && args.target, guard, store)
-  if (checked.error) return { ...base, target: typeof args?.target === 'string' ? args.target : '', hint: checked.error }
+  if (checked.error) return { ...base, code: 'TARGET_REJECTED', target: typeof args?.target === 'string' ? args.target : '', hint: checked.error }
   const limit = Number.isInteger(args && args.limit) ? Math.min(Math.max(args.limit, 1), 60) : 30
   const result = findEmptyDirs(checked.resolved, guard)
   const shown = result.empty.slice(0, limit).map((item) => ({
@@ -1856,7 +1860,7 @@ function doPlanDupes(args, guard, store) {
     hint: '',
   }
   const checked = validateTarget(args && args.target, guard, store)
-  if (checked.error) return { ...base, target: typeof args?.target === 'string' ? args.target : '', hint: checked.error }
+  if (checked.error) return { ...base, code: 'TARGET_REJECTED', target: typeof args?.target === 'string' ? args.target : '', hint: checked.error }
   const result = findDuplicates(checked.resolved, guard)
   const limit = Number.isInteger(args && args.limit) ? Math.min(Math.max(args.limit, 1), 30) : 12
   const shown = result.groups.slice(0, limit).map((group) => ({
@@ -1896,9 +1900,9 @@ function doApplyEmpty(args, guard, store) {
     hint: '',
   }
   const checked = validateTarget(args && args.target, guard, store)
-  if (checked.error) return { ...base, hint: checked.error }
+  if (checked.error) return { ...base, code: 'TARGET_REJECTED', hint: checked.error }
   if (!Boolean(args && args.confirm)) {
-    return { ...base, hint: '空目录本身没有内容，删除是安全的，但仍需先给用户看清单；确认后传 confirm:true。' }
+    return { ...base, code: 'CONFIRM_REQUIRED', hint: '空目录本身没有内容，删除是安全的，但仍需先给用户看清单；确认后传 confirm:true。' }
   }
   // 自底向上多扫几轮：删掉空子目录后，父目录可能也空了
   let removed = 0
@@ -1946,9 +1950,9 @@ function doApplyDupes(args, guard, store) {
     hint: '',
   }
   const checked = validateTarget(args && args.target, guard, store)
-  if (checked.error) return { ...base, hint: checked.error }
+  if (checked.error) return { ...base, code: 'TARGET_REJECTED', hint: checked.error }
   if (!Boolean(args && args.confirm)) {
-    return { ...base, hint: '查重要动文件。先给用户看 tidy_plan（kind=dupes）的结果，确认后传 confirm:true。' }
+    return { ...base, code: 'CONFIRM_REQUIRED', hint: '查重要动文件。先给用户看 tidy_plan（kind=dupes）的结果，确认后传 confirm:true。' }
   }
   const result = findDuplicates(checked.resolved, guard)
   const quarantine = path.join(store.dir, '_dupes', stampOf())
@@ -2133,7 +2137,7 @@ function doApplyResidue(args, guard, store) {
     hint: '',
   }
   if (!Boolean(args && args.confirm)) {
-    return { ...base, hint: '改注册表/环境变量前必须先看清单；确认后传 confirm:true。' }
+    return { ...base, code: 'CONFIRM_REQUIRED', hint: '改注册表/环境变量前必须先看清单；确认后传 confirm:true。' }
   }
   // 改前备份：把 HKCU 的 Run 与 Environment 两个键导出成 .reg，出事能还原
   const backupDir = path.join(store.dir, 'tools', 'backups')
@@ -2219,6 +2223,7 @@ function doUndo(store, args) {
       skipped: 0,
       errors: [],
       manifest: '',
+      code: 'NO_MANIFEST',
       hint: '还没有可撤销的整理记录。',
     }
   }
@@ -2228,7 +2233,7 @@ function doUndo(store, args) {
       : manifests[0]
   const file = path.join(store.manifests, wanted)
   if (!existsSync(file)) {
-    return { applied: false, restored: 0, skipped: 0, errors: [], manifest: wanted, hint: '找不到这份整理记录，可能已被清理。' }
+    return { applied: false, code: 'MANIFEST_NOT_FOUND', restored: 0, skipped: 0, errors: [], manifest: wanted, hint: '找不到这份整理记录，可能已被清理。' }
   }
   if (!confirm) {
     return {
@@ -2237,6 +2242,7 @@ function doUndo(store, args) {
       skipped: 0,
       errors: [],
       manifest: wanted,
+      code: 'CONFIRM_REQUIRED',
       hint: '撤销会把文件搬回原位。先给用户看要还原的记录，得到同意后传 confirm:true。',
     }
   }
@@ -2244,7 +2250,7 @@ function doUndo(store, args) {
   try {
     payload = JSON.parse(readText(file))
   } catch (error) {
-    return { applied: false, restored: 0, skipped: 0, errors: [], manifest: wanted, hint: '这份记录读不出来，无法撤销。' }
+    return { applied: false, code: 'MANIFEST_UNREADABLE', restored: 0, skipped: 0, errors: [], manifest: wanted, hint: '这份记录读不出来，无法撤销。' }
   }
   if (wanted.startsWith('residue-')) {
     // 残留处置的撤销：把环境变量 / 自启项原值写回去
@@ -2318,6 +2324,18 @@ function readText(file) {
 
 // ───────────────────────────── 主逻辑：诊断 ─────────────────────────────
 
+/** status 用：数据目录真的读得到吗（还没建也算未就绪：没有任何可读记录） */
+function probeStoreReadable(dir) {
+  try {
+    if (!existsSync(dir)) return { ready: false, reason: `数据目录还没建：${dir}（第一次整理后自动创建）` }
+    readdirSync(dir)
+    return { ready: true, reason: '' }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ready: false, reason: `数据目录读不到：${dir}（${message}）` }
+  }
+}
+
 function doStatus(config, store, guard) {
   const manifests = listManifests(store)
   let lastApply = ''
@@ -2348,7 +2366,10 @@ function doStatus(config, store, guard) {
   if (manifests.length === 0) notices.push('还没有整理记录，第一次整理后会在这里出现。')
   if (manifests.length > 20) notices.push(`整理记录已有 ${manifests.length} 份，可按需清理旧记录。`)
   if (inventory.error) notices.push('台账读不出来：' + inventory.error + '检查 ' + path.join(store.dir, 'inventory.json') + ' 后再处理。')
+  const readable = probeStoreReadable(store.dir)
   return {
+    ready: readable.ready,
+    unavailableReason: readable.reason,
     storeDir: store.dir,
     manifests: manifests.length,
     lastApply,
@@ -2746,31 +2767,31 @@ function doInventoryAdd(args, store) {
     error: '',
     hint: '',
   }
-  const fail = (message, hint) => ({ ...base, error: message, hint })
+  const fail = (message, hint, code) => ({ ...base, code: code || 'INVENTORY_ERROR', error: message, hint })
   const name = typeof args?.name === 'string' ? args.name.trim() : ''
   if (name === '') {
-    return fail('没给名称（name）。', '登记一条需要 name + kind + path，例如 name="某软件"、kind="installer"、path="D:\\某软件"。')
+    return fail('没给名称（name）。', '登记一条需要 name + kind + path，例如 name="某软件"、kind="installer"、path="D:\\某软件"。', 'EMPTY_NAME')
   }
   const kind = typeof args?.kind === 'string' ? args.kind.trim() : 'installer'
   if (!INVENTORY_KINDS.includes(kind)) {
-    return fail('类型取值不对：' + (kind || '（空）'), 'kind 只能是 installer / portable / dsh-plugin / dev-tool 之一。')
+    return fail('类型取值不对：' + (kind || '（空）'), 'kind 只能是 installer / portable / dsh-plugin / dev-tool 之一。', 'INVALID_KIND')
   }
   const rawPath = typeof args?.path === 'string' ? args.path.trim() : ''
   if (rawPath === '') {
-    return fail('没给安装路径（path）。', '把程序主体所在目录或可执行文件写进 path，例如 D:\\某软件；登记前先确认它已经装好。')
+    return fail('没给安装路径（path）。', '把程序主体所在目录或可执行文件写进 path，例如 D:\\某软件；登记前先确认它已经装好。', 'EMPTY_PATH')
   }
   let absPath
   try {
     absPath = path.resolve(rawPath)
   } catch (error) {
-    return fail('路径看不懂：' + rawPath, '请给绝对路径，例如 D:\\某软件。')
+    return fail('路径看不懂：' + rawPath, '请给绝对路径，例如 D:\\某软件。', 'BAD_PATH')
   }
   if (!existsSync(absPath)) {
-    return fail('这个路径不存在：' + absPath, '登记前先确认程序已经装好；路径写错就改 path，便携包请指到解压后的目录。')
+    return fail('这个路径不存在：' + absPath, '登记前先确认程序已经装好；路径写错就改 path，便携包请指到解压后的目录。', 'PATH_MISSING')
   }
   const spec = readInventory(store)
   if (spec.error) {
-    return fail(spec.error, '台账解析失败时不会覆盖原文件。请先备份或修好 ' + spec.file + '，再重试登记。')
+    return fail(spec.error, '台账解析失败时不会覆盖原文件。请先备份或修好 ' + spec.file + '，再重试登记。', 'INVENTORY_UNREADABLE')
   }
   const data = spec.data
   const lowerName = name.toLowerCase()
@@ -2782,6 +2803,7 @@ function doInventoryAdd(args, store) {
     return fail(
       '这个路径已经登记在「' + samePath.name + '」（' + samePath.id + '）名下。',
       '一个路径只记一条：要么改用已有条目，要么先确认旧条目已卸载（inventory_check 的 markRemoved）后再登记新的。',
+      'PATH_CONFLICT',
     )
   }
   const dataDirs = Array.isArray(args?.dataDirs)
@@ -2835,7 +2857,7 @@ function doInventoryAdd(args, store) {
   try {
     writeInventory(store, data)
   } catch (error) {
-    return fail('台账写不进去：' + lockHint(error) + '（' + jsonFile + '）', '检查数据目录是否可写；台账原文件没被动过，修好后重试。')
+    return fail('台账写不进去：' + lockHint(error) + '（' + jsonFile + '）', '检查数据目录是否可写；台账原文件没被动过，修好后重试。', 'INVENTORY_WRITE_FAILED')
   }
   const refsScanned = Boolean(scanRefs && probe.ok)
   let hint = created
@@ -2859,7 +2881,7 @@ function doInventoryAdd(args, store) {
 /** 列出条目（默认只在用；可按类型 / 状态过滤） */
 function doInventoryList(args, store) {
   const { jsonFile } = inventoryPaths(store)
-  const emptyResult = (error, hint) => ({
+  const emptyResult = (error, hint, code) => ({
     storeDir: store.dir,
     total: 0,
     shown: 0,
@@ -2872,12 +2894,13 @@ function doInventoryList(args, store) {
     inventoryFile: jsonFile,
     error,
     hint,
+    ...(code ? { code } : {}),
   })
   const spec = readInventory(store)
-  if (spec.error) return emptyResult(spec.error, '台账解析失败，臣没有覆盖它。请先检查 ' + spec.file + '。')
+  if (spec.error) return emptyResult(spec.error, '台账解析失败，臣没有覆盖它。请先检查 ' + spec.file + '。', 'INVENTORY_UNREADABLE')
   const kind = typeof args?.kind === 'string' ? args.kind.trim() : ''
   if (kind !== '' && !INVENTORY_KINDS.includes(kind)) {
-    return emptyResult('类型筛选值不对：' + kind, 'kind 只能是 installer / portable / dsh-plugin / dev-tool。')
+    return emptyResult('类型筛选值不对：' + kind, 'kind 只能是 installer / portable / dsh-plugin / dev-tool。', 'INVALID_KIND')
   }
   const status = args?.status === 'removed' ? 'removed' : args?.status === 'all' ? 'all' : 'active'
   const limit = Number.isInteger(args?.limit) ? Math.min(Math.max(args.limit, 1), 200) : 20
@@ -3000,17 +3023,18 @@ function doPlanUninstall(args, store, guard) {
   const pathQuery = typeof args?.path === 'string' ? args.path.trim() : ''
   const query = nameQuery || pathQuery
   if (query === '') {
-    return { ...base, error: '没给要预演的对象。', hint: '用 name（台账里的名字或编号）或 path（安装路径）指定一条，例如 name="某软件"。' }
+    return { ...base, code: 'EMPTY_QUERY', error: '没给要预演的对象。', hint: '用 name（台账里的名字或编号）或 path（安装路径）指定一条，例如 name="某软件"。' }
   }
   const spec = readInventory(store)
   if (spec.error) {
-    return { ...base, query, error: spec.error, hint: '台账解析失败，臣没有覆盖它。请先检查 ' + spec.file + '。' }
+    return { ...base, code: 'INVENTORY_UNREADABLE', query, error: spec.error, hint: '台账解析失败，臣没有覆盖它。请先检查 ' + spec.file + '。' }
   }
   const matched = findInventoryEntries(spec.data.entries, query)
   if (matched.length === 0) {
     return {
       ...base,
       query,
+      code: 'NOT_FOUND',
       error: '台账里没有匹配「' + query + '」的条目。',
       hint: '先用 inventory_list 看已登记的名字；确实是新装的，用 inventory_add 补录后再预演。',
     }
@@ -3117,13 +3141,13 @@ function doInventoryCheck(args, store) {
     hint: '',
   }
   const spec = readInventory(store)
-  if (spec.error) return { ...base, error: spec.error, hint: '台账解析失败，臣没有覆盖它。请先检查 ' + spec.file + '。' }
+  if (spec.error) return { ...base, code: 'INVENTORY_UNREADABLE', error: spec.error, hint: '台账解析失败，臣没有覆盖它。请先检查 ' + spec.file + '。' }
   const query = typeof args?.name === 'string' ? args.name.trim() : ''
   let scoped = spec.data.entries
   if (query !== '') {
     const matched = findInventoryEntries(scoped, query)
     if (matched.length === 0) {
-      return { ...base, error: '台账里没有匹配「' + query + '」的条目。', hint: '先用 inventory_list 看已登记的名字。' }
+      return { ...base, code: 'NOT_FOUND', error: '台账里没有匹配「' + query + '」的条目。', hint: '先用 inventory_list 看已登记的名字。' }
     }
     scoped = matched
   }
@@ -3515,6 +3539,7 @@ const inventoryAddSchema = {
     markdownFile: { type: 'string' },
     error: { type: 'string' },
     hint: { type: 'string' },
+    code: { type: 'string' },
   },
   required: [
     'ok',
@@ -3576,6 +3601,7 @@ const inventoryListSchema = {
     inventoryFile: { type: 'string' },
     error: { type: 'string' },
     hint: { type: 'string' },
+    code: { type: 'string' },
   },
   required: [
     'storeDir',
@@ -3673,6 +3699,7 @@ const planUninstallSchema = {
     inventoryFile: { type: 'string' },
     error: { type: 'string' },
     hint: { type: 'string' },
+    code: { type: 'string' },
   },
   required: [
     'found',
@@ -3774,6 +3801,7 @@ const inventoryCheckSchema = {
     markdownFile: { type: 'string' },
     error: { type: 'string' },
     hint: { type: 'string' },
+    code: { type: 'string' },
   },
   required: [
     'checked',
@@ -4321,6 +4349,7 @@ export function apply(ctx, config) {
       omitted: { type: 'integer' },
       truncated: { type: 'boolean' },
       hint: { type: 'string' },
+      code: { type: 'string' },
     },
     required: [
       'kind',
@@ -4492,6 +4521,7 @@ export function apply(ctx, config) {
       manifest: { type: 'string' },
       remaining: { type: 'integer' },
       hint: { type: 'string' },
+      code: { type: 'string' },
     },
     required: [
       'applied',
@@ -4624,6 +4654,7 @@ export function apply(ctx, config) {
       errors: { type: 'array', items: { type: 'string' } },
       manifest: { type: 'string' },
       hint: { type: 'string' },
+      code: { type: 'string' },
     },
     required: ['applied', 'restored', 'skipped', 'errors', 'manifest', 'hint'],
     additionalProperties: false,
@@ -4669,6 +4700,8 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
             storeDir: { type: 'string' },
             manifests: { type: 'integer' },
             lastApply: { type: 'string' },
@@ -4683,6 +4716,7 @@ export function apply(ctx, config) {
             inventoryStale: { type: 'integer' },
           },
           required: [
+            'ready',
             'storeDir',
             'manifests',
             'lastApply',
@@ -4708,6 +4742,7 @@ export function apply(ctx, config) {
             `限额：${value?.limits ?? '—'}`,
           ]
           for (const notice of Array.isArray(value?.notices) ? value.notices : []) lines.push(notice)
+          if (value?.ready === false) lines.unshift(`不可用：${value?.unavailableReason || '未知原因'}`)
           return [text(lines.join('\n'))]
         },
       },

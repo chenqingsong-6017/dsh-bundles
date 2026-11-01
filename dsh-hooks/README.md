@@ -109,6 +109,7 @@ exit ≠0: 按 onError 处理，并记进 hooks_status
 | **真机回灌** | `pwsh: node --check ...` | 结果前出现 `(dsh-hooks) 刚跑了 pwsh：…`（UTF-8 中文正常）✅ |
 | 热加载 | 改 `hooks.json`（2 条 → 1 条）后直接查状态 | 立刻变成「已加载 1 条钩子」，无需重启 ✅ |
 | 计数 | `hooks_status` | 执行 7 次、拒绝 2 次，逐条带时间戳与耗时（30–88ms）✅ |
+| 统一契约（v0.1.1，2026-11-01） | `hooks_status` 新增 `ready` / `unavailableReason`（真判断：配置文件读得动且钩子数 >0） | 真配置 → `ready:true` 照常输出；`DSH_HOOKS_FILE` 指向不存在文件 → `ready:false` + 「不可用：没有找到 hooks.json（候选：…）」；`hooks_test('nonsense')` → `code=UNKNOWN_EVENT` ✅ |
 
 安装方式（本机已在用）：
 

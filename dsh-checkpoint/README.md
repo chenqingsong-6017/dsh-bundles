@@ -100,6 +100,8 @@ DSH bundle（Host 侧插件）：在 agent **写/改/删文件之前**把原内�
 
 测试临时目录统一用 `D:\AI\dsh-data\_selftest-checkpoint-*`，跑完自动删除，不落 C 盘。
 
+**2026-11-01 接口契约补丁**：`checkpoint_status` 增 `ready` / `unavailableReason`（判据＝storeDir 真能写：建目录 + 写探针再删，不碰快照存档），schema `required` 含 `ready`，`ready: false` 时 render 首行「不可用：<原因>」；所有抛错带 `code`（MISSING_TARGET / NOT_FOUND / CONFIRM_REQUIRED / MISSING_FILTER / INVALID_ARGUMENT / SANDBOX_READ_ONLY / OUTSIDE_WORKSPACE），人话消息不变。实测：storeDir 指到不存在的盘 → `ready:false` + 「不可用：storeDir 不可写…」；正常目录 → `ready:true`；`node --check index.js` 通过、`node _selftest/tests/checkpoint.test.mjs` 21 项全过。
+
 ## 安装 / 卸载
 
 ```powershell

@@ -80,7 +80,8 @@ source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId }
 
 ## 诊断
 
-`subagent_brief_status`（唯一一个工具，内部计数只在这里出现）：
+`subagent_brief_status`（唯一一个工具，内部计数只在这里出现）。
+统一契约（v0.2.1，2026-11-01）：返回值必带 `ready` 与 `unavailableReason`（空串=可用）；`ready` 判的是**配置阈值是否有效**（没配=用默认值算有效；配了必须是 ≥1 的数字），`ready:false` 时渲染只输出「不可用：<原因>」。这一行即验证记录：`maxChars:800` → `ready:true`；`maxChars:0` → `ready:false` + 「不可用：配置阈值 maxChars=0 无效（应为 ≥1 的数字），实际按默认 1200 截断」；不配 → `ready:true`。
 
 ```
 摘要契约：已启用 —— 子 agent 结算消息的正文超过 1,200 字符就收成摘要。
@@ -140,6 +141,10 @@ source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId }
 不要设超过 3000：一次子 agent 就吃掉 3k 字符，多来几次等于没设。调完用 `subagent_brief_status` 看"最近记录"里的实际 原长度 → 新长度，再决定要不要动。
 
 ## 验证记录
+
+### v0.2.1（2026-11-01，统一状态契约）
+
+`subagent_brief_status` 加 `ready` / `unavailableReason`：`node --check` 通过、`_selftest/tests/subagent-brief.test.mjs` **34 项全过**（其中「返回值与 output schema 严格一致」的 key 集合已同步为新契约）；真实模块验证 `maxChars:800` → `ready:true`、`maxChars:0` → `ready:false` + 「不可用：配置阈值 maxChars=0 无效（…）实际按默认 1200 截断」、不配 → `ready:true`。
 
 ### v2（2026-10-30，agent/pre-step 机制）
 

@@ -771,6 +771,8 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
             storeDir: { type: 'string' },
             stateFile: { type: 'string' },
             git: { type: 'object', properties: { available: { type: 'boolean' }, path: { type: 'string' }, error: { type: 'string' } }, required: ['available', 'path', 'error'], additionalProperties: false },
@@ -811,7 +813,7 @@ export function apply(ctx, config) {
               },
             },
           },
-          required: ['storeDir', 'stateFile', 'git', 'node', 'allowedRoots', 'backupsToKeep', 'sources', 'studies'],
+          required: ['ready', 'storeDir', 'stateFile', 'git', 'node', 'allowedRoots', 'backupsToKeep', 'sources', 'studies'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -839,6 +841,7 @@ export function apply(ctx, config) {
             lines.push(`学习样本：${value.studies.length} 个`)
             for (const study of value.studies) lines.push(`  ${study.slug} ← ${study.repo}@${study.sha ? study.sha.slice(0, 8) : '?'}`)
           }
+          if (value?.ready === false) lines.unshift(`不可用：${value?.unavailableReason || '未知原因'}`)
           return [text(lines.join('\n'))]
         },
       },
@@ -894,7 +897,16 @@ export function apply(ctx, config) {
           clonedAt: typeof study?.clonedAt === 'string' ? study.clonedAt : '',
         }))
 
+        // ready 判据：git 与 node 都解析得到才谈得上比对/校验/更新
+        const missing = []
+        if (!gitInfo.available) missing.push(`git 不可用（${gitInfo.error || '未知原因'}）`)
+        if (!nodeInfo.available) missing.push('node 不可解析')
+        const ready = missing.length === 0
+        const unavailableReason = ready ? '' : missing.join('；')
+
         return {
+          ready,
+          unavailableReason,
           storeDir,
           stateFile,
           git: gitInfo,
@@ -932,6 +944,7 @@ export function apply(ctx, config) {
           type: 'object',
           properties: {
             ok: { type: 'boolean' },
+            code: { type: 'string' },
             action: { type: 'string' },
             name: { type: 'string' },
             message: { type: 'string' },
@@ -947,26 +960,26 @@ export function apply(ctx, config) {
       async execute(args) {
         const action = args?.action
         const key = typeof args?.name === 'string' ? args.name.trim() : ''
-        if (key === '') return { ok: false, action: action ?? '', name: '', message: 'name 不能为空', total: Object.keys(state.sources).length }
+        if (key === '') return { ok: false, code: 'EMPTY_NAME', action: action ?? '', name: '', message: 'name 不能为空', total: Object.keys(state.sources).length }
 
         if (action === 'remove') {
-          if (!state.sources[key]) return { ok: false, action, name: key, message: `没有名为 ${key} 的源`, total: Object.keys(state.sources).length }
+          if (!state.sources[key]) return { ok: false, code: 'SOURCE_NOT_FOUND', action, name: key, message: `没有名为 ${key} 的源`, total: Object.keys(state.sources).length }
           delete state.sources[key]
           persist()
           return { ok: true, action, name: key, message: `已移除源 ${key}（本地文件未动）`, total: Object.keys(state.sources).length }
         }
 
         if (action !== 'add') {
-          return { ok: false, action: action ?? '', name: key, message: 'action 只能是 add 或 remove', total: Object.keys(state.sources).length }
+          return { ok: false, code: 'INVALID_ACTION', action: action ?? '', name: key, message: 'action 只能是 add 或 remove', total: Object.keys(state.sources).length }
         }
 
         const repo = typeof args?.repo === 'string' ? args.repo.trim() : state.sources[key]?.repo ?? ''
         const localDir = typeof args?.localDir === 'string' ? args.localDir.trim() : state.sources[key]?.localDir ?? ''
-        if (repo === '') return { ok: false, action, name: key, message: 'repo 不能为空', total: Object.keys(state.sources).length }
-        if (localDir === '') return { ok: false, action, name: key, message: 'localDir 不能为空', total: Object.keys(state.sources).length }
+        if (repo === '') return { ok: false, code: 'EMPTY_REPO', action, name: key, message: 'repo 不能为空', total: Object.keys(state.sources).length }
+        if (localDir === '') return { ok: false, code: 'EMPTY_LOCAL_DIR', action, name: key, message: 'localDir 不能为空', total: Object.keys(state.sources).length }
 
         const gate = checkWritable(localDir)
-        if (!gate.ok) return { ok: false, action, name: key, message: gate.reason, total: Object.keys(state.sources).length }
+        if (!gate.ok) return { ok: false, code: 'LOCAL_DIR_NOT_ALLOWED', action, name: key, message: gate.reason, total: Object.keys(state.sources).length }
 
         const previous = state.sources[key] ?? {}
         state.sources[key] = {
@@ -1024,6 +1037,7 @@ export function apply(ctx, config) {
                   localSha: { type: 'string' },
                   localVersion: { type: 'string' },
                   note: { type: 'string' },
+                  code: { type: 'string' },
                 },
                 required: ['name', 'repo', 'ref', 'status', 'remoteSha', 'localSha', 'localVersion', 'note'],
                 additionalProperties: false,
@@ -1061,7 +1075,7 @@ export function apply(ctx, config) {
             checked: 0,
             behind: 0,
             results: only
-              ? [{ name: only, repo: '', ref: '', status: 'error', remoteSha: '', localSha: '', localVersion: '', note: `没有登记名为 ${only} 的源` }]
+              ? [{ name: only, repo: '', ref: '', status: 'error', code: 'SOURCE_NOT_FOUND', remoteSha: '', localSha: '', localVersion: '', note: `没有登记名为 ${only} 的源` }]
               : [],
           }
         }
@@ -1078,7 +1092,7 @@ export function apply(ctx, config) {
             const base = { name: sourceName, repo, ref, remoteSha: '', localSha, localVersion, note: '' }
 
             if (!existsSync(localDir)) {
-              return { ...base, status: 'no-local', note: `本地目录 ${localDir} 不存在` }
+              return { ...base, status: 'no-local', code: 'LOCAL_DIR_MISSING', note: `本地目录 ${localDir} 不存在` }
             }
 
             const remote = await git(['ls-remote', repo, ref === 'HEAD' ? 'HEAD' : ref], { signal: exec?.signal })
@@ -1086,13 +1100,14 @@ export function apply(ctx, config) {
               return {
                 ...base,
                 status: 'error',
+                code: 'GIT_LS_REMOTE_FAILED',
                 note: (remote.timedOut ? 'ls-remote 超时' : (remote.stderr || remote.stdout).trim().split('\n')[0] || 'ls-remote 失败').slice(0, 300),
               }
             }
             const firstLine = remote.stdout.trim().split('\n')[0] ?? ''
             const remoteSha = (firstLine.split(/\s+/)[0] ?? '').trim()
             if (!/^[0-9a-f]{7,40}$/i.test(remoteSha)) {
-              return { ...base, status: 'error', note: `远端没返回可识别的提交（ref=${ref}）` }
+              return { ...base, status: 'error', code: 'INVALID_REMOTE_SHA', note: `远端没返回可识别的提交（ref=${ref}）` }
             }
 
             const previousSeen = source?.lastSeenSha ?? ''
@@ -1139,6 +1154,7 @@ export function apply(ctx, config) {
             name: { type: 'string' },
             ok: { type: 'boolean' },
             status: { type: 'string', enum: ['applied', 'validated', 'rejected', 'refused', 'error'] },
+            code: { type: 'string' },
             stagedSha: { type: 'string' },
             previousSha: { type: 'string' },
             fromVersion: { type: 'string' },
@@ -1185,6 +1201,7 @@ export function apply(ctx, config) {
             name: typeof args?.name === 'string' ? args.name : '',
             ok: false,
             status: 'refused',
+            code: 'UNKNOWN_SOURCE',
             stagedSha: '',
             previousSha: '',
             fromVersion: '',
@@ -1225,13 +1242,13 @@ export function apply(ctx, config) {
         }
 
         if (!dryRun && !confirmed) {
-          return { ...base, status: 'refused', message: '这是会改本地文件的动作，需要 confirm: true。想先看差异就传 dryRun: true。' }
+          return { ...base, status: 'refused', code: 'CONFIRM_REQUIRED', message: '这是会改本地文件的动作，需要 confirm: true。想先看差异就传 dryRun: true。' }
         }
 
         const gate = checkWritable(localDir)
-        if (!gate.ok) return { ...base, status: 'refused', message: gate.reason }
-        if (!existsSync(localDir)) return { ...base, status: 'error', message: `本地目录 ${localDir} 不存在；请先确认插件装在哪。` }
-        if (repo === '') return { ...base, status: 'error', message: '该源没有 repo 地址' }
+        if (!gate.ok) return { ...base, status: 'refused', code: 'LOCAL_DIR_NOT_ALLOWED', message: gate.reason }
+        if (!existsSync(localDir)) return { ...base, status: 'error', code: 'LOCAL_DIR_MISSING', message: `本地目录 ${localDir} 不存在；请先确认插件装在哪。` }
+        if (repo === '') return { ...base, status: 'error', code: 'REPO_MISSING', message: '该源没有 repo 地址' }
 
         const localManifest = readJson(path.join(localDir, 'package.json'))
         const fromVersion = typeof localManifest?.version === 'string' ? localManifest.version : ''
@@ -1239,13 +1256,13 @@ export function apply(ctx, config) {
         const target = path.join(stagingDir, `${sourceName}-${stamp()}`)
         const cloned = await cloneTo(repo, ref, target, exec?.signal)
         if (!cloned.ok) {
-          return { ...base, fromVersion, status: 'error', message: cloned.error }
+          return { ...base, fromVersion, status: 'error', code: 'CLONE_FAILED', message: cloned.error }
         }
 
         const pluginRoot = subdir !== '' ? path.join(cloned.dir, subdir) : cloned.dir
         if (!existsSync(pluginRoot)) {
           forceRm(target)
-          return { ...base, fromVersion, stagedSha: shortSha(cloned.sha), status: 'rejected', message: `仓库里没有子目录 ${subdir}`, issues: [{ level: 'error', code: 'no-subdir', message: `缺少 ${subdir}` }] }
+          return { ...base, fromVersion, stagedSha: shortSha(cloned.sha), status: 'rejected', code: 'NO_SUBDIR', message: `仓库里没有子目录 ${subdir}`, issues: [{ level: 'error', code: 'no-subdir', message: `缺少 ${subdir}` }] }
         }
 
         const inspected = inspectBundle(pluginRoot)
@@ -1263,6 +1280,7 @@ export function apply(ctx, config) {
             toVersion,
             stagedSha: shortSha(cloned.sha),
             status: 'rejected',
+            code: 'VALIDATION_FAILED',
             issues,
             diff: compared.diff,
             diffStat: compared.stat,
@@ -1302,7 +1320,7 @@ export function apply(ctx, config) {
           backupInfo = backupDir(localDir, backupPath)
         } catch (error) {
           forceRm(target)
-          return { ...base, fromVersion, toVersion, status: 'error', message: `备份失败，已放弃写入：${error instanceof Error ? error.message : String(error)}` }
+          return { ...base, fromVersion, toVersion, status: 'error', code: 'BACKUP_FAILED', message: `备份失败，已放弃写入：${error instanceof Error ? error.message : String(error)}` }
         }
 
         let removedCount = 0
@@ -1331,6 +1349,7 @@ export function apply(ctx, config) {
             fromVersion,
             toVersion,
             status: 'error',
+            code: 'WRITE_FAILED',
             issues,
             files,
             backupDir: backupPath,
@@ -1398,6 +1417,7 @@ export function apply(ctx, config) {
             name: { type: 'string' },
             ok: { type: 'boolean' },
             status: { type: 'string', enum: ['restored', 'refused', 'error'] },
+            code: { type: 'string' },
             restoredFrom: { type: 'string' },
             safetyBackup: { type: 'string' },
             files: { type: 'integer' },
@@ -1420,28 +1440,28 @@ export function apply(ctx, config) {
       async execute(args) {
         const found = findSource(args?.name)
         if (found.error) {
-          return { name: typeof args?.name === 'string' ? args.name : '', ok: false, status: 'refused', restoredFrom: '', safetyBackup: '', files: 0, message: found.error, reloadHint: '' }
+          return { name: typeof args?.name === 'string' ? args.name : '', ok: false, status: 'refused', code: 'UNKNOWN_SOURCE', restoredFrom: '', safetyBackup: '', files: 0, message: found.error, reloadHint: '' }
         }
         const { name: sourceName, source } = found
         const localDir = typeof source?.localDir === 'string' ? source.localDir : ''
 
         if (args?.confirm !== true) {
-          return { name: sourceName, ok: false, status: 'refused', restoredFrom: '', safetyBackup: '', files: 0, message: '回滚会改本地文件，需要 confirm: true。', reloadHint: '' }
+          return { name: sourceName, ok: false, status: 'refused', code: 'CONFIRM_REQUIRED', restoredFrom: '', safetyBackup: '', files: 0, message: '回滚会改本地文件，需要 confirm: true。', reloadHint: '' }
         }
 
         const gate = checkWritable(localDir)
-        if (!gate.ok) return { name: sourceName, ok: false, status: 'refused', restoredFrom: '', safetyBackup: '', files: 0, message: gate.reason, reloadHint: '' }
+        if (!gate.ok) return { name: sourceName, ok: false, status: 'refused', code: 'LOCAL_DIR_NOT_ALLOWED', restoredFrom: '', safetyBackup: '', files: 0, message: gate.reason, reloadHint: '' }
 
         const entries = listBackups(sourceName)
         if (entries.length === 0) {
-          return { name: sourceName, ok: false, status: 'error', restoredFrom: '', safetyBackup: '', files: 0, message: '这个源还没有任何备份，无法回滚（只应用过一次且没备份过？）', reloadHint: '' }
+          return { name: sourceName, ok: false, status: 'error', code: 'NO_BACKUP', restoredFrom: '', safetyBackup: '', files: 0, message: '这个源还没有任何备份，无法回滚（只应用过一次且没备份过？）', reloadHint: '' }
         }
 
         const wanted = typeof args?.backup === 'string' && args.backup.trim() !== '' ? args.backup.trim() : entries[entries.length - 1]
         const backupPath = path.join(backupsDir, sourceName, wanted)
         const backupTree = path.join(backupPath, 'tree')
         if (!existsSync(backupTree)) {
-          return { name: sourceName, ok: false, status: 'error', restoredFrom: wanted, safetyBackup: '', files: 0, message: `备份 ${wanted} 不完整（缺 tree 目录）；可选：${entries.join(', ')}`, reloadHint: '' }
+          return { name: sourceName, ok: false, status: 'error', code: 'BACKUP_INCOMPLETE', restoredFrom: wanted, safetyBackup: '', files: 0, message: `备份 ${wanted} 不完整（缺 tree 目录）；可选：${entries.join(', ')}`, reloadHint: '' }
         }
 
         // 回滚前先把当前状态另存一份，保证「回滚的回滚」也可用
@@ -1449,14 +1469,14 @@ export function apply(ctx, config) {
         try {
           backupDir(localDir, safetyPath)
         } catch (error) {
-          return { name: sourceName, ok: false, status: 'error', restoredFrom: wanted, safetyBackup: '', files: 0, message: `回滚前的安全备份失败，已放弃：${error instanceof Error ? error.message : String(error)}`, reloadHint: '' }
+          return { name: sourceName, ok: false, status: 'error', code: 'BACKUP_FAILED', restoredFrom: wanted, safetyBackup: '', files: 0, message: `回滚前的安全备份失败，已放弃：${error instanceof Error ? error.message : String(error)}`, reloadHint: '' }
         }
 
         let outcome
         try {
           outcome = restoreDir(backupTree, localDir)
         } catch (error) {
-          return { name: sourceName, ok: false, status: 'error', restoredFrom: wanted, safetyBackup: safetyPath, files: 0, message: `还原失败：${error instanceof Error ? error.message : String(error)}；安全备份在 ${safetyPath}`, reloadHint: '' }
+          return { name: sourceName, ok: false, status: 'error', code: 'RESTORE_FAILED', restoredFrom: wanted, safetyBackup: safetyPath, files: 0, message: `还原失败：${error instanceof Error ? error.message : String(error)}；安全备份在 ${safetyPath}`, reloadHint: '' }
         }
 
         // 从备份名里还原当时的提交（形如 20261027-223501-abc12345 或 -baseline）
@@ -1504,6 +1524,7 @@ export function apply(ctx, config) {
           type: 'object',
           properties: {
             ok: { type: 'boolean' },
+            code: { type: 'string' },
             slug: { type: 'string' },
             dir: { type: 'string' },
             focusDir: { type: 'string' },
@@ -1560,7 +1581,7 @@ export function apply(ctx, config) {
           entrypoints: [],
           message: '',
         }
-        if (repo === '') return { ...empty, message: 'repo 不能为空' }
+        if (repo === '') return { ...empty, code: 'EMPTY_REPO', message: 'repo 不能为空' }
 
         const slug = slugOf(repo)
         const ref = typeof args?.ref === 'string' && args.ref.trim() !== '' ? args.ref.trim() : 'HEAD'
@@ -1581,13 +1602,13 @@ export function apply(ctx, config) {
 
         if (!reused) {
           const cloned = await cloneTo(repo, ref, dir, exec?.signal)
-          if (!cloned.ok) return { ...empty, slug, dir, message: cloned.error }
+          if (!cloned.ok) return { ...empty, code: 'CLONE_FAILED', slug, dir, message: cloned.error }
           sha = cloned.sha
         }
 
         const focusDir = subdir !== '' ? path.join(dir, subdir) : dir
         if (!existsSync(focusDir)) {
-          return { ...empty, ok: false, slug, dir, sha: shortSha(sha), reused, message: `仓库里没有子目录 ${subdir}` }
+          return { ...empty, ok: false, code: 'NO_SUBDIR', slug, dir, sha: shortSha(sha), reused, message: `仓库里没有子目录 ${subdir}` }
         }
 
         const allFiles = walkFiles(focusDir, { skipDirs: new Set(['node_modules', '.git']) })

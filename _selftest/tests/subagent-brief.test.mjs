@@ -275,7 +275,7 @@ const fire = async (pre, messages, options = {}) => {
   const value = await status.execute({})
   assert.deepEqual(
     Object.keys(value).sort(),
-    ['charsSaved', 'enabled', 'lastSeen', 'maxChars', 'recent', 'sourceKinds', 'truncatedCount'],
+    ['charsSaved', 'enabled', 'lastSeen', 'maxChars', 'ready', 'recent', 'sourceKinds', 'truncatedCount', 'unavailableReason'],
     '返回值与 output schema 严格一致',
   )
   assert.equal(value.enabled, true)

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "代码库地图",
-    "description": "给工作区生成按引用热度排序的文件地图，附带符号纲要与符号定位（repo_map / repo_outline / repo_find_symbol）。"
+    "description": "给工作区生成按引用热度排序的文件地图，附带符号纲要与符号定位（repo_map / repo_outline / repo_find_symbol）；repo_status 报扫描根是否可读与缓存状态。"
   }
 }

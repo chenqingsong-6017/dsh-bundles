@@ -616,6 +616,9 @@ export function apply(ctx, config) {
           type: 'object',
           properties: {
             ok: { type: 'boolean' },
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
+            code: { type: 'string' },
             vault: { type: 'string' },
             storeDir: { type: 'string' },
             vaultExists: { type: 'boolean' },
@@ -633,10 +636,11 @@ export function apply(ctx, config) {
             memoryPointers: { type: 'object', additionalProperties: true },
             lastError: { type: 'string' },
           },
-          required: ['ok', 'vault', 'notes', 'bases', 'attachments', 'links', 'brokenLinks', 'parseErrors'],
+          required: ['ok', 'ready', 'vault', 'notes', 'bases', 'attachments', 'links', 'brokenLinks', 'parseErrors'],
           additionalProperties: true,
         },
         render(_args, value) {
+          if (value.ready === false) return [text('不可用：' + (value.unavailableReason || value.lastError || '未知原因'))]
           if (value.ok === false) return [text('Obsidian 索引不可用：' + (value.lastError || '未知原因'))]
           let line = 'Obsidian：' + value.notes + ' 篇笔记 / ' + value.bases + ' 个视图 / 链接 ' + value.links + '（断 ' + value.brokenLinks + '）/ 解析失败 ' + value.parseErrors
           const pointer = value.memoryPointers
@@ -655,7 +659,10 @@ export function apply(ctx, config) {
       async execute() {
         try {
           const exists = existsSync(vaultDir)
-          if (!exists) return { ok: false, vault: vaultDir, storeDir, vaultExists: false, notes: 0, bases: 0, attachments: 0, dirs: 0, links: 0, brokenLinks: 0, parseErrors: 0, lastError: lastError || 'vault 不存在：' + vaultDir }
+          if (!exists) {
+            const reason = lastError || 'vault 不存在：' + vaultDir
+            return { ok: false, ready: false, unavailableReason: reason, code: 'VAULT_MISSING', vault: vaultDir, storeDir, vaultExists: false, notes: 0, bases: 0, attachments: 0, dirs: 0, links: 0, brokenLinks: 0, parseErrors: 0, lastError: reason }
+          }
           const cached = readIndex()
           const listing = listVault(vaultDir)
           const liveNewest = listing.notes.reduce((max, entry) => Math.max(max, entry.mtime), 0)
@@ -663,6 +670,8 @@ export function apply(ctx, config) {
           try { bytes = existsSync(indexFile()) ? statSync(indexFile()).size : 0 } catch (error) { note(error) }
           return {
             ok: cached !== null,
+            ready: true,
+            unavailableReason: '',
             vault: vaultDir,
             storeDir,
             vaultExists: true,
@@ -683,7 +692,8 @@ export function apply(ctx, config) {
           }
         } catch (error) {
           note(error)
-          return { ok: false, vault: vaultDir, storeDir, vaultExists: false, notes: 0, bases: 0, attachments: 0, dirs: 0, links: 0, brokenLinks: 0, parseErrors: 0, lastError }
+          const message = lastError || (error instanceof Error ? error.message : String(error))
+          return { ok: false, ready: false, unavailableReason: '读库失败：' + message, code: 'STATUS_ERROR', vault: vaultDir, storeDir, vaultExists: false, notes: 0, bases: 0, attachments: 0, dirs: 0, links: 0, brokenLinks: 0, parseErrors: 0, lastError: lastError || message }
         }
       },
     }),
@@ -698,10 +708,10 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
-            ok: { type: 'boolean' }, vault: { type: 'string' }, notes: { type: 'integer' }, bases: { type: 'integer' },
+            ok: { type: 'boolean' }, code: { type: 'string' }, vault: { type: 'string' }, notes: { type: 'integer' }, bases: { type: 'integer' },
             attachments: { type: 'integer' }, links: { type: 'integer' }, brokenLinks: { type: 'integer' },
             parseErrors: { type: 'integer' }, bytes: { type: 'integer' }, tookMs: { type: 'integer' },
-            rebuilt: { type: 'boolean' }, indexFile: { type: 'string' }, lastError: { type: 'string' },
+            rebuilt: { type: 'boolean' }, indexFile: { type: 'string' }, code: { type: 'string' }, lastError: { type: 'string' },
           },
           required: ['ok', 'notes', 'links', 'brokenLinks'],
           additionalProperties: true,
@@ -714,7 +724,7 @@ export function apply(ctx, config) {
         const started = Date.now()
         try {
           const result = ensureIndex(args?.force === true)
-          if (!result.ok || !result.index) return { ok: false, lastError: lastError || 'vault 不可读', tookMs: Date.now() - started }
+          if (!result.ok || !result.index) return { ok: false, code: 'VAULT_UNREADABLE', lastError: lastError || 'vault 不可读', tookMs: Date.now() - started }
           const index = result.index
           let bytes = 0
           try { bytes = statSync(indexFile()).size } catch (error) { note(error) }
@@ -726,7 +736,7 @@ export function apply(ctx, config) {
           })
         } catch (error) {
           note(error)
-          return { ok: false, lastError, tookMs: Date.now() - started }
+          return { ok: false, code: 'INDEX_ERROR', lastError: lastError || (error instanceof Error ? error.message : String(error)), tookMs: Date.now() - started }
         }
       },
     }),
@@ -754,7 +764,7 @@ export function apply(ctx, config) {
           properties: {
             ok: { type: 'boolean' }, query: { type: 'string' }, total: { type: 'integer' }, matched: { type: 'integer' },
             rebuilt: { type: 'boolean' }, results: { type: 'array', items: { type: 'object', additionalProperties: true } },
-            lastError: { type: 'string' },
+            code: { type: 'string' }, lastError: { type: 'string' },
           },
           required: ['ok', 'query', 'matched', 'results'],
           additionalProperties: true,
@@ -769,11 +779,11 @@ export function apply(ctx, config) {
       async execute(args) {
         try {
           const query = strValue(args?.query)
-          if (query === '') return { ok: false, query, total: 0, matched: 0, results: [], lastError: 'query 为空' }
+          if (query === '') return { ok: false, code: 'EMPTY_QUERY', query, total: 0, matched: 0, results: [], lastError: 'query 为空' }
           const limitRaw = Number(args?.limit)
           const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 50) : 10
           const result = ensureIndex(false)
-          if (!result.ok || !result.index) return { ok: false, query, total: 0, matched: 0, results: [], lastError: lastError || 'vault 不可读' }
+          if (!result.ok || !result.index) return { ok: false, code: 'VAULT_UNREADABLE', query, total: 0, matched: 0, results: [], lastError: lastError || 'vault 不可读' }
           const index = result.index
           const terms = tokenize(query)
           const type = strValue(args?.type).toLowerCase()
@@ -804,7 +814,7 @@ export function apply(ctx, config) {
           return { ok: true, query, total: pool.length, matched: scored.length, rebuilt: result.rebuilt, results, lastError }
         } catch (error) {
           note(error)
-          return { ok: false, query: strValue(args?.query), total: 0, matched: 0, results: [], lastError }
+          return { ok: false, code: 'SEARCH_ERROR', query: strValue(args?.query), total: 0, matched: 0, results: [], lastError }
         }
       },
     }),
@@ -830,7 +840,7 @@ export function apply(ctx, config) {
             ok: { type: 'boolean' }, path: { type: 'string' }, name: { type: 'string' },
             frontmatter: { type: 'object', additionalProperties: true }, body: { type: 'string' },
             links: { type: 'array', items: { type: 'object', additionalProperties: true } },
-            truncated: { type: 'boolean' }, lastError: { type: 'string' },
+            truncated: { type: 'boolean' }, code: { type: 'string' }, lastError: { type: 'string' },
           },
           required: ['ok', 'path'],
           additionalProperties: true,
@@ -843,18 +853,18 @@ export function apply(ctx, config) {
       async execute(args) {
         try {
           const rel = strValue(args?.path)
-          if (rel === '') return { ok: false, path: '', lastError: 'path 为空' }
+          if (rel === '') return { ok: false, code: 'EMPTY_PATH', path: '', lastError: 'path 为空' }
           const abs = safeResolve(vaultDir, rel)
-          if (!abs) return { ok: false, path: rel, lastError: '路径越界：只允许 vault 内部路径' }
+          if (!abs) return { ok: false, code: 'PATH_ESCAPE', path: rel, lastError: '路径越界：只允许 vault 内部路径' }
           const candidates = [abs, abs + '.md']
           let target = ''
           for (const candidate of candidates) {
             if (existsSync(candidate) && statSync(candidate).isFile()) { target = candidate; break }
           }
-          if (target === '') return { ok: false, path: rel, lastError: '文件不存在：' + rel }
-          if (path.extname(target).toLowerCase() !== '.md') return { ok: false, path: rel, lastError: '只支持 .md' }
+          if (target === '') return { ok: false, code: 'NOT_FOUND', path: rel, lastError: '文件不存在：' + rel }
+          if (path.extname(target).toLowerCase() !== '.md') return { ok: false, code: 'UNSUPPORTED_TYPE', path: rel, lastError: '只支持 .md' }
           const info = statSync(target)
-          if (info.size > MAX_NOTE_BYTES) return { ok: false, path: rel, lastError: '文件超过 ' + MAX_NOTE_BYTES + ' 字节' }
+          if (info.size > MAX_NOTE_BYTES) return { ok: false, code: 'TOO_LARGE', path: rel, lastError: '文件超过 ' + MAX_NOTE_BYTES + ' 字节' }
           const raw = readFileSync(target, 'utf8')
           const parsed = parseFrontmatter(raw)
           const capRaw = Number(args?.maxChars)
@@ -872,7 +882,7 @@ export function apply(ctx, config) {
           }
         } catch (error) {
           note(error)
-          return { ok: false, path: strValue(args?.path), lastError }
+          return { ok: false, code: 'NOTE_ERROR', path: strValue(args?.path), lastError: lastError || (error instanceof Error ? error.message : String(error)) }
         }
       },
     }),
@@ -1012,6 +1022,7 @@ export function apply(ctx, config) {
           type: 'object',
           properties: {
             ok: { type: 'boolean' },
+            code: { type: 'string' },
             vault: { type: 'string' },
             total: { type: 'integer' },
             errorCount: { type: 'integer' },
@@ -1036,7 +1047,7 @@ export function apply(ctx, config) {
         const started = Date.now()
         try {
           const result = ensureIndex(true)
-          if (!result.ok || !result.index) return { ok: false, total: 0, errorCount: 0, warnCount: 0, issues: [], tookMs: Date.now() - started, lastError: lastError || 'vault 不可读' }
+          if (!result.ok || !result.index) return { ok: false, code: 'VAULT_UNREADABLE', total: 0, errorCount: 0, warnCount: 0, issues: [], tookMs: Date.now() - started, lastError: lastError || 'vault 不可读' }
           const skipPrefixes = args?.includeTemplates === true ? [] : ['90-shared/91-templates/', '95-archive/']
           const report = lintIndex(result.index, { pointerTargets: memoryPointerTargets(), skipPrefixes })
           return {
@@ -1051,7 +1062,7 @@ export function apply(ctx, config) {
           }
         } catch (error) {
           note(error)
-          return { ok: false, total: 0, errorCount: 0, warnCount: 0, issues: [], tookMs: Date.now() - started, lastError }
+          return { ok: false, code: 'LINT_ERROR', total: 0, errorCount: 0, warnCount: 0, issues: [], tookMs: Date.now() - started, lastError: lastError || (error instanceof Error ? error.message : String(error)) }
         }
       },
     }),

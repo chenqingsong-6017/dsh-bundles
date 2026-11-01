@@ -13,6 +13,10 @@
  *
  * 为什么强制用 guard 而不是 post-execute:
  *   post 阶段动作已经发生,拦不住;guard 在动作之前运行,返回字符串即拒绝。
+ *
+ * status 契约(v0.3 统一):
+ *   `staleness_status` 的 ready 是**真实判断**——配置合法 + 两个挂载点真的挂上了;
+ *   任何一项落空都报 ready:false 并给出 unavailableReason 与 code。
  */
 
 export const name = 'staleness-watch'
@@ -59,6 +63,18 @@ function carriedTokens(args) {
 const text = (value) => ({ type: 'text', text: value })
 
 export function apply(ctx, config) {
+  // 配置非法不改行为（fail-safe：仍按默认值跑），但 staleness_status 会如实报不可用。
+  const configProblems = []
+  if (config?.mode !== undefined && config.mode !== 'warn' && config.mode !== 'block') {
+    configProblems.push('mode 只能是 warn 或 block，收到 ' + JSON.stringify(config.mode))
+  }
+  if (
+    config?.maxBlindActions !== undefined &&
+    !(Number.isInteger(config.maxBlindActions) && config.maxBlindActions > 0)
+  ) {
+    configProblems.push('maxBlindActions 需要正整数，收到 ' + JSON.stringify(config.maxBlindActions))
+  }
+
   const mode = config?.mode === 'block' ? 'block' : 'warn'
   const limit = Number.isInteger(config?.maxBlindActions) && config.maxBlindActions > 0
     ? config.maxBlindActions
@@ -67,9 +83,12 @@ export function apply(ctx, config) {
   /** key -> { stale: boolean, blind: number } */
   const state = new Map()
   const read = (key) => state.get(key) ?? { stale: false, blind: 0 }
+  // 挂载结果是 ready 的真实依据：没挂上就是没生效，不能假装可用。
+  let guardMounted = false
+  let postExecuteMounted = false
 
   // ---- 强制层:动作之前拦截 ----
-  ctx.tools.guard((exec) => {
+  const guardHook = (exec) => {
     if (mode !== 'block') return undefined
     const toolName = String(exec?.name ?? '')
     if (!matches(MUTATING, toolName)) return undefined
@@ -86,10 +105,14 @@ export function apply(ctx, config) {
       `staleness-watch 已拦截:目标 pid=${pid} window=${windowId} 已连续 ${current.blind} 次输入操作未重新观察。` +
       `请先调用 get_window_state(pid=${pid}, window_id=${windowId}) 取得新快照,确认页面/窗口的实际状态后再继续。`
     )
-  })
+  }
+  if (typeof ctx.tools?.guard === 'function') {
+    ctx.tools.guard(guardHook)
+    guardMounted = true
+  }
 
   // ---- 观测层:结果之后告警 ----
-  ctx.on('tools/post-execute', async (exec, result, next) => {
+  const postHook = async (exec, result, next) => {
     const decision = await next()
     if (decision.kind !== 'accept') return decision
     if (decision.value !== undefined) return decision
@@ -129,5 +152,67 @@ export function apply(ctx, config) {
 
     const base = decision.content ?? result.content ?? []
     return { kind: 'accept', content: [...warnings.map(text), ...base] }
-  })
+  }
+  if (typeof ctx.on === 'function') {
+    ctx.on('tools/post-execute', postHook)
+    postExecuteMounted = true
+  }
+
+  // ---- staleness_status：ready 由「配置合法 + 两个挂载点真的挂上」现算 ----
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'staleness_status',
+      description:
+        'Health of the staleness-watch hooks: mode, blind-action threshold, whether the guard and post-execute hooks are actually mounted, and how many targets are tracked. Use it when warnings or block decisions stop appearing.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
+            code: { type: 'string' },
+            mode: { type: 'string' },
+            maxBlindActions: { type: 'integer' },
+            guardMounted: { type: 'boolean' },
+            postExecuteMounted: { type: 'boolean' },
+            trackedTargets: { type: 'integer' },
+            staleTargets: { type: 'integer' },
+            blockedTargets: { type: 'integer' },
+          },
+          required: ['ready', 'mode', 'maxBlindActions', 'guardMounted', 'postExecuteMounted', 'trackedTargets'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          if (value?.ready === false) return [text('不可用：' + (value?.unavailableReason || '未知原因'))]
+          const policy = value?.mode === 'block' ? `连续 ${value?.maxBlindActions ?? 0} 次盲操作后拦截` : '只告警不拦截'
+          return [
+            text(
+              `陈旧告警在跑（${value?.mode ?? '?'} 模式，${policy}）：跟踪 ${value?.trackedTargets ?? 0} 个目标，` +
+                `其中 ${value?.staleTargets ?? 0} 个有陈旧快照、${value?.blockedTargets ?? 0} 个已达拦截阈值。`,
+            ),
+          ]
+        },
+      },
+      async execute() {
+        const problems = [...configProblems]
+        if (!guardMounted) problems.push('ctx.tools.guard 不可用：强制层没挂上，block 模式不会拦截')
+        if (!postExecuteMounted) problems.push('ctx.on 不可用：post-execute 观测层没挂上，告警不会出现')
+        const ready = problems.length === 0
+        const tracked = [...state.values()]
+        return {
+          ready,
+          unavailableReason: problems.join('；'),
+          ...(ready ? {} : { code: configProblems.length > 0 ? 'STALENESS_CONFIG_INVALID' : 'STALENESS_HOOKS_UNAVAILABLE' }),
+          mode,
+          maxBlindActions: limit,
+          guardMounted,
+          postExecuteMounted,
+          trackedTargets: state.size,
+          staleTargets: tracked.filter((item) => item.stale === true).length,
+          blockedTargets: tracked.filter((item) => item.blind >= limit).length,
+        }
+      },
+    }),
+  )
 }

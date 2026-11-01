@@ -2,6 +2,17 @@
 
 本文件于 2026-10-31 按「改到谁补谁」的规则建立；当前版本为存量版本，本节为补记。
 
+## v0.1.1 — 2026-11-01
+
+### Changed
+- **统一状态契约**：`hooks_status` 新增 `ready` / `unavailableReason`（两者都必填，`unavailableReason` 为空串表示可用）。`ready` 是真判断——hooks.json 存在、每个文件都读得动、且至少 1 条钩子；`ready:false` 时渲染首行固定为「不可用：<原因>」（未配置时追加配置写法与最小示例）。
+- **错误码**：`hooks_test` 认不出 event 时返回 `code: 'UNKNOWN_EVENT'`；`hooks_reload` 按情况返回 `CONFIG_INVALID` / `CONFIG_MISSING` / `NO_HOOKS`（成功为 `''`）。
+- `load()` 增加 `unreadable` 计数，把「文件读不到」与「配置写错」分开，状态判定不再混为一谈。
+
+### Verification
+- `node --check` 通过；`_selftest/tests/hooks.test.mjs` 10 项全过。
+- 真实模块验证：真 hooks.json → `ready:true`；`DSH_HOOKS_FILE` 指向不存在文件 → `ready:false` + 「不可用：没有找到 hooks.json（候选：…）」；`hooks_test` 传 `nonsense` → `code=UNKNOWN_EVENT`。
+
 ## v0.1.0（补记于 2026-10-31）
 
 ### Added

@@ -201,6 +201,8 @@ JSON 数组（也接受 `{"rules": [...]}` 形式），每条：
 
 单次判定 0.016–0.55 ms，满足「单次判断纯正则，10 ms 量级」的要求。
 
+**2026-11-01 接口契约补丁**：`auto_approve_status` 增 `ready` / `unavailableReason`（判据＝插件启用且「项目级/用户级规则文件可读 或 内置红线开着」），`required` 含 `ready`，`ready:false` 时 render 首行「不可用：<原因>」；本插件不返回错误对象（坏配置一律 fail-safe 放行并记进 `status.errors`），`code` 只需保留原有的 `AUTO_APPROVE_DENIED`。实测：项目级规则文件可读 → `ready:true`；`enabled:false` → `ready:false`（理由「插件已停用」）；无规则文件 + `builtins:false` → `ready:false`；`node --check` 通过、`auto-approve.test.mjs` 19 项全过。
+
 安装/重载由 Lead 统一做：源码在 `D:\AI\dsh-bundles\dsh-auto-approve`，用 plugin_manager install_bundle 安装，重载用 remove_bundle + install_bundle。
 
 ## 已知边界（诚实清单）

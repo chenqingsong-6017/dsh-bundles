@@ -2,6 +2,16 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.1.4 — 2026-11-01
+
+### Changed
+- **统一状态契约**：`log_status` 新增 `ready` / `unavailableReason`（两者都进 `required`）。`ready` 是真判断——对日志目录做一次真实探针（建目录 → 列目录 → 写 `.write-probe-<pid>.tmp` → 删掉），不靠 `accessSync(W_OK)`（Windows 上对 ACL 不可信）。探针文件名不匹配 `events-*.jsonl`，不会被 `log_query` 或条数统计算进去。
+- `log_status` 变了一点副作用：为判定「可写」，每次调用会在日志目录里建一个探针文件并立刻删掉（工具描述里已注明）。
+- **错误码**：`log_write` 失败返回 `code`——`EMPTY_MESSAGE` / `LEVEL_FILTERED`（低于 `minLevel`，原来静默 `ok:false` 无原因）/ `WRITE_FAILED`；成功时 `code` 仍是写入事件的 code（如 `MILESTONE`），由 `ok` 区分。
+
+### Tests
+- `_selftest/tests/eventlog.test.mjs` 16 项全过；另做真实模块验证：可写目录 → `ready:true`，目录建不出来 → `ready:false` + 「不可用：日志目录不可写/不可读（…）：ENOTDIR…」；`log_write` 三种失败码逐个实测。
+
 ## v0.1.3 — 2026-11-01
 
 ### Fixed

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "技能用量",
-    "description": "统计每个 skill 被加载的次数，标出长期没用的陈旧技能供人工复核；只统计与标注，从不删除（skill_usage / skill_usage_mark）。"
+    "description": "统计每个 skill 被加载的次数，标出长期没用的陈旧技能供人工复核；只统计与标注，从不删除（skill_usage / skill_usage_mark）；skill_usage_status 报账本可写性与存档健康。"
   }
 }

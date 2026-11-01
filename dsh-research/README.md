@@ -23,7 +23,7 @@
 | `research_evidence` | 记一条结论 + 落点：`claim` / `tier` / `ref` / `quote` / `confidence` / `inferred` |
 | `research_check` | 机械体检：无落点几条、断引用几条、推断几条、能否收尾 |
 | `research_report` | 出 Markdown 结论文档（证据表 + 未验证区），原子写；可 `close` 收尾 |
-| `research_status` | 存储健康度：任务数 / 开放数 / 证据数 / 各层级分布 / 最近错误 |
+| `research_status` | 存储健康度：任务数 / 开放数 / 证据数 / 各层级分布 / 最近错误；带 `ready` / `unavailableReason`（`store.json` 读不动时渲染「不可用：<原因>」） |
 
 `tier` 取值（与 `docs.md` 出处分层一致）：`paper`（论文）/ `official`（官方文档或博客）/ `source`（源码）/ `readme`（插件 README）/ `search`（搜索摘要）。
 
@@ -59,6 +59,7 @@ config:
 | `node --check index.js` | 通过 |
 | 单测 `_selftest/tests/research.test.mjs` | 见验证门输出（纯函数 + 临时 store + 5 工具真调用 + fail-safe） |
 | 真机 | 见下方「真机验收」 |
+| 统一契约（v0.1.2，2026-11-01） | `research_status` 加 `ready`/`unavailableReason`（store 可读+结构对才 true）；所有 `ok:false` 返回带 `code`。实测：store 正常 → `ready:true`；store 不存在 → `ready:false` + 「不可用：store.json 不存在（…）：先跑一次 research_new」；store 坏 JSON → 见「读不了：…」 ✅ |
 
 ## 已知边界（诚实清单）
 

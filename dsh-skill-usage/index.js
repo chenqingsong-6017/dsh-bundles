@@ -26,7 +26,7 @@
  *     主动调 `skill_usage`。
  */
 
-import { writeFileSync, readFileSync, renameSync, mkdirSync } from 'node:fs'
+import { writeFileSync, readFileSync, renameSync, mkdirSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
@@ -39,6 +39,13 @@ const DEFAULT_ARCHIVE_DAYS = 30
 const MAX_NOTE = 200
 
 const text = (value) => ({ type: 'text', text: value })
+
+/** 统一错误契约：所有抛出的错误都带 code（UPPER_SNAKE），调用方据此分支，不必解析中文文案。 */
+function fail(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
 
 function storeLocation(overrideDir) {
   const override = typeof overrideDir === 'string' ? overrideDir.trim() : ''
@@ -421,11 +428,11 @@ export function apply(ctx, config) {
       },
       async execute(args, exec) {
         const skillName = typeof args?.name === 'string' ? args.name.trim() : ''
-        if (skillName === '') throw new Error('skill_usage_mark 需要 name（精确技能名）。')
+        if (skillName === '') throw fail('SKILL_USAGE_ARG_MISSING', 'skill_usage_mark 需要 name（精确技能名）。')
         await refreshCatalog(exec?.agent ? { scope: exec.agent } : {})
         if (!records.has(skillName) && !catalog.has(skillName)) {
           const known = [...new Set([...records.keys(), ...catalog.keys()])].sort().slice(0, 12)
-          throw new Error(`未知技能：${skillName}。可用的名字例如：${known.join(', ')}`)
+          throw fail('SKILL_USAGE_UNKNOWN_SKILL', `未知技能：${skillName}。可用的名字例如：${known.join(', ')}`)
         }
         const record = ensureRecord(skillName)
         record.reviewedAt = new Date().toISOString()
@@ -437,6 +444,159 @@ export function apply(ctx, config) {
           state: result.state,
           reviewedAt: record.reviewedAt,
           ...(record.note ? { note: record.note } : {}),
+        }
+      },
+    }),
+  )
+
+  // ---- skill_usage_status：ready 由「配置合法 + 数据目录真的可写 + 存档可解析」现算 ----
+  const probeStoreWritable = () => {
+    try {
+      if (!existsSync(storeDir)) mkdirSync(storeDir, { recursive: true })
+    } catch (error) {
+      return { ok: false, reason: '数据目录无法创建：' + (error?.message ?? 'unknown') }
+    }
+    // accessSync(W_OK) 在 Windows 上对目录太宽松，直接写一个探针文件再删掉才是真检查。
+    const probe = path.join(storeDir, '.status-probe-' + process.pid)
+    try {
+      writeFileSync(probe, 'ok', 'utf8')
+      unlinkSync(probe)
+      return { ok: true, reason: '' }
+    } catch (error) {
+      try {
+        unlinkSync(probe)
+      } catch (inner) {
+        // 探针文件删不掉就留着，下次覆盖
+      }
+      return { ok: false, reason: '数据目录不可写：' + (error?.message ?? 'unknown') }
+    }
+  }
+
+  ctx.effect(() =>
+    tools.register({
+      name: 'skill_usage_status',
+      description:
+        'Read-only health of the skill usage ledger: whether the store directory is actually writable, whether usage.json parses, how many skills are tracked, and the stale/archive thresholds. Use it when counts look wrong or a mark does not persist.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
+            code: { type: 'string' },
+            storeDir: { type: 'string' },
+            storeFile: { type: 'string' },
+            storeExists: { type: 'boolean' },
+            storeBytes: { type: 'integer' },
+            storeWritable: { type: 'boolean' },
+            records: { type: 'integer' },
+            catalogSize: { type: 'integer' },
+            skillsService: { type: 'boolean' },
+            thresholds: {
+              type: 'object',
+              properties: { staleAfterDays: { type: 'number' }, archiveAfterDays: { type: 'number' } },
+              required: ['staleAfterDays', 'archiveAfterDays'],
+              additionalProperties: false,
+            },
+            toolResults: { type: 'integer' },
+            skillLoads: { type: 'integer' },
+            skillErrors: { type: 'integer' },
+            lastError: { type: 'string' },
+            configWarning: { type: 'string' },
+          },
+          required: [
+            'ready',
+            'storeDir',
+            'storeFile',
+            'storeExists',
+            'storeWritable',
+            'records',
+            'catalogSize',
+            'skillsService',
+            'thresholds',
+            'toolResults',
+            'skillLoads',
+            'skillErrors',
+          ],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          if (value?.ready === false) return [text('不可用：' + (value?.unavailableReason || '未知原因'))]
+          return [
+            text(
+              `技能用量可用：账本 ${value?.records ?? 0} 条 / 目录 ${value?.catalogSize ?? 0} 个技能` +
+                `（阈值 ${value?.thresholds?.staleAfterDays ?? '?'} 天 / ${value?.thresholds?.archiveAfterDays ?? '?'} 天），` +
+                `已计 ${value?.skillLoads ?? 0} 次加载，存档 ${value?.storeFile ?? '?'}。`,
+            ),
+          ]
+        },
+      },
+      async execute() {
+        const problems = []
+        let code = ''
+        const note = (nextCode, reason) => {
+          problems.push(reason)
+          if (code === '') code = nextCode
+        }
+
+        // 配置非法不改行为（仍按默认阈值跑），但如实报出来。
+        const configWarnings = []
+        for (const key of ['staleAfterDays', 'archiveAfterDays']) {
+          const value = config?.[key]
+          if (value !== undefined && !(Number.isFinite(value) && value > 0)) {
+            configWarnings.push(`${key} 需要正数，收到 ${JSON.stringify(value)}（已回落到默认值）`)
+          }
+        }
+        if (
+          config?.storeDir !== undefined &&
+          (typeof config.storeDir !== 'string' || config.storeDir.trim() === '')
+        ) {
+          note('SKILL_USAGE_CONFIG_INVALID', '配置 storeDir 无效（需要非空字符串），已回落到默认目录')
+        }
+
+        let storeExists = false
+        let storeBytes = 0
+        if (existsSync(storeFile)) {
+          storeExists = true
+          try {
+            storeBytes = statSync(storeFile).size
+          } catch (error) {
+            note('SKILL_USAGE_STORE_UNREADABLE', '读不到存档：' + (error?.message ?? 'unknown'))
+          }
+          try {
+            const parsed = JSON.parse(readFileSync(storeFile, 'utf8'))
+            const table = parsed?.skills
+            if (table === null || typeof table !== 'object') {
+              note('SKILL_USAGE_STORE_UNREADABLE', '存档形状不合法：缺 skills 表')
+            }
+          } catch (error) {
+            note('SKILL_USAGE_STORE_UNREADABLE', '存档不是合法 JSON：' + (error?.message ?? 'unknown'))
+          }
+        }
+
+        const writable = probeStoreWritable()
+        if (!writable.ok) note('SKILL_USAGE_STORE_UNWRITABLE', writable.reason)
+
+        const ready = problems.length === 0
+        return {
+          ready,
+          unavailableReason: problems.join('；'),
+          ...(ready ? {} : { code: code || 'SKILL_USAGE_STORE_UNWRITABLE' }),
+          storeDir,
+          storeFile,
+          storeExists,
+          storeBytes,
+          storeWritable: writable.ok,
+          records: records.size,
+          catalogSize: catalog.size,
+          skillsService: typeof skills?.list === 'function',
+          thresholds,
+          toolResults: stats.toolResults,
+          skillLoads: stats.skillLoads,
+          skillErrors: stats.skillErrors,
+          ...(typeof stats.lastError === 'string' && stats.lastError !== '' ? { lastError: stats.lastError } : {}),
+          ...(configWarnings.length > 0 ? { configWarning: configWarnings.join('；') } : {}),
         }
       },
     }),

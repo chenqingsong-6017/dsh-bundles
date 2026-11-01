@@ -69,6 +69,16 @@ export function normalizeMaxChars(value) {
   return DEFAULT_MAX_CHARS
 }
 
+/**
+ * 配置阈值是否真的有效（status.ready 的判据）：
+ * 没配 = 用默认值，算有效；配了就必须是 ≥1 的数字，否则是「配置写了但没生效」。
+ */
+export function isValidMaxChars(value) {
+  if (value === undefined || value === null || value === '') return true
+  const num = typeof value === 'string' ? Number(value.trim()) : value
+  return typeof num === 'number' && Number.isFinite(num) && num >= 1
+}
+
 /** 来源 kind 归一化：去空白、丢非字符串、去重；显式空数组表示「一个都不拦」。 */
 export function normalizeSourceKinds(value) {
   if (!Array.isArray(value)) return [...DEFAULT_SOURCE_KINDS]
@@ -221,6 +231,10 @@ export function summarizeNotice(message, maxChars = DEFAULT_MAX_CHARS) {
 export function apply(ctx, config) {
   const enabled = config?.enabled !== false
   const maxChars = normalizeMaxChars(config?.maxChars)
+  const thresholdValid = isValidMaxChars(config?.maxChars)
+  const unavailableReason = thresholdValid
+    ? ''
+    : '配置阈值 maxChars=' + JSON.stringify(config?.maxChars ?? null) + ' 无效（应为 ≥1 的数字），实际按默认 ' + maxChars + ' 截断'
   const sourceKinds = normalizeSourceKinds(config?.sourceKinds)
   const sourceSet = new Set(sourceKinds)
 
@@ -327,6 +341,8 @@ export function apply(ctx, config) {
   const statusSchema = {
     type: 'object',
     properties: {
+      ready: { type: 'boolean' },
+      unavailableReason: { type: 'string' },
       enabled: { type: 'boolean' },
       maxChars: { type: 'integer' },
       sourceKinds: { type: 'array', items: { type: 'string' } },
@@ -360,7 +376,7 @@ export function apply(ctx, config) {
         additionalProperties: false,
       },
     },
-    required: ['enabled', 'maxChars', 'sourceKinds', 'truncatedCount', 'charsSaved', 'recent', 'lastSeen'],
+    required: ['ready', 'unavailableReason', 'enabled', 'maxChars', 'sourceKinds', 'truncatedCount', 'charsSaved', 'recent', 'lastSeen'],
     additionalProperties: false,
   }
 
@@ -383,6 +399,7 @@ export function apply(ctx, config) {
   }
 
   const statusRender = (_args, value) => {
+    if (value?.ready === false) return [textPart('不可用：' + (value.unavailableReason || '未知原因'))]
     const lines = []
     const seen = value?.lastSeen ?? emptySeen()
     if (value?.enabled === false) {
@@ -443,6 +460,8 @@ export function apply(ctx, config) {
       async execute(args) {
         const limit = clampLimit(args?.limit)
         return {
+          ready: thresholdValid,
+          unavailableReason,
           enabled,
           maxChars,
           sourceKinds,

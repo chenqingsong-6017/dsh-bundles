@@ -10,7 +10,7 @@
  *
  * 数据：<storeDir>/events-YYYY-MM-DD.jsonl，每天一个文件，按 keepDays 清理。
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 export const name = 'dsh-eventlog'
@@ -133,6 +133,26 @@ export function apply(ctx, config) {
     } catch (error) {
       noteError(error)
       return false
+    }
+  }
+
+  /**
+   * log_status.ready 的真实判据：日志目录可读且可写。
+   * 「可写」不靠猜（Windows 上 accessSync(W_OK) 对 ACL 不可信），
+   * 用一次真实的最小写探针：建目录 → 列目录 → 写一个 `.write-probe-<pid>.tmp` → 删掉。
+   * 探针文件名不在 events-*.jsonl 的匹配里，不会被 log_query / 条数统计算进去。
+   */
+  function dirReadiness() {
+    const probe = path.join(storeDir, '.write-probe-' + process.pid + '.tmp')
+    try {
+      mkdirSync(storeDir, { recursive: true })
+      readdirSync(storeDir)
+      writeFileSync(probe, 'probe', 'utf8')
+      return { ready: true, unavailableReason: '' }
+    } catch (error) {
+      return { ready: false, unavailableReason: '日志目录不可写/不可读（' + storeDir + '）：' + (error instanceof Error ? error.message : String(error)) }
+    } finally {
+      try { unlinkSync(probe) } catch (ignored) { /* 没写成功就没得删 */ }
     }
   }
 
@@ -325,7 +345,11 @@ export function apply(ctx, config) {
         const message = String(args?.message ?? '').replace(/\s+/g, ' ').trim()
         if (message === '') {
           lastError = 'log_write: message 为空，已拒绝（空事件只会污染日志）'
-          return { ok: false }
+          return { ok: false, code: 'EMPTY_MESSAGE' }
+        }
+        // 低于 minLevel 的写入是被策略丢掉的，不是失败：先判掉，好给出准确原因
+        if (levelRank(normalizeEvent({ level: args?.level, message }).level) < levelRank(minLevel)) {
+          return { ok: false, code: 'LEVEL_FILTERED' }
         }
         const result = append({
           level: args?.level,
@@ -335,8 +359,8 @@ export function apply(ctx, config) {
           message,
           data: args?.data,
         })
-        if (result === null) return { ok: false }
-        return { ok: true, file: result.file, code: result.event.code }
+        if (result === null) return { ok: false, code: 'WRITE_FAILED' }
+        return { ok: true, code: result.event.code, file: result.file }
       },
     }),
   )
@@ -445,12 +469,14 @@ export function apply(ctx, config) {
   ctx.effect(() =>
     ctx.tools.register({
       name: 'log_status',
-      description: 'Read-only health of the local event log: files, entries, size, oldest/newest, retention, last error, capture switches.',
+      description: 'Health of the local event log: files, entries, size, oldest/newest, retention, last error, capture switches. Readiness is checked with a one-off temp-file write probe in the log dir (created then removed).',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: {
         schema: {
           type: 'object',
           properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
             storeDir: { type: 'string' },
             files: { type: 'integer' },
             entries: { type: 'integer' },
@@ -463,10 +489,11 @@ export function apply(ctx, config) {
             writtenThisRun: { type: 'integer' },
             lastError: { type: 'string' },
           },
-          required: ['storeDir', 'files', 'entries', 'bytes', 'keepDays', 'minLevel', 'captureToolErrors', 'writtenThisRun', 'lastError'],
+          required: ['ready', 'unavailableReason', 'storeDir', 'files', 'entries', 'bytes', 'keepDays', 'minLevel', 'captureToolErrors', 'writtenThisRun', 'lastError'],
           additionalProperties: false,
         },
         render(_args, value) {
+          if (value?.ready === false) return [text('不可用：' + (value.unavailableReason || '未知原因'))]
           const head = '事件日志：' + (value?.files ?? 0) + ' 个文件 / ' + (value?.entries ?? 0) + ' 条 / ' + Math.round((value?.bytes ?? 0) / 1024) + ' KB'
           const range = value?.oldest ? '，范围 ' + String(value.oldest).slice(0, 10) + ' → ' + String(value.newest).slice(0, 10) : ''
           const tail = '（保留 ' + (value?.keepDays ?? 0) + ' 天，最低级别 ' + (value?.minLevel ?? '') + '，本次已写 ' + (value?.writtenThisRun ?? 0) + ' 条）'
@@ -475,6 +502,7 @@ export function apply(ctx, config) {
         },
       },
       async execute() {
+        const readiness = dirReadiness()
         let files = 0
         let entries = 0
         let bytes = 0
@@ -502,6 +530,8 @@ export function apply(ctx, config) {
           }
         }
         return {
+          ready: readiness.ready,
+          unavailableReason: readiness.unavailableReason,
           storeDir,
           files,
           entries,

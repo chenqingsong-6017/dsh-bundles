@@ -171,6 +171,10 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 
 示例（自测数据，非实机安装）：登记「测试应用」（`inv-0001` · 便携版 · 1 个数据目录）→ `plan_uninstall` 给出「便携版直接删目录 / 数据目录去留 / 卸后复核」3 步 → 删掉目录后 `inventory_check` 报「安装路径与数据目录都已不在，也没有关联引用」→ `markRemoved:true` 标为已卸载，历史仍可查。
 
+### 接口契约补丁（2026-11-01）
+
+`tidy_status` 增 `ready` / `unavailableReason`（判据＝数据目录真能读：`readdirSync(storeDir)`；目录还没建也算未就绪），`required` 含 `ready`，`ready:false` 时 render 首行「不可用：<原因>」；工具的错误返回统一带 `code`（UPPER_SNAKE：TARGET_REJECTED / TARGET_UNREADABLE / MISSING_INPUT / CONFIRM_REQUIRED / NO_MANIFEST / MANIFEST_NOT_FOUND / MANIFEST_UNREADABLE / EMPTY_QUERY / NOT_FOUND / INVENTORY_UNREADABLE / EMPTY_NAME / INVALID_KIND / EMPTY_PATH / BAD_PATH / PATH_MISSING / PATH_CONFLICT / INVENTORY_WRITE_FAILED），hint 与 render 文案不变。实测：目录存在 → `ready:true`、不存在 → `ready:false` + 「不可用：数据目录还没建…」；`inventory_add` 缺 name → `code:'EMPTY_NAME'`、`tidy_apply` 缺 confirm → `code:'CONFIRM_REQUIRED'`；`node --check` 通过、`butler-tidy.test.mjs` 12 项全过（含 9 个工具的输出 schema 严格核对）。
+
 ### v0.2.0 → v0.3.0（2026-10-27）
 
 `D:\AI\dsh-bundles\_selftest\tidy-selftest.mjs`，假 ctx 直接驱动五个工具，**32 项断言全过**：

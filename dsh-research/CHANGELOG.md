@@ -2,6 +2,15 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.1.2 — 2026-11-01
+
+### Changed
+- **统一状态契约**：`research_status` 新增 `ready` / `unavailableReason`（两者都进 `required`）。`ready` 是真判断：`store.json` 存在、JSON 解析得开、`tasks` 是数组；不存在 / 坏 JSON / 结构不对都 `ready:false` 并在原因里给出路径与实际错误。`ready:false` 时渲染只输出「不可用：<原因>」。
+- **错误码**：所有 `ok:false` 返回都带 `code`（UPPER_SNAKE）——`QUESTION_TOO_SHORT` / `DECISION_TOO_SHORT` / `TASK_LIMIT` / `CLAIM_TOO_SHORT` / `INVALID_TIER` / `NO_TASK` / `TASK_CLOSED` / `EVIDENCE_LIMIT` / `EVIDENCE_UNVERIFIABLE` / `STORE_WRITE_FAILED` / `UNVERIFIED_BLOCKED` / `REPORT_TOO_LARGE` / `STATUS_FAILED` / `UNEXPECTED_FAILURE`；成功返回 `code: ''`。
+
+### Tests
+- `_selftest/tests/research.test.mjs` 9 组全过；另做真实模块验证：store 可读 → `ready:true`，store 缺失 / 坏 JSON → `ready:false` + 「不可用：…」。
+
 ## v0.1.1 — 2026-11-01
 
 ### Fixed

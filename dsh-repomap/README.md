@@ -22,6 +22,7 @@ DSH bundle（Host 侧插件）：给任意工作区生成"按引用热度排序�
 | `repo_map` | 按热度排序的文件地图，带每文件顶层符号，受 `maxChars` 预算约束（默认 8000）。输出只给人看的顺序与符号，**不暴露内部评分**（评分仍在返回数据里供程序使用） |
 | `repo_outline` | 单文件符号纲要（行号 + 种类），替代"为了看结构读整个文件" |
 | `repo_find_symbol` | 全库找某符号的定义位置（文件:行） |
+| `repo_status` | 只读诊断：扫描根是否存在 / 是目录 / 可读（真做一次 `readdir`）、识别到的源文件数、扫描缓存与预算。`ready:false` 时给 `unavailableReason` + `code` |
 
 ## 配置
 
@@ -82,3 +83,13 @@ DSH bundle（Host 侧插件）：给任意工作区生成"按引用热度排序�
 - 排序是"引用次数"近似，不是真正的 PageRank（跨文件引用图未建）；
 - 不做真正意义上的增量索引：靠内存级扫描缓存避免重复解析；缓存 key 的指纹是「相对路径 + mtimeMs + size」，如果内容变了但 size 与 mtime 被人工还原成原值，理论上会漏判（日常编辑不会出现）；
 - 缓存最多保留 `maxCacheEntries` 份扫描结果（每份含符号与词频表），超大仓库 × 8 会占一些内存；嫌大可把 `maxCacheEntries` 调小。
+
+## 验证记录（2026-11-01，统一契约：ready / unavailableReason / 错误 code）
+
+| 项 | 结果 |
+|---|---|
+| `repo_status` | 新增；`ready` 现算：扫描根存在 + 是目录 + 真做一次 `readdir` 判可读 |
+| 错误 `code` | `repo_outline` / `repo_find_symbol` 的 4 处错误带 `REPO_ARG_MISSING` / `REPO_FILE_UNREADABLE` |
+| `node --check index.js` | 通过 |
+| `node _selftest/tests/repomap.test.mjs` | 15 项通过，退出码 0 |
+| 契约真机校验 | 真实目录 `ready:true` 且数到源文件；目录不存在 → `REPO_ROOT_MISSING`；把文件当根 → `REPO_ROOT_NOT_DIRECTORY` |

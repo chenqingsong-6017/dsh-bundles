@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Skill Usage",
-    "description": "Tracks how often each skill is loaded across sessions, flags stale skills for review, and never deletes anything (skill_usage / skill_usage_mark)."
+    "description": "Tracks how often each skill is loaded across sessions, flags stale skills for review, and never deletes anything (skill_usage / skill_usage_mark); skill_usage_status reports ledger writability and store health."
   }
 }

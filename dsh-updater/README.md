@@ -301,6 +301,10 @@ updater_check    → 检查了 1 个源，0 个有新提交；· eva-theme 未�
 
 第 4 个是**mock 测试测不出来**的那类：本地测试用的替身能容忍 undefined 的 cwd，真实 `subprocess.spawn` 会在内部解引用时崩。装进 DSH 后一调就暴露，说明"只跑单测"不够，必须真实调用。
 
+### 6. 接口契约补丁（2026-11-01）
+
+`updater_status` 增 `ready` / `unavailableReason`（判据＝git 与 node 都解析得到，复用 status 里原有的两次探测），`required` 含 `ready`，`ready:false` 时 render 首行「不可用：<原因>」；错误返回统一带 `code`（UPPER_SNAKE：EMPTY_NAME / SOURCE_NOT_FOUND / INVALID_ACTION / EMPTY_REPO / EMPTY_LOCAL_DIR / LOCAL_DIR_NOT_ALLOWED / LOCAL_DIR_MISSING / GIT_LS_REMOTE_FAILED / INVALID_REMOTE_SHA / UNKNOWN_SOURCE / CONFIRM_REQUIRED / REPO_MISSING / CLONE_FAILED / NO_SUBDIR / VALIDATION_FAILED / BACKUP_FAILED / BACKUP_INCOMPLETE / WRITE_FAILED / NO_BACKUP / RESTORE_FAILED），原有 `issues[].code`（lowercase）与消息不变。实测：注入假 subprocess（git/node 可解析）→ `ready:true`；不注入 → `ready:false` 且 render 首行「不可用：git 不可用…」；`updater_source` 缺 name → `code:'EMPTY_NAME'`、`updater_apply` 未知源 → `code:'UNKNOWN_SOURCE'`、`updater_check` 未知源条目 → `code:'SOURCE_NOT_FOUND'`；`node --check` 通过、`updater.test.mjs` 25 项全过。
+
 ---
 
 ## 已知边界

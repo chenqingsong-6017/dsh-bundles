@@ -14,6 +14,7 @@ DSH bundle（Host 侧插件）：统计每个 skill 被加载了多少次、最�
 |---|---|
 | `skill_usage` | 列出用量与状态。`filter` = `all`（默认）/ `used` / `unused` / `attention`（陈旧 + 可归档），`limit` 默认 40。输出面向人：状态写成【常用】/【从未用过】/【陈旧】/【建议归档】，不暴露内部枚举值 |
 | `skill_usage_mark` | 标记"已复核"（可带 ≤200 字备注）。复核会给提醒续期，而不是永久压掉 |
+| `skill_usage_status` | 只读诊断：数据目录**真的可写**（写探针文件再删）、`usage.json` 能否解析、账本条数与目录技能数、阈值与计数。`ready:false` 时给 `unavailableReason` + `code` |
 
 ## 状态机
 
@@ -71,3 +72,13 @@ plugin_manager action=remove_bundle target=@local/dsh-skill-usage
 ```
 
 改代码后需要 `remove_bundle` + `install_bundle` 才会加载新的模块代际。
+
+## 验证记录（2026-11-01，统一契约：ready / unavailableReason / 错误 code）
+
+| 项 | 结果 |
+|---|---|
+| `skill_usage_status` | 新增；`ready` 现算：数据目录写探针文件再删（Windows 上 `accessSync(W_OK)` 对目录太宽松，不用它）+ `usage.json` 可解析 |
+| 错误 `code` | 2 处错误带 `SKILL_USAGE_ARG_MISSING` / `SKILL_USAGE_UNKNOWN_SKILL` |
+| `node --check index.js` | 通过 |
+| `node _selftest/tests/skill-usage.test.mjs` | 7 项通过，退出码 0 |
+| 契约真机校验 | 可写目录 `ready:true`；存档坏 JSON → `SKILL_USAGE_STORE_UNREADABLE`；目录不可建 → `SKILL_USAGE_STORE_UNWRITABLE` |

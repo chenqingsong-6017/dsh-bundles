@@ -25,7 +25,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 
 export const name = 'dsh-repomap'
@@ -382,6 +382,13 @@ function rankFiles(files) {
 
 const text = (value) => ({ type: 'text', text: value })
 
+/** 统一错误契约：所有抛出的错误都带 code（UPPER_SNAKE），调用方据此分支，不必解析中文文案。 */
+function fail(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
 export function apply(ctx, config) {
   const defaultMaxChars =
     Number.isInteger(config?.maxChars) && config.maxChars > 0 ? Math.min(config.maxChars, 64000) : 8000
@@ -402,7 +409,7 @@ export function apply(ctx, config) {
     try {
       info = statSync(full)
     } catch (error) {
-      throw new Error(`读不到文件：${full}`)
+      throw fail('REPO_FILE_UNREADABLE', `读不到文件：${full}`)
     }
     const key = `${full}\u0000${info.mtimeMs}\u0000${info.size}`
     const cached = outlineCache.get(key)
@@ -415,7 +422,7 @@ export function apply(ctx, config) {
     try {
       content = readFileSync(full, 'utf8')
     } catch (error) {
-      throw new Error(`读不到文件：${full}`)
+      throw fail('REPO_FILE_UNREADABLE', `读不到文件：${full}`)
     }
     const value = { path: full, symbols: extractSymbols(path.extname(full).toLowerCase(), content) }
     outlineCache.set(key, value)
@@ -558,7 +565,7 @@ export function apply(ctx, config) {
       },
       async execute(args, exec) {
         const raw = typeof args?.path === 'string' ? args.path.trim() : ''
-        if (raw === '') throw new Error('repo_outline 需要 path。')
+        if (raw === '') throw fail('REPO_ARG_MISSING', 'repo_outline 需要 path。')
         const cwd = workingDirectory && exec?.agent ? await workingDirectory.ensure(exec.agent, exec.signal).catch(() => undefined) : undefined
         return outlineFor(path.resolve(cwd ?? process.cwd(), raw))
       },
@@ -608,7 +615,7 @@ export function apply(ctx, config) {
       },
       async execute(args, exec) {
         const wanted = typeof args?.name === 'string' ? args.name.trim() : ''
-        if (wanted === '') throw new Error('repo_find_symbol 需要 name。')
+        if (wanted === '') throw fail('REPO_ARG_MISSING', 'repo_find_symbol 需要 name。')
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 100) : 20
         const root = await resolveRoot(exec, args?.path)
         const { files } = scanner.scan(root)
@@ -623,6 +630,145 @@ export function apply(ctx, config) {
           if (matches.length >= limit) break
         }
         return { name: wanted, matches }
+      },
+    }),
+  )
+
+  // ---- repo_status：ready 由「扫描根存在 + 是目录 + 可读」现算，不写死 ----
+  ctx.effect(() =>
+    tools.register({
+      name: 'repo_status',
+      description:
+        'Read-only health of the repo map: whether the scan root exists and is readable, how many source files it sees, and the scan-cache and budget settings. Call it when repo_map returns nothing or a path looks wrong.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Root directory to check (defaults to the session working directory).' },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
+            code: { type: 'string' },
+            root: { type: 'string' },
+            exists: { type: 'boolean' },
+            isDirectory: { type: 'boolean' },
+            readable: { type: 'boolean' },
+            sources: { type: 'integer' },
+            skippedLarge: { type: 'integer' },
+            skippedUnsupported: { type: 'integer' },
+            cache: {
+              type: 'object',
+              properties: { hits: { type: 'integer' }, misses: { type: 'integer' }, size: { type: 'integer' } },
+              required: ['hits', 'misses', 'size'],
+              additionalProperties: false,
+            },
+            maxChars: { type: 'integer' },
+            maxFiles: { type: 'integer' },
+            maxCacheEntries: { type: 'integer' },
+            configWarning: { type: 'string' },
+          },
+          required: ['ready', 'root', 'exists', 'isDirectory', 'readable', 'sources', 'cache', 'maxChars', 'maxFiles', 'maxCacheEntries'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          if (value?.ready === false) return [text('不可用：' + (value?.unavailableReason || '未知原因'))]
+          const cache = value?.cache ?? {}
+          return [
+            text(
+              `代码库地图可用：扫描根 ${value?.root ?? '?'}，识别 ${value?.sources ?? 0} 个源文件` +
+                `（跳过超大 ${value?.skippedLarge ?? 0}、不支持 ${value?.skippedUnsupported ?? 0}），` +
+                `扫描缓存 ${cache.size ?? 0} 份（命中 ${cache.hits ?? 0} / 未命中 ${cache.misses ?? 0}），` +
+                `预算 ${value?.maxChars ?? 0} 字符 / 上限 ${value?.maxFiles ?? 0} 个文件。`,
+            ),
+          ]
+        },
+      },
+      async execute(args, exec) {
+        const root = await resolveRoot(exec, args?.path)
+        const problems = []
+        let code = ''
+        const note = (nextCode, reason) => {
+          problems.push(reason)
+          if (code === '') code = nextCode
+        }
+
+        // 配置非法不改行为（仍按夹取后的默认值跑），但如实报出来。
+        const configWarnings = []
+        for (const [key, floor] of [
+          ['maxChars', 64000],
+          ['maxFiles', 20000],
+          ['maxCacheEntries', MAX_CACHE_ENTRIES_LIMIT],
+        ]) {
+          const value = config?.[key]
+          if (value !== undefined && !(Number.isInteger(value) && value > 0)) {
+            configWarnings.push(`${key} 需要正整数，收到 ${JSON.stringify(value)}（已回落到默认值）`)
+          } else if (Number.isInteger(value) && value > floor) {
+            configWarnings.push(`${key}=${value} 超过上限 ${floor}（已夹取到 ${floor}）`)
+          }
+        }
+
+        const exists = existsSync(root)
+        let isDirectory = false
+        let readable = false
+        let sources = 0
+        let skippedLarge = 0
+        let skippedUnsupported = 0
+
+        if (!exists) {
+          note('REPO_ROOT_MISSING', '扫描根不存在：' + root)
+        } else {
+          try {
+            isDirectory = statSync(root).isDirectory()
+          } catch (error) {
+            note('REPO_ROOT_UNREADABLE', '扫描根 stat 失败：' + (error?.message ?? 'unknown'))
+          }
+          if (exists && !isDirectory) note('REPO_ROOT_NOT_DIRECTORY', '扫描根不是目录：' + root)
+        }
+
+        if (exists && isDirectory) {
+          // collectEntries 内部会吞掉 readdir 失败（正常扫描想要的宽容），所以可读性必须自己先真读一次。
+          try {
+            readdirSync(root)
+            readable = true
+          } catch (error) {
+            note('REPO_ROOT_UNREADABLE', '扫描根不可读：' + (error?.message ?? 'unknown'))
+          }
+          if (readable) {
+            try {
+              // 只 readdir + stat，与 repo_map 的冷扫描同一段代码；不读文件内容，状态查询不贵。
+              const collected = collectEntries(root, { maxFiles, maxBytes: MAX_SCAN_BYTES })
+              sources = collected.entries.length
+              skippedLarge = collected.skippedLarge
+              skippedUnsupported = collected.skippedUnsupported
+            } catch (error) {
+              note('REPO_ROOT_UNREADABLE', '扫描根不可读：' + (error?.message ?? 'unknown'))
+            }
+          }
+        }
+
+        const ready = problems.length === 0
+        return {
+          ready,
+          unavailableReason: problems.join('；'),
+          ...(ready ? {} : { code }),
+          root,
+          exists,
+          isDirectory,
+          readable,
+          sources,
+          skippedLarge,
+          skippedUnsupported,
+          cache: scanner.stats(),
+          maxChars: defaultMaxChars,
+          maxFiles,
+          maxCacheEntries,
+          ...(configWarnings.length > 0 ? { configWarning: configWarnings.join('；') } : {}),
+        }
       },
     }),
   )

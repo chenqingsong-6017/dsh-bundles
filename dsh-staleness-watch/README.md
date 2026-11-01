@@ -50,3 +50,14 @@ staleness-watch 已拦截: 目标 pid=100 window=7 已连续 2 次输入操作�
 - 只按 `pid/window_id` 识别目标；某些工具用别的定位方式时不会被统计；
 - 不感知"内容是否真的变了"，只计"有没有重新观察"；
 - `block` 模式会改变执行结果（拒绝），排查问题时先切回 `warn`。
+
+## 验证记录（2026-11-01，统一契约：ready / unavailableReason / 错误 code）
+
+| 项 | 结果 |
+|---|---|
+| `staleness_status` | 新增（本插件首个工具）；`ready` 现算：配置合法 + `ctx.tools.guard` 与 `ctx.on('tools/post-execute')` **真的挂上了**（挂载结果记在局部变量里，不是写死） |
+| 挂载方式 | 两个回调从内联箭头改成命名常量（`guardHook` / `postHook`），挂载成功才置位；行为与文案未变 |
+| `ready:false` 的 code | 配置非法 → `STALENESS_CONFIG_INVALID`；钩子缺失 → `STALENESS_HOOKS_UNAVAILABLE` |
+| `node --check index.js` | 通过 |
+| `node _selftest/tests/staleness-watch.test.mjs` | 6 项通过，退出码 0 |
+| 契约真机校验 | 正常挂载 `ready:true`；去掉 `ctx.tools.guard` 后 `ready:false`；`mode: nonsense` / `maxBlindActions: -1` → `ready:false` |

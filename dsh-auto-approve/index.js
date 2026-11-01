@@ -709,6 +709,8 @@ export function apply(ctx, config) {
     type: 'object',
     properties: {
       enabled: { type: 'boolean' },
+      ready: { type: 'boolean' },
+      unavailableReason: { type: 'string' },
       builtinsEnabled: { type: 'boolean' },
       llmEnabled: { type: 'boolean' },
       files: {
@@ -765,6 +767,7 @@ export function apply(ctx, config) {
     },
     required: [
       'enabled',
+      'ready',
       'builtinsEnabled',
       'llmEnabled',
       'files',
@@ -831,6 +834,7 @@ export function apply(ctx, config) {
       if (errors.length > 8) lines.push('  … 还有 ' + (errors.length - 8) + ' 条')
     }
     if (typeof value?.lastError === 'string' && value.lastError !== '') lines.push('最近一次异常：' + value.lastError)
+    if (value?.ready === false) lines.unshift('不可用：' + (value?.unavailableReason || '未知原因'))
     return [text(lines.join('\n'))]
   }
 
@@ -843,13 +847,32 @@ export function apply(ctx, config) {
       output: { schema: statusSchema, render: renderStatus },
       async execute(_args, exec) {
         const cwd = cwdOf(exec?.agent?.session ?? exec?.agent ?? exec?.session)
-        const layers = [layersOf(cwd).project, layersOf(cwd).user]
+        const loaded = layersOf(cwd)
+        const layers = [loaded.project, loaded.user]
         const errors = []
         for (const entry of layers) {
           for (const error of entry.errors) errors.push(entry.file + '：' + error)
         }
+        // ready 判据：能真正参与审批吗 —— 插件启用，且（项目级/用户级规则文件可读 或 内置红线开着）
+        const projectUsable = loaded.project.exists && loaded.project.errors.length === 0
+        const userUsable = loaded.user.exists && loaded.user.errors.length === 0
+        const builtinRules = settings.builtins ? BUILTIN_REDLINES.length : 0
+        let ready = true
+        let unavailableReason = ''
+        if (!settings.enabled) {
+          ready = false
+          unavailableReason = '插件已停用（enabled: false），规则不参与审批'
+        } else if (!projectUsable && !userUsable && builtinRules === 0) {
+          ready = false
+          unavailableReason =
+            '规则文件都读不出来，且内置红线已关闭：项目级 ' +
+            (loaded.project.file === '' ? '未配置' : loaded.project.file) +
+            '；先用 auto_approve_status 的 errors 排查，或把 builtins 打开'
+        }
         return {
           enabled: settings.enabled,
+          ready,
+          unavailableReason,
           builtinsEnabled: settings.builtins,
           llmEnabled: settings.llm.enabled,
           files: layers.map((entry) => ({
@@ -861,7 +884,7 @@ export function apply(ctx, config) {
           })),
           projectRules: layers[0].rules.length,
           userRules: layers[1].rules.length,
-          builtinRules: settings.builtins ? BUILTIN_REDLINES.length : 0,
+          builtinRules,
           maxRecords: settings.maxRecords,
           stats: { ...stats },
           recent: recent

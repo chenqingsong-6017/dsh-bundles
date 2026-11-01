@@ -612,6 +612,8 @@ export function apply(ctx, config) {
   const statusSchema = {
     type: 'object',
     properties: {
+      ready: { type: 'boolean' },
+      unavailableReason: { type: 'string' },
       enabled: { type: 'boolean' },
       ruleDirs: {
         type: 'array',
@@ -677,6 +679,8 @@ export function apply(ctx, config) {
       },
     },
     required: [
+      'ready',
+      'unavailableReason',
       'enabled',
       'ruleDirs',
       'totalRules',
@@ -692,6 +696,7 @@ export function apply(ctx, config) {
   }
 
   const statusRender = (_args, value) => {
+    if (value?.ready === false) return [text('不可用：' + (value.unavailableReason || '未知原因'))]
     const dirs = Array.isArray(value?.ruleDirs) ? value.ruleDirs : []
     const layers = Array.isArray(value?.layers) ? value.layers : []
     const active = Array.isArray(value?.activeRules) ? value.activeRules : []
@@ -747,6 +752,8 @@ export function apply(ctx, config) {
           }
           return { dir: entry.dir, exists, rules }
         })
+        // ready 的真实判据：至少一个规则目录真的读得动（exists 只在 readdirSync 成功时为 true）
+        const readableDirs = dirs.filter((entry) => entry.exists)
         const activeRules = composed.active.map((entry) => ({
           file: toSlash(entry.rule.file),
           source: layerLabel(entry.rule.layer),
@@ -774,6 +781,10 @@ export function apply(ctx, config) {
           },
         ]
         return {
+          ready: readableDirs.length > 0,
+          unavailableReason: readableDirs.length > 0
+            ? ''
+            : '规则目录都不可读（' + dirs.map((entry) => entry.dir).join(' / ') + '）',
           enabled: true,
           ruleDirs: dirs,
           totalRules: dirs.reduce((sum, entry) => sum + entry.rules, 0),

@@ -20,6 +20,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 | `memory_audit` | 只读审计（给模型）：重复候选（bigram 相似度）、过期候选（从未使用且 >N 天）、使用排行、scope 分布、预算 |
 | `memory_review` | 记忆概览（给人看，v2.8）：已过期 / 未证实 / 从未引用 / 硬规则四段 + scope 分布 + 容量，写入 `review-latest.md` |
 | `memory_remove` | 删某条（物理删除；要留历史用 `memory_update` 的 supersede） |
+| `memory_status` | 只读诊断（v4.2）：**现算** `ready`（损坏保护 / 只读降级 / 主库可解析 / 数据目录真的可写），给出 `unavailableReason` + `code`、库路径与字节数、条目数与预算占用 |
 
 ## 机制
 
@@ -957,3 +958,13 @@ memory_add {..., status: "draft"}        # 先存成待证实
 | 三道门 | 见本轮验证门输出 |
 
 > **v4.0 生效需重启 DSH**：`index.js` 只在进程启动时求值。
+
+## 验证记录（2026-11-01，统一契约：ready / unavailableReason / 错误 code）
+
+| 项 | 结果 |
+|---|---|
+| `memory_status` | 新增（第 14 个工具）；`ready` 现算四件事：损坏保护 / 只读降级 / 主库 JSON 可解析 / 数据目录写探针文件成功，全过才是 true |
+| 错误 `code` | 36 处 `throw` 改走 `fail('<CODE>', …)`，错误对象带 `code`（`MEMORY_ARG_MISSING` / `MEMORY_STORE_UNREADABLE` / `MEMORY_BUDGET_EXCEEDED` / `MEMORY_STORE_CORRUPT` …） |
+| `node --check index.js` | 通过 |
+| `node _selftest/tests/memory.test.mjs` | 131 项通过，退出码 0 |
+| 契约真机校验（mock ctx + 真实临时库） | schema 严格通过（`additionalProperties:false` 不拒）；健康库 `ready:true`、损坏库 `ready:false` + `MEMORY_STORE_CORRUPT`、目录不可建 `ready:false` |

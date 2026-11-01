@@ -71,5 +71,6 @@ config:
 | `node --check index.js` | 通过 |
 | 单测 `_selftest/tests/eventlog.test.mjs` | 见验证门输出 |
 | 真机写入 / 查询 / 状态 | 待重启后验证（见 `D:\AI\dsh-data\restart\pending.md`） |
+| 统一契约（v0.1.4，2026-11-01） | `log_status` 新增 `ready` / `unavailableReason`（真判断：对日志目录做一次「建目录 → 列目录 → 写探针 → 删探针」）；`log_write` 失败带 `code`（`EMPTY_MESSAGE` / `LEVEL_FILTERED` / `WRITE_FAILED`） | 可写目录 → `ready:true`；目录建不出来 → `ready:false` + 「不可用：日志目录不可写/不可读（…）：ENOTDIR…」；三种失败码逐个实测 ✅ |
 
 > **生效需重启 DSH**（插件 index.js 只在进程启动时求值）。

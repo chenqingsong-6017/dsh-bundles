@@ -341,11 +341,11 @@ export function apply(ctx, config) {
       const cached = cache.get(file)
       if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached
       const parsed = parseHooksConfig(readFileSync(file, 'utf8'))
-      const entry = { mtimeMs: stat.mtimeMs, size: stat.size, hooks: parsed.hooks, errors: parsed.errors }
+      const entry = { mtimeMs: stat.mtimeMs, size: stat.size, hooks: parsed.hooks, errors: parsed.errors, readable: true }
       cache.set(file, entry)
       return entry
     } catch (error) {
-      return { mtimeMs: 0, size: 0, hooks: [], errors: [`读不到：${error instanceof Error ? error.message : String(error)}`] }
+      return { mtimeMs: 0, size: 0, hooks: [], errors: [`读不到：${error instanceof Error ? error.message : String(error)}`], readable: false }
     }
   }
 
@@ -353,14 +353,16 @@ export function apply(ctx, config) {
     const files = []
     const hooks = []
     const errors = []
+    let unreadable = 0
     for (const file of candidateFiles(cwd, fileOverride)) {
       if (!existsSync(file)) continue
       const entry = loadFile(file)
       files.push(file)
+      if (entry.readable === false) unreadable += 1
       for (const hook of entry.hooks) hooks.push({ ...hook, source: file })
       for (const error of entry.errors) errors.push(`${file}：${error}`)
     }
-    return { files, hooks: hooks.slice(0, maxHooks), errors }
+    return { files, hooks: hooks.slice(0, maxHooks), errors, unreadable }
   }
 
   function cwdFor(agentId) {
@@ -512,6 +514,8 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
             enabled: { type: 'boolean' },
             configured: { type: 'boolean' },
             files: { type: 'array', items: { type: 'string' } },
@@ -533,19 +537,18 @@ export function apply(ctx, config) {
             errors: { type: 'array', items: { type: 'string' } },
             lastError: { type: 'string' },
           },
-          required: ['enabled', 'configured', 'files', 'candidates', 'hookCount', 'byEvent', 'runs', 'denials', 'asks', 'recent', 'errors', 'lastError'],
+          required: ['ready', 'unavailableReason', 'enabled', 'configured', 'files', 'candidates', 'hookCount', 'byEvent', 'runs', 'denials', 'asks', 'recent', 'errors', 'lastError'],
           additionalProperties: false,
         },
         render(_args, value) {
-          if (!value?.configured) {
-            return [
-              text(
-                `dsh-hooks 还没生效：没有找到 hooks 配置文件。\n` +
-                  `配置写法：${value?.candidates?.[0] ?? '<DSH_HOME>/hooks.json'}\n` +
-                  `最小示例：{"hooks":[{"event":"tool.pre","match":"^(bash|pwsh)$","run":"node check.mjs"}]}\n` +
-                  `改完不用重启，下一次工具调用就会生效。`,
-              ),
-            ]
+          if (value?.ready === false) {
+            const lines = [`不可用：${value.unavailableReason || '未知原因'}`]
+            if (!value?.configured) {
+              lines.push(`配置写法：${value?.candidates?.[0] ?? '<DSH_HOME>/hooks.json'}`)
+              lines.push(`最小示例：{"hooks":[{"event":"tool.pre","match":"^(bash|pwsh)$","run":"node check.mjs"}]}`)
+              lines.push(`改完不用重启，下一次工具调用就会生效。`)
+            }
+            return [text(lines.join('\n'))]
           }
           const events = Object.entries(value.byEvent ?? {})
             .filter(([, count]) => count > 0)
@@ -579,7 +582,21 @@ export function apply(ctx, config) {
         const loaded = load('')
         const byEvent = Object.fromEntries(EVENT_NAMES.map((event) => [event, 0]))
         for (const hook of loaded.hooks) byEvent[hook.event] = (byEvent[hook.event] ?? 0) + 1
+        const ready = loaded.files.length > 0 && loaded.hooks.length > 0 && loaded.unreadable === 0
+        let unavailableReason = ''
+        if (!ready) {
+          if (loaded.files.length === 0) {
+            unavailableReason = `没有找到 hooks.json（候选：${candidateFiles('', fileOverride).join(' / ')}）`
+          } else if (loaded.unreadable > 0) {
+            const first = loaded.errors.find((item) => item.includes('读不到：')) ?? loaded.errors[0] ?? '未知原因'
+            unavailableReason = `hooks.json 读不了（${first}）`
+          } else {
+            unavailableReason = `hooks.json 里没有可用的钩子（0 条${loaded.errors.length > 0 ? `；首个问题：${loaded.errors[0]}` : ''}）`
+          }
+        }
         return {
+          ready,
+          unavailableReason,
           enabled,
           configured: loaded.files.length > 0,
           files: loaded.files,
@@ -622,10 +639,11 @@ export function apply(ctx, config) {
             tool: { type: 'string' },
             matched: { type: 'number' },
             decision: { type: 'string' },
+            code: { type: 'string' },
             results: { type: 'array', items: { type: 'object', additionalProperties: true } },
             notes: { type: 'array', items: { type: 'string' } },
           },
-          required: ['event', 'tool', 'matched', 'decision', 'results', 'notes'],
+          required: ['event', 'tool', 'matched', 'decision', 'code', 'results', 'notes'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -650,6 +668,7 @@ export function apply(ctx, config) {
             tool: String(args?.tool ?? ''),
             matched: 0,
             decision: 'unknown',
+            code: 'UNKNOWN_EVENT',
             results: [],
             notes: [`event 认不出，可用：${EVENT_NAMES.join(' / ')}`],
           }
@@ -670,6 +689,7 @@ export function apply(ctx, config) {
           tool: toolName,
           matched: matching.length,
           decision,
+          code: '',
           results: results.map((item) => ({
             hook: item.hook.name,
             source: item.hook.source,
@@ -698,9 +718,10 @@ export function apply(ctx, config) {
           properties: {
             files: { type: 'array', items: { type: 'string' } },
             hookCount: { type: 'number' },
+            code: { type: 'string' },
             errors: { type: 'array', items: { type: 'string' } },
           },
-          required: ['files', 'hookCount', 'errors'],
+          required: ['files', 'hookCount', 'code', 'errors'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -716,7 +737,14 @@ export function apply(ctx, config) {
       async execute() {
         cache.clear()
         const loaded = load('')
-        return { files: loaded.files, hookCount: loaded.hooks.length, errors: loaded.errors }
+        const code = loaded.errors.length > 0
+          ? 'CONFIG_INVALID'
+          : loaded.files.length === 0
+            ? 'CONFIG_MISSING'
+            : loaded.hooks.length === 0
+              ? 'NO_HOOKS'
+              : ''
+        return { files: loaded.files, hookCount: loaded.hooks.length, code, errors: loaded.errors }
       },
     }),
   )

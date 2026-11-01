@@ -126,7 +126,8 @@ paths:
 
 ## 六、诊断：`path_rules_status`
 
-只读、不注入，专门回答"到底哪几条在生效、为什么"：
+只读、不注入，专门回答"到底哪几条在生效、为什么"。
+统一契约（v1.0.1，2026-11-01）：返回值必带 `ready` 与 `unavailableReason`（空串=可用），两者都在 `required` 里；`ready` 为真判断——只要有**一个**规则目录 `readdirSync` 成功即为 `true`，全都读不动则 `ready:false` 且渲染只输出「不可用：<原因>」。本轮验证：项目级+用户级目录都可读 → `ready:true`；两个目录都不存在 → `ready:false` + 「不可用：规则目录都不可读（…）」。
 
 ```
 路径规则：共扫到 4 条，当前生效 3 条
@@ -234,7 +235,11 @@ path-rules: 25 项通过
 
 本插件是并行开发的一条，**没有在这台 DSH 里安装**（安装与全量验证门由集成方统一做）。所以第 9.3 节的渲染输出是模块级的真实调用，不等于"装进 DSH 后在真实会话里看到了 path-rules 块"。装机后需要补一条：新开会话、写一条 `always: true` 规则、看系统提示里是否出现核心层；再读一个匹配 `paths` 的文件、看路径层是否补进来。
 
-### 9.5 v1 的历史验证（2026-10-29，作为背景）
+### 9.5 统一契约验证（2026-11-01，v1.0.1）
+
+`path_rules_status` 加 `ready` / `unavailableReason` 后重跑：`node --check` 通过、`_selftest/tests/path-rules.test.mjs` **25 项全过**（含第 364–365 行「返回字段与 schema 完全一致 / required 覆盖全部字段」）；真实模块验证两条路径——项目级+用户级规则目录都可读 → `ready:true` 照常输出，两个目录都不存在 → `ready:false` 且首行「不可用：规则目录都不可读（…）」。
+
+### 9.6 v1 的历史验证（2026-10-29，作为背景）
 
 v1（0.1.0）当时装进本机 profile 做过真实验证，并借此抓到一个单测抓不到的 bug：`path_rules_status` 原来用 `process.cwd()`（= profile 目录）算规则目录，诊断显示成 `C:\Users\...\profiles\desktop\.dsh\rules`。修法是从工具执行的 `exec.agent.session` 直接取会话工作目录。v2 保留了这个修法，并把"拿不到 cwd 就不注入"写成明确行为（见第八节）。
 

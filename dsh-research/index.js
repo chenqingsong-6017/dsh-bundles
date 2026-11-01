@@ -209,6 +209,22 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * status.ready 的真实判据：store.json 存在、解析得开、tasks 是数组。
+   * 不存在不算「坏」而是「还没建」——但对调用方同样不可用，所以 ready:false + 原因。
+   */
+  function storeReadiness() {
+    const file = storeFile()
+    if (!existsSync(file)) return { ready: false, unavailableReason: 'store.json 不存在（' + file + '）：先跑一次 research_new' }
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      if (!parsed || !Array.isArray(parsed.tasks)) return { ready: false, unavailableReason: 'store.json 结构不对（tasks 不是数组）：' + file }
+      return { ready: true, unavailableReason: '' }
+    } catch (error) {
+      return { ready: false, unavailableReason: 'store.json 读不了：' + errText(error).slice(0, 160) }
+    }
+  }
+
   function saveStore(store) {
     try {
       mkdirSync(storeDir, { recursive: true })
@@ -290,7 +306,7 @@ export function apply(ctx, config) {
       output: {
         schema: {
           type: 'object',
-          properties: { ok: { type: 'boolean' }, id: { type: 'string' }, question: { type: 'string' }, decision: { type: 'string' }, createdAt: { type: 'string' }, lastError: { type: 'string' } },
+          properties: { ok: { type: 'boolean' }, code: { type: 'string' }, id: { type: 'string' }, question: { type: 'string' }, decision: { type: 'string' }, createdAt: { type: 'string' }, lastError: { type: 'string' } },
           required: ['ok'],
           additionalProperties: true,
         },
@@ -302,10 +318,10 @@ export function apply(ctx, config) {
         try {
           const question = strValue(args?.question).slice(0, MAX_QUESTION)
           const decision = strValue(args?.decision).replace(/\s+/g, ' ').slice(0, MAX_DECISION)
-          if (question.length < 4) return { ok: false, lastError: 'question 太短（至少 4 字），先把要找什么说清' }
-          if (decision.length < 8) return { ok: false, lastError: 'decision 太短（至少 8 字）：这条结论要决定什么？含糊的问题不开工' }
+          if (question.length < 4) return { ok: false, code: 'QUESTION_TOO_SHORT', lastError: 'question 太短（至少 4 字），先把要找什么说清' }
+          if (decision.length < 8) return { ok: false, code: 'DECISION_TOO_SHORT', lastError: 'decision 太短（至少 8 字）：这条结论要决定什么？含糊的问题不开工' }
           const store = loadStore()
-          if (store.tasks.length >= MAX_TASKS) return { ok: false, lastError: '任务数已达上限 ' + MAX_TASKS + '，先把旧任务收尾' }
+          if (store.tasks.length >= MAX_TASKS) return { ok: false, code: 'TASK_LIMIT', lastError: '任务数已达上限 ' + MAX_TASKS + '，先把旧任务收尾' }
           const tags = Array.isArray(args?.tags) ? args.tags.map((item) => strValue(item)).filter((item) => item !== '').slice(0, 8) : []
           const task = {
             id: makeId(args?.slug),
@@ -317,11 +333,11 @@ export function apply(ctx, config) {
             evidence: [],
           }
           store.tasks.push(task)
-          if (!saveStore(store)) return { ok: false, lastError: lastError || '写 store 失败' }
-          return { ok: true, id: task.id, question: task.question, decision: task.decision, createdAt: task.createdAt, lastError }
+          if (!saveStore(store)) return { ok: false, code: 'STORE_WRITE_FAILED', lastError: lastError || '写 store 失败' }
+          return { ok: true, code: '', id: task.id, question: task.question, decision: task.decision, createdAt: task.createdAt, lastError }
         } catch (error) {
           note(error)
-          return { ok: false, lastError }
+          return { ok: false, code: 'UNEXPECTED_FAILURE', lastError }
         }
       },
     }),
@@ -349,7 +365,7 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
-            ok: { type: 'boolean' }, id: { type: 'string' }, evidenceId: { type: 'string' }, claim: { type: 'string' },
+            ok: { type: 'boolean' }, code: { type: 'string' }, id: { type: 'string' }, evidenceId: { type: 'string' }, claim: { type: 'string' },
             refKind: { type: 'string' }, verified: { type: 'boolean' }, note: { type: 'string' }, lastError: { type: 'string' },
           },
           required: ['ok'],
@@ -364,20 +380,20 @@ export function apply(ctx, config) {
       async execute(args) {
         try {
           const claim = strValue(args?.claim).replace(/\s+/g, ' ').slice(0, MAX_CLAIM)
-          if (claim.length < 4) return { ok: false, lastError: 'claim 太短（至少 4 字）' }
+          if (claim.length < 4) return { ok: false, code: 'CLAIM_TOO_SHORT', lastError: 'claim 太短（至少 4 字）' }
           const tier = normalizeTier(args?.tier)
-          if (tier === '') return { ok: false, lastError: 'tier 必须是 ' + TIERS.join(' / ') }
+          if (tier === '') return { ok: false, code: 'INVALID_TIER', lastError: 'tier 必须是 ' + TIERS.join(' / ') }
           const store = loadStore()
           const task = pickTask(store, args?.item)
-          if (!task) return { ok: false, lastError: '没有可用的任务：先用 research_new 建一个' }
-          if (task.status !== 'open') return { ok: false, lastError: '任务 ' + task.id + ' 已关闭，先 reopen 或新建' }
+          if (!task) return { ok: false, code: 'NO_TASK', lastError: '没有可用的任务：先用 research_new 建一个' }
+          if (task.status !== 'open') return { ok: false, code: 'TASK_CLOSED', lastError: '任务 ' + task.id + ' 已关闭，先 reopen 或新建' }
           if (!Array.isArray(task.evidence)) task.evidence = []
-          if (task.evidence.length >= MAX_EVIDENCE) return { ok: false, lastError: '该任务证据已达上限 ' + MAX_EVIDENCE }
+          if (task.evidence.length >= MAX_EVIDENCE) return { ok: false, code: 'EVIDENCE_LIMIT', lastError: '该任务证据已达上限 ' + MAX_EVIDENCE }
           const inferred = args?.inferred === true
           const ref = strValue(args?.ref)
           const parsed = parseRef(ref)
           if (!inferred && parsed.kind === 'none') {
-            return { ok: false, lastError: '证据必须能回到一行：给 http(s) 链接或 文件:行；确实没取证就传 inferred:true（会进未验证区）' }
+            return { ok: false, code: 'EVIDENCE_UNVERIFIABLE', lastError: '证据必须能回到一行：给 http(s) 链接或 文件:行；确实没取证就传 inferred:true（会进未验证区）' }
           }
           const confidence = normalizeConfidence(args?.confidence, tier)
           const item = {
@@ -403,11 +419,11 @@ export function apply(ctx, config) {
             noteText = '标了 inferred，进未验证区'
           }
           task.evidence.push(item)
-          if (!saveStore(store)) return { ok: false, lastError: lastError || '写 store 失败' }
-          return { ok: true, id: task.id, evidenceId: item.id, claim, refKind: parsed.kind, verified, note: noteText, lastError }
+          if (!saveStore(store)) return { ok: false, code: 'STORE_WRITE_FAILED', lastError: lastError || '写 store 失败' }
+          return { ok: true, code: '', id: task.id, evidenceId: item.id, claim, refKind: parsed.kind, verified, note: noteText, lastError }
         } catch (error) {
           note(error)
-          return { ok: false, lastError }
+          return { ok: false, code: 'UNEXPECTED_FAILURE', lastError }
         }
       },
     }),
@@ -422,7 +438,7 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
-            ok: { type: 'boolean' }, id: { type: 'string' }, evidence: { type: 'integer' }, missingEvidence: { type: 'integer' },
+            ok: { type: 'boolean' }, code: { type: 'string' }, id: { type: 'string' }, evidence: { type: 'integer' }, missingEvidence: { type: 'integer' },
             inferred: { type: 'integer' }, uncheckedUrls: { type: 'integer' }, lowConfidence: { type: 'integer' },
             brokenRefs: { type: 'array', items: { type: 'object', additionalProperties: true } },
             canClose: { type: 'boolean' }, tiers: { type: 'object', additionalProperties: true }, lastError: { type: 'string' },
@@ -439,11 +455,11 @@ export function apply(ctx, config) {
         try {
           const store = loadStore()
           const task = pickTask(store, args?.item)
-          if (!task) return { ok: false, lastError: '任务不存在（也没有 open 任务）' }
+          if (!task) return { ok: false, code: 'NO_TASK', lastError: '任务不存在（也没有 open 任务）' }
           return taskSummary(task)
         } catch (error) {
           note(error)
-          return { ok: false, lastError }
+          return { ok: false, code: 'UNEXPECTED_FAILURE', lastError }
         }
       },
     }),
@@ -468,7 +484,7 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
-            ok: { type: 'boolean' }, id: { type: 'string' }, path: { type: 'string' }, bytes: { type: 'integer' },
+            ok: { type: 'boolean' }, code: { type: 'string' }, id: { type: 'string' }, path: { type: 'string' }, bytes: { type: 'integer' },
             evidence: { type: 'integer' }, inferred: { type: 'integer' }, closed: { type: 'boolean' },
             blockedBy: { type: 'array', items: { type: 'string' } }, lastError: { type: 'string' },
           },
@@ -484,18 +500,18 @@ export function apply(ctx, config) {
         try {
           const store = loadStore()
           const task = pickTask(store, args?.item)
-          if (!task) return { ok: false, lastError: '任务不存在（也没有 open 任务）' }
+          if (!task) return { ok: false, code: 'NO_TASK', lastError: '任务不存在（也没有 open 任务）' }
           const lint = lintTask(task, fileChecker)
           if (!lint.canClose && args?.allowIncomplete !== true) {
             const blocked = []
             if (lint.missingEvidence > 0) blocked.push(lint.missingEvidence + ' 条结论没有可核对的落点')
             if (lint.brokenRefs.length > 0) blocked.push(lint.brokenRefs.length + ' 条文件引用查不到')
             if (lint.total === 0) blocked.push('还没有任何证据')
-            return { ok: false, id: task.id, blockedBy: blocked, lastError: '先补齐证据，或用 allowIncomplete:true 明确标注不完整' }
+            return { ok: false, code: 'UNVERIFIED_BLOCKED', id: task.id, blockedBy: blocked, lastError: '先补齐证据，或用 allowIncomplete:true 明确标注不完整' }
           }
           const visible = Object.assign({}, task, { title: strValue(args?.title) || task.question })
           const markdown = renderReport(visible, Date.now())
-          if (markdown.length > MAX_OUT_BYTES) return { ok: false, lastError: '报告过大（> ' + MAX_OUT_BYTES + ' 字节）' }
+          if (markdown.length > MAX_OUT_BYTES) return { ok: false, code: 'REPORT_TOO_LARGE', lastError: '报告过大（> ' + MAX_OUT_BYTES + ' 字节）' }
           const rawOut = strValue(args?.outPath)
           const outPath = rawOut !== '' ? (path.isAbsolute(rawOut) ? rawOut : path.resolve(workspaceDir, rawOut)) : path.join(defaultOutDir, 'research-' + task.id + '.md')
           mkdirSync(path.dirname(outPath), { recursive: true })
@@ -504,10 +520,10 @@ export function apply(ctx, config) {
           renameSync(tmp, outPath)
           let closed = false
           if (args?.close === true) { task.status = 'closed'; closed = saveStore(store) }
-          return { ok: true, id: task.id, path: outPath, bytes: Buffer.byteLength(markdown, 'utf8'), evidence: lint.total - lint.missingEvidence, inferred: lint.inferred, closed, lastError }
+          return { ok: true, code: '', id: task.id, path: outPath, bytes: Buffer.byteLength(markdown, 'utf8'), evidence: lint.total - lint.missingEvidence, inferred: lint.inferred, closed, lastError }
         } catch (error) {
           note(error)
-          return { ok: false, lastError }
+          return { ok: false, code: 'UNEXPECTED_FAILURE', lastError }
         }
       },
     }),
@@ -522,21 +538,23 @@ export function apply(ctx, config) {
         schema: {
           type: 'object',
           properties: {
-            ok: { type: 'boolean' }, storeDir: { type: 'string' }, storeFile: { type: 'string' }, storeBytes: { type: 'integer' },
+            ok: { type: 'boolean' }, code: { type: 'string' }, storeDir: { type: 'string' }, storeFile: { type: 'string' }, storeBytes: { type: 'integer' },
+            ready: { type: 'boolean' }, unavailableReason: { type: 'string' },
             tasks: { type: 'integer' }, open: { type: 'integer' }, closed: { type: 'integer' },
             evidenceTotal: { type: 'integer' }, inferredTotal: { type: 'integer' }, tiers: { type: 'object', additionalProperties: true },
             latest: { type: 'string' }, lastError: { type: 'string' },
           },
-          required: ['ok', 'tasks', 'open', 'evidenceTotal'],
+          required: ['ok', 'ready', 'unavailableReason', 'tasks', 'open', 'evidenceTotal'],
           additionalProperties: true,
         },
         render(_args, value) {
-          if (value.ok === false) return [text('research 不可用：' + (value.lastError || '未知原因'))]
+          if (value.ready === false) return [text('不可用：' + (value.unavailableReason || value.lastError || '未知原因'))]
           return [text('research：任务 ' + value.tasks + '（open ' + value.open + '）/ 证据 ' + value.evidenceTotal + ' 条 / 推断 ' + value.inferredTotal + ' 条')]
         },
       },
       async execute() {
         try {
+          const readiness = storeReadiness()
           const store = loadStore()
           const tiers = {}
           let evidenceTotal = 0
@@ -554,9 +572,12 @@ export function apply(ctx, config) {
           const latest = store.tasks.length ? store.tasks[store.tasks.length - 1].id : ''
           return {
             ok: true,
+            code: '',
             storeDir,
             storeFile: storeFile(),
             storeBytes: bytes,
+            ready: readiness.ready,
+            unavailableReason: readiness.unavailableReason,
             tasks: store.tasks.length,
             open: openTasks.length,
             closed: store.tasks.length - openTasks.length,
@@ -568,7 +589,7 @@ export function apply(ctx, config) {
           }
         } catch (error) {
           note(error)
-          return { ok: false, storeDir, storeFile: storeFile(), storeBytes: 0, tasks: 0, open: 0, closed: 0, evidenceTotal: 0, inferredTotal: 0, tiers: {}, latest: '', lastError }
+          return { ok: false, code: 'STATUS_FAILED', storeDir, storeFile: storeFile(), storeBytes: 0, ready: false, unavailableReason: '读取状态失败：' + lastError, tasks: 0, open: 0, closed: 0, evidenceTotal: 0, inferredTotal: 0, tiers: {}, latest: '', lastError }
         }
       },
     }),

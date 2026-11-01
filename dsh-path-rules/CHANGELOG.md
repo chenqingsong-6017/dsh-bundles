@@ -1,5 +1,10 @@
 # CHANGELOG — dsh-path-rules
 
+## 1.0.1 — 2026-11-01
+
+- **统一状态契约**：`path_rules_status` 新增 `ready` / `unavailableReason`（两者都进 `required`，`unavailableReason` 为空串表示可用）。`ready` 是真判断——至少一个规则目录 `readdirSync` 成功（`exists` 字段即「读得动」）。`ready:false` 时渲染只输出「不可用：<原因>」。
+- 该工具没有其它错误返回路径，因此本轮没有新增错误码；返回字段与 schema 仍严格一一对应（测试第 364–365 行的断言保持有效）。
+
 ## 1.0.0 — 2026-10-30
 
 - 三层优先级：用户级 < 项目级 < 路径命中；同 `id` 时更近/更具体的层覆盖更远的层。
