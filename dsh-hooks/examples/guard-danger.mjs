@@ -1,9 +1,18 @@
 /**
- * 危险命令拦截（tool.pre · bash/pwsh）—— v2：LOLBAS / Sigma / OWASP 2026 规则集
+ * 危险命令拦截（tool.pre · bash/pwsh）—— v3（2026-11-01 修误报）
+ * @guard-revision: 2026-11-01-falsepositive-fix
  *
- * 与 v1 差别：先归一化（小写、去引号与脱字符、合并空白）再匹配，防 cer""tutil / cert^util 拆词；
- * 规则从 23 条扩到 37 条（来源见 _research/security-guardrails.md R01-R27）。
- * 上限：正则只是黑名单，自适应攻击能绕（OWASP LLM01:91），真正的控制在能力与审批层。
+ * v3 相对 v2 的改动（根因见 D:/AI/dsh-data/tmp/guard-fix/README.md）：
+ *   1) 「删除整个用户目录」：原正则末尾 `\s*(|$)` 里的 `(|$)` 是空分支，永远成立，
+ *      于是整条规则退化成「Remove-Item … C:\Users\<任意一段>」就命中——
+ *      12:49:57 那条只是删 C:\Users\cqs6017\AppData\Local\Temp\dsh-baselines-stub.mjs，被误判。
+ *      改成 `\s*(?:$|[;|&])` 后，只有目标**就是**用户目录本身才命中。
+ *   2) 同款 `(|$)` 缺陷在「del /s 递归删除整个盘符」里也有，一并改掉。
+ *   3) 为了不丢检出力，新增「删除用户目录全部内容」（C:\Users\x\*）规则——
+ *      修 (|$) 会顺带放走 `Remove-Item -Recurse C:\Users\bob\*`，必须单独兜住。
+ *
+ * v2 原有的归一化（小写 / 去引号与脱字符 / 合并空白）与 37 条规则集保持不变；
+ * 上限同 v2：正则只是黑名单，自适应攻击能绕（OWASP LLM01:91），真正的控制在能力与审批层。
  */
 const raw = await new Promise((resolve) => {
   let buffer = ''
@@ -59,8 +68,13 @@ const RULES = [
   // 四、不可逆删除（Windows）
   [/\bremove-item\b.*-recurse.*[a-z]:[\\\/]?\s*$/, '递归删除整个盘符'],
   [/\bremove-item\b.*[a-z]:[\\\/]+(windows|program files)\b/, '删除系统目录'],
-  [/\bremove-item\b.*[a-z]:[\\\/]+users[\\\/]+[^\\\/\s]+[\\\/]?\s*(|$)/, '删除整个用户目录'],
-  [/\bdel\s+\/[a-z]*s[a-z]*\s+[a-z]:[\\\/]?\s*(|$)/, '递归删除整个盘符'],
+  // ↓ v3 修：末尾 `(|$)` 原本是空分支（永远成立），改成「命令到此结束或接分隔符」才算目标就是用户目录
+  [/\bremove-item\b.*?[a-z]:[\\\/]+users[\\\/]+[^\\\/\s]+[\\\/]?\s*(?:$|[;|&])/, '删除整个用户目录'],
+  // ↓ v3 新增：修 (|$) 后会放走「删用户目录全部内容」，单独兜住（12:49:57 那类只删子文件的不受影响）
+  [/\bremove-item\b.*[a-z]:[\\\/]+users[\\\/]+[^\\\/\s]+[\\\/]+\*/, '删除用户目录全部内容'],
+  // v3 修：原式 `\/[a-z]*s[a-z]*\s+` 只吃一个开关，`del /s /q C:\`（真·递归删盘符）反而漏检；
+  // 改成「任意多个 /开关」+ 末尾 (?:$|[;|&])，既修误报又补上这个洞。
+  [/\bdel\s+(?:\/[a-z]+\s+)*[a-z]:[\\\/]?\s*(?:$|[;|&])/, '递归删除整个盘符'],
   [/\brm\s+(-[a-z]+\s+)*-[a-z]*r[a-z]*f?[a-z]*\s+(\/|~|\*|[a-z]:[\\\/])(\s|$)/, '递归删除根目录/盘符'],
   [/\bshutdown\s+\/[sr]\b|\brestart-computer\b|\bstop-computer\b/, '关机/重启'],
   [/\bdd\b.*\bof=\/dev\//, '直接写裸块设备'],
@@ -68,7 +82,7 @@ const RULES = [
 
 for (const [re, why] of RULES) {
   if (re.test(cmd)) {
-    console.error('命中危险模式：' + why + '。已由 dsh-hooks 拦下（规则集来源：LOLBAS/Sigma/OWASP LLM Top 10 2026，见 _research/security-guardrails.md）。如确需执行，请人工在终端逐条操作。')
+    console.error('命中危险模式：' + why + '。已由 dsh-hooks 拦下（规则集来源：LOLBAS/Sigma/OWASP LLM Top 10 2026，见 _research/security-guardrails.md）。如确需执行，请人工在终端逐条操作；如判断是误报，请把命令加进 D:/AI/dsh-bundles/_selftest/tests/security-guards.test.mjs。')
     process.exit(2)
   }
 }
