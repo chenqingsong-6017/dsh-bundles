@@ -46,9 +46,13 @@ const makeFixture = (docText, opts) => {
       unit: 'ratio',
       format: { kind: 'percent', digits: 2 },
       window: '30 天',
+      budgetingMethod: 'Occurrences',
+      timeWindow: { durationDays: (opts && opts.durationDays) || 30, anchor: 'rolling' },
+      emptyDayPolicy: 'no-data',
       source: { kind: 'file', path: 'baseline.json', field: 'errorRate', freshnessDays: 7 },
       thresholds: { warn: 0.05 },
       docKeywords: ['错误率'],
+      ...((opts && opts.metricExtra) || {}),
     }],
   }, null, 2))
   writeFileSync(path.join(root, 'baseline.json'), JSON.stringify({
@@ -57,6 +61,7 @@ const makeFixture = (docText, opts) => {
     totalCalls: 100,
     totalErrors: 4,
     errorRate: 0.04,
+    windowDays: (opts && opts.windowDays) || 30,
   }))
   if (docText !== null) writeFileSync(path.join(root, 'DOC.md'), docText)
   if (opts && opts.dropBaseline) rmSync(path.join(root, 'baseline.json'))
@@ -122,4 +127,23 @@ const cleanup = (root) => { try { rmSync(root, { recursive: true, force: true })
   ok('真工作区 icd-check 通过')
 }
 
+// 字段白名单（kubeconform -strict 语义）：拼错字段名必须红。
+{
+  const root = makeFixture('# 文档\n\n错误率 4.00%\n', { metricExtra: { tresholds: { warn: 0.05 } } })
+  const r = run(root)
+  assert.equal(r.status, 1, '未知字段必须失败')
+  assert.match(r.out, /未知字段/)
+  ok('未知字段 → 失败')
+  cleanup(root)
+}
+
+// 结构化窗口与基线必须一致：差一天就是两份基线。
+{
+  const root = makeFixture('# 文档\n\n错误率 4.00%\n', { windowDays: 7 })
+  const r = run(root)
+  assert.equal(r.status, 1, '窗口不一致必须失败')
+  assert.match(r.out, /两份基线/)
+  ok('窗口与基线不一致 → 失败')
+  cleanup(root)
+}
 console.log('contracts: ' + passed + ' 组通过')
