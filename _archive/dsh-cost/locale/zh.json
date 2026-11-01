@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "成本与上下文 HUD",
-    "description": "每轮在系统提示里附一行：本会话 token 用量、缓存命中率、上下文水位；用 cost_status 看明细。"
-  }
-}

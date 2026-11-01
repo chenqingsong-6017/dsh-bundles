@@ -1,6 +1,0 @@
-- insert:
-    - id: skill-forge
-      name: '@local/dsh-skill-forge'
-      config:
-        # 锻造出的技能统一放 D 盘，不落 C 盘
-        storeDir: 'D:\AI\dsh-data\skills'

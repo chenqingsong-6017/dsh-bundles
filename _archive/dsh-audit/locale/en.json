@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Operation Audit",
-    "description": "Records every agent side-effect tool call, classifies it by risk (destructive commands, sensitive paths, bulk rollback), redacts secrets, and appends a local JSONL entry. Query it with audit_report / audit_search. Reporting is read-only."
-  }
-}

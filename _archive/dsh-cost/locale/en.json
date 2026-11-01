@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "Cost & Context HUD",
-    "description": "Adds one line per turn with session token totals, cache hit ratio and context-window usage; cost_status shows details."
-  }
-}

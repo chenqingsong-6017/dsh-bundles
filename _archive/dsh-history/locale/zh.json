@@ -1,6 +1,0 @@
-{
-  "meta": {
-    "title": "历史会话检索",
-    "description": "对本地历史会话日志做全文检索与阅读：给出标题、工作区、命中片段（history_search / history_read / history_status）。"
-  }
-}
