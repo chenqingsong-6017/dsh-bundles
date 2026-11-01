@@ -20,6 +20,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
+import { signature, summarizeRepeat } from './error-stats.mjs'
 
 const argv = process.argv.slice(2)
 const arg = (name, dflt) => {
@@ -93,15 +94,7 @@ function classify(msg) {
   return 'code/other'
 }
 
-/** 归一化错误签名：去路径、去 id、去数字，便于聚合。 */
-function signature(text) {
-  return text
-    .replace(/[A-Za-z]:\\[^\s"']+/g, '<path>')
-    .replace(/\b[0-9a-f]{8,}\b/g, '<id>')
-    .replace(/\b\d{3,}\b/g, '<n>')
-    .replace(/\s+/g, ' ')
-    .slice(0, 110)
-}
+// 归一化签名与「跨天复发」统计在 error-stats.mjs（纯函数，可单测；口径只有一份）。
 
 const DENIED = /dsh-hooks 拦截/
 let denials = 0
@@ -110,6 +103,8 @@ const kindCount = new Map()
 const toolErr = new Map()
 const toolCalls = new Map()
 const sigCount = new Map()
+/** 每个签名按天计数：Map<sig, Map<day, count>>，用于算「同一错误复发几天」。 */
+const sigDays = new Map()
 const perDay = new Map()
 let totalCalls = 0
 let totalErrors = 0
@@ -151,6 +146,9 @@ for (const file of listSessionFiles(SESSIONS)) {
       const sig = signature(text)
       sigCount.set(sig, (sigCount.get(sig) || 0) + 1)
       const day = new Date(t).toISOString().slice(0, 10)
+      const sd = sigDays.get(sig) || new Map()
+      sd.set(day, (sd.get(day) || 0) + 1)
+      sigDays.set(sig, sd)
       const cur = perDay.get(day) || { calls: 0, errors: 0 }
       cur.errors++
       perDay.set(day, cur)
@@ -161,6 +159,14 @@ for (const file of listSessionFiles(SESSIONS)) {
       if (kind !== 'completed') abortedTurns++
     }
   }
+}
+
+// fail-safe：会话目录解析失败/为空时，宁可退出也不写 0 基线——空基线会把所有仪表归零，
+// 让「错误率 0.00%」看起来像好转（2026-11-01 实测撞到：run_code 环境缺 USERPROFILE 时）。
+if (fileCount === 0) {
+  console.error('没有找到可解析的会话日志：DSH_HOME=' + HOME + '（会话目录 ' + SESSIONS + '）')
+  console.error('拒绝写空基线。若确实要空跑，请先确认 DSH_HOME/USERPROFILE 并显式设置 DSH_METRICS_DIR 到临时目录。')
+  process.exit(2)
 }
 
 const rate = totalCalls ? totalErrors / totalCalls : 0
@@ -182,7 +188,12 @@ const report = {
   byKind: sorted(kindCount).map(([k, v]) => ({ kind: k, count: v, share: +(v / (totalErrors || 1)).toFixed(4) })),
   byTool: sorted(toolErr).slice(0, TOP).map(([tool, errs]) => ({ tool, errs, calls: toolCalls.get(tool) || 0, rate: +((toolCalls.get(tool) || 1) ? errs / (toolCalls.get(tool) || 1) : 0).toFixed(4) })),
   perDay: [...perDay.entries()].sort().map(([day, v]) => ({ day, calls: v.calls, errors: v.errors, rate: +(v.errors / (v.calls || 1)).toFixed(4) })),
-  topSignatures: sorted(sigCount).slice(0, TOP).map(([sig, count]) => ({ count, sig })),
+  topSignatures: sorted(sigCount).slice(0, TOP).map(([sig, count]) => {
+    const days = [...(sigDays.get(sig) || new Map()).keys()].sort()
+    return { count, sig, days: days.length, firstDay: days[0] || null, lastDay: days[days.length - 1] || null }
+  }),
+  /** 稳定性：同一签名跨几天复发（判据登记在 _contracts/metrics.json 的 repeatErrorShare）。 */
+  repeat: summarizeRepeat(sigDays),
 }
 
 if (JSON_OUT) {
@@ -203,13 +214,17 @@ if (JSON_OUT) {
   for (const d of report.perDay) console.log('  ' + d.day + '  ' + d.errors + '/' + d.calls + '  ' + pct(d.rate))
   console.log('')
   console.log('[错误签名 Top]')
-  for (const s of report.topSignatures) console.log('  ' + String(s.count).padStart(3) + '  ' + s.sig)
+  for (const s of report.topSignatures) console.log('  ' + String(s.count).padStart(3) + '  ' + s.sig + (s.days > 1 ? '  (跨 ' + s.days + ' 天)' : ''))
+  const rep = report.repeat
+  console.log('')
+  console.log('[复发] 签名 ' + rep.signatures + ' 个 · 跨天复发 ' + rep.repeatSignatures + ' 个 · 复发错误占 ' + pct(rep.repeatErrorShare) + ' · 最长 ' + rep.maxDays + ' 天')
+  for (const w of rep.worst) console.log('  ' + String(w.count).padStart(3) + ' 次 / ' + w.days + ' 天  ' + w.sig)
 }
 
 try {
   mkdirSync(METRICS_DIR, { recursive: true })
   writeFileSync(path.join(METRICS_DIR, 'tool-error-rate-baseline.json'), JSON.stringify(report, null, 2))
-  appendFileSync(path.join(METRICS_DIR, 'tool-error-rate-history.jsonl'), JSON.stringify({ at: report.generatedAt, days: DAYS, calls: totalCalls, errors: totalErrors, rate: report.errorRate }) + '\n')
+  appendFileSync(path.join(METRICS_DIR, 'tool-error-rate-history.jsonl'), JSON.stringify({ at: report.generatedAt, days: DAYS, calls: totalCalls, errors: totalErrors, rate: report.errorRate, repeatSignatures: report.repeat.repeatSignatures, repeatErrorShare: report.repeat.repeatErrorShare, maxDays: report.repeat.maxDays }) + '\n')
 } catch (e) {
   console.error('基线落盘失败：' + e.message)
 }
