@@ -91,6 +91,7 @@ config:
 | 真机 P1（2026-11-01） | ✅ notes=21 / bases=4 / links=18 / brokenLinks=0 / parseErrors=0；重建 2ms、index.json 25.7KB |
 | 页面契约检查（2026-11-01，真实 vault） | ✅ 21 篇 / **0 错误 0 警告** / 12ms；单测 12 项（含 journal 免检、根级豁免、模板跳过三条正例） |
 | 记忆指针试点（2026-11-01，真实 memory.json） | ✅ 4 条记忆改为「判据 + `vault://` 指针」；扫出 `total:2` 个不同锚点、`broken:0`；记忆 10849 → 10644 字（90.4% → 88.7%） |
+| 进程内验收（2026-11-01 重启后，真实 vault） | ✅ 7 项全过：指针 `total:2`/`broken:0`、新建 155 字节、二次写 `file_exists`、白名单 `denied`、模板 `denied`、lint 21 篇 0/0、search/note 回归 |
 | 真机 P2（2026-11-01，源码直跑真实 vault） | ✅ 新建 71 字节成功（自动补 .md）/ 二次写 `file_exists` / `10-Life` 与模板目录 `denied` / append 85 字节 / 检索与读单篇回归正常；验证文件已删，索引重建回 21 篇 |
 
 ## 已知边界（诚实清单）
