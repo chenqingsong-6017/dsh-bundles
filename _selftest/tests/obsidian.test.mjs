@@ -226,6 +226,7 @@ put('.git/config', '')
   writeFileSync(memFile, JSON.stringify({ entries: [
     { id: 'm1', text: '细节见 vault://00-Inbox/ai-drafts/ok.md' },
     { id: 'm2', text: '断的 vault://99-Gone/x.md' },
+    { id: 'm3', text: '带锚点 vault://00-Inbox/ai-drafts/ok.md#一句话' },
   ] }), 'utf8')
   const h = host(vault, store, { memoryPath: memFile })
   const write = h.defs.get("obsidian_write")
@@ -275,7 +276,7 @@ put('.git/config', '')
   const st = await h.defs.get("obsidian_status").execute({})
   assert.equal(st.ok, true)
   assert.equal(st.memoryPointers.checked, true)
-  assert.equal(st.memoryPointers.total, 2)
+  assert.equal(st.memoryPointers.total, 3, '带锚点的指针算一条，且不因 # 被判断链')
   assert.equal(st.memoryPointers.broken.length, 1, '断指针要报出来')
   assert.equal(st.memoryPointers.broken[0].pointer, '99-Gone/x.md')
 

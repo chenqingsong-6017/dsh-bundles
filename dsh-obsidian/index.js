@@ -522,7 +522,8 @@ export function apply(ctx, config) {
       report.checked = true
       report.total = owners.size
       for (const [pointer, ids] of owners) {
-        const abs = safeResolve(vaultDir, normalizeVaultPath(pointer))
+        const clean = String(pointer).split('#')[0]
+        const abs = safeResolve(vaultDir, normalizeVaultPath(clean))
         if (abs !== null && existsSync(abs)) {
           if (report.sample.length < 5) report.sample.push(pointer)
         } else {
