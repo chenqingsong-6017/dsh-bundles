@@ -932,15 +932,15 @@ export function apply(ctx, config) {
       },
       async execute(args) {
         try {
-          if (!writeEnabled) return { ok: false, code: 'write_disabled', path: '', lastError: '受控写已关闭（writeEnabled=false）' }
+          if (!writeEnabled) return { ok: false, code: 'WRITE_DISABLED', path: '', lastError: '受控写已关闭（writeEnabled=false）' }
           const rel = normalizeVaultPath(args?.path)
           if (rel === '') return { ok: false, code: 'bad_path', path: '', lastError: 'path 为空' }
           const content = String(args?.content ?? '')
           if (content === '') return { ok: false, code: 'empty_content', path: rel, lastError: 'content 为空' }
           const abs = safeResolve(vaultDir, rel)
-          if (!abs) return { ok: false, code: 'escape', path: rel, lastError: '路径越界：只允许 vault 内部路径' }
+          if (!abs) return { ok: false, code: 'ESCAPE', path: rel, lastError: '路径越界：只允许 vault 内部路径' }
           const gate = isWriteAllowed(rel, writeAllowlist)
-          if (!gate.allowed) return { ok: false, code: 'denied', path: rel, absPath: abs, allowlist: writeAllowlist, lastError: gate.reason }
+          if (!gate.allowed) return { ok: false, code: 'DENIED', path: rel, absPath: abs, allowlist: writeAllowlist, lastError: gate.reason }
           const mode = ['create', 'append', 'section'].includes(String(args?.mode)) ? String(args?.mode) : 'create'
           const exists = existsSync(abs)
           let before = ''
@@ -949,33 +949,33 @@ export function apply(ctx, config) {
           if (exists) {
             info = statSync(abs)
             if (!info.isFile()) return { ok: false, code: 'not_a_file', path: rel, lastError: '目标不是普通文件' }
-            if (info.size > MAX_NOTE_BYTES) return { ok: false, code: 'too_large', path: rel, lastError: '文件超过 ' + MAX_NOTE_BYTES + ' 字节' }
+            if (info.size > MAX_NOTE_BYTES) return { ok: false, code: 'TOO_LARGE', path: rel, lastError: '文件超过 ' + MAX_NOTE_BYTES + ' 字节' }
             before = readFileSync(abs, 'utf8')
             sizeBefore = info.size
           }
           const expectedHash = strValue(args?.expectedHash).toLowerCase()
           if (expectedHash !== '' && sha256(before) !== expectedHash) {
-            return { ok: false, code: 'conflict', path: rel, lastError: '内容已变（expectedHash 不符），本次放弃写入' }
+            return { ok: false, code: 'CONFLICT', path: rel, lastError: '内容已变（expectedHash 不符），本次放弃写入' }
           }
           const expectedMtime = Number(args?.expectedMtime)
           if (exists && Number.isFinite(expectedMtime) && expectedMtime > 0 && Math.abs(info.mtimeMs - expectedMtime) > 1000) {
-            return { ok: false, code: 'conflict', path: rel, lastError: '文件在预期之外被改过（expectedMtime 不符），本次放弃写入' }
+            return { ok: false, code: 'CONFLICT', path: rel, lastError: '文件在预期之外被改过（expectedMtime 不符），本次放弃写入' }
           }
           let next = ''
           let created = false
           if (!exists) {
-            if (mode === 'section') return { ok: false, code: 'no_file', path: rel, lastError: 'section 模式要求文件已存在' }
+            if (mode === 'section') return { ok: false, code: 'NO_FILE', path: rel, lastError: 'section 模式要求文件已存在' }
             next = content
             created = true
           } else if (mode === 'create') {
-            return { ok: false, code: 'file_exists', path: rel, lastError: '目标已存在；create 绝不覆盖（改内容请用 section 或 append）' }
+            return { ok: false, code: 'FILE_EXISTS', path: rel, lastError: '目标已存在；create 绝不覆盖（改内容请用 section 或 append）' }
           } else if (mode === 'append') {
             next = before.endsWith('\n') ? before + content : before + '\n' + content
           } else {
             const section = strValue(args?.section)
             if (section === '') return { ok: false, code: 'bad_section', path: rel, lastError: 'section 模式必须给 section 标题' }
             const replaced = applySection(before, section, content)
-            if (replaced === null) return { ok: false, code: 'section_not_found', path: rel, lastError: '找不到标题：' + section }
+            if (replaced === null) return { ok: false, code: 'SECTION_NOT_FOUND', path: rel, lastError: '找不到标题：' + section }
             next = replaced
           }
           mkdirSync(path.dirname(abs), { recursive: true })

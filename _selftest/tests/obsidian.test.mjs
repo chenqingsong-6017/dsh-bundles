@@ -240,7 +240,7 @@ put('.git/config', '')
 
   const again = await write.execute({ path: "00-Inbox/ai-drafts/ok.md", content: 'x' })
   assert.equal(again.ok, false)
-  assert.equal(again.code, 'file_exists', 'create 绝不覆盖')
+  assert.equal(again.code, 'FILE_EXISTS', 'create 绝不覆盖')
 
   const appended = await write.execute({ path: "00-Inbox/ai-drafts/ok.md", content: '追加行', mode: 'append' })
   assert.equal(appended.ok, true)
@@ -248,7 +248,7 @@ put('.git/config', '')
 
   const missingSection = await write.execute({ path: "00-Inbox/ai-drafts/ok.md", content: '- 新观测', mode: 'section', section: '观测' })
   assert.equal(missingSection.ok, false)
-  assert.equal(missingSection.code, 'section_not_found')
+  assert.equal(missingSection.code, 'SECTION_NOT_FOUND')
 
   await write.execute({ path: "00-Inbox/ai-drafts/sec.md", content: '# 卡\n\n## 观测\n\n- 旧观测\n\n## 关系\n\n- 旧关系\n' })
   const replaced = await write.execute({ path: "00-Inbox/ai-drafts/sec.md", content: '- 新观测', mode: 'section', section: '观测' })
@@ -260,19 +260,19 @@ put('.git/config', '')
 
   const denied = await write.execute({ path: "10-Life/Me.md", content: 'x' })
   assert.equal(denied.ok, false)
-  assert.equal(denied.code, 'denied')
+  assert.equal(denied.code, 'DENIED')
 
   const template = await write.execute({ path: "90-Shared/91-Templates/person.md", content: 'x' })
   assert.equal(template.ok, false)
-  assert.equal(template.code, 'denied')
+  assert.equal(template.code, 'DENIED')
 
   const escape = await write.execute({ path: "../outside.md", content: 'x' })
   assert.equal(escape.ok, false)
-  assert.equal(escape.code, 'escape')
+  assert.equal(escape.code, 'ESCAPE')
 
   const conflict = await write.execute({ path: "00-Inbox/ai-drafts/sec.md", content: 'x', mode: 'append', expectedHash: 'deadbeef' })
   assert.equal(conflict.ok, false)
-  assert.equal(conflict.code, 'conflict')
+  assert.equal(conflict.code, 'CONFLICT')
 
   const st = await h.defs.get("obsidian_status").execute({})
   assert.equal(st.ok, true)
