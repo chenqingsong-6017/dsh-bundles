@@ -84,7 +84,8 @@ const READ_ONLY_TOOLS = new Set([
 /** 高危命令模式：命中即 high。 */
 const HIGH_PATTERNS = [
   { re: /\brm\s+(?:-[a-zA-Z]*[rf][a-zA-Z]*\s+)+/i, reason: '递归/强制删除' },
-  { re: /\bRemove-Item\b[^\n]*-(?:Recurse|Force)/i, reason: '删除（PowerShell 递归/强制）' },
+  // 只认 -Recurse：`Remove-Item -Force x` 是日常清理，不该进 high（2026-11-01 实测误标）
+  { re: /\bRemove-Item\b[^\n]*-(?:Recurse)/i, reason: '删除（递归）' },
   { re: /\b(?:del|erase)\s+\/[a-zA-Z]*[sq]/i, reason: '批量删除' },
   { re: /\bformat\s+[a-zA-Z]:/i, reason: '格式化磁盘' },
   { re: /git\s+(?:reset\s+--hard|clean\s+-[a-zA-Z]*f|push\s+(?:--force|-f))/i, reason: '破坏性 git 操作' },
@@ -95,9 +96,25 @@ const HIGH_PATTERNS = [
   { re: /\b(?:curl|wget|Invoke-WebRequest|iwr)\b[^\n]*\|\s*(?:sh|bash|pwsh|powershell|iex)/i, reason: '下载并直接执行' },
 ]
 
-/** 敏感路径：命中即 high。 */
-const SENSITIVE_PATH =
-  /(?:[\\/]\.ssh[\\/]|[\\/]\.aws[\\/]|[\\/]\.gnupg[\\/]|id_rsa|id_ed25519|[\\/]\.env(?:\.[a-z0-9]+)?\b|[\\/]\.npmrc\b|[\\/]\.netrc\b|credentials|secrets?[\\/]|[\\/]\.git[\\/]config|C:[\\/]Windows\b|System32|SysWOW64|[\\/]SAM\b|[\\/]\.kube[\\/]config)/i
+/**
+ * 凭据类路径：读写都算 high（读凭据本身就有外泄风险）。
+ * 2026-11-01 修误标：原式里的裸 `credentials` 会把 `docs\credentials.md` 也判 high，
+ * 现在只认「路径形态」（点开头的凭据文件，或无扩展名的 credentials/secrets 目录）。
+ */
+const CRED_PATH =
+  /(?:[\\/]\.ssh[\\/]|[\\/]\.aws[\\/]|[\\/]\.gnupg[\\/]|[\\/](?:id_rsa|id_ed25519)\b|[\\/]\.env(?:\.[a-z0-9]+)?\b|[\\/]\.npmrc\b|[\\/]\.netrc\b|[\\/]\.credentials(?:\.[a-z0-9]+)?(?=[\\/"'\s,}]|$)|[\\/]credentials(?=[\\/"'\s,}]|$)|[\\/]secrets?[\\/]|[\\/]\.git[\\/]config|[\\/]\.kube[\\/]config)/i
+
+/**
+ * 系统路径：只读命令「读到」它不算高危（今日误标主因），
+ * 只有写/删动作指向它、或只读工具（read/grep）主动去读，才判 high。
+ */
+const SYS_PATH = /(?:C:[\\/]Windows\b|[\\/](?:System32|SysWOW64)\b|[\\/]SAM\b)/i
+
+/** shell 类工具：它们可能只读也可能破坏，要靠命令里有没有动词区分。 */
+const SHELL_TOOLS = /^(bash|pwsh|run_code|terminal|terminal_send|exec)$/i
+/** 破坏 / 写动作动词：只读命令碰系统路径不判 high，出现这些才算真动手。 */
+const DESTRUCTIVE_VERB =
+  /(\brm\s|Remove-Item|rmdir|\bdel\s|erase\s|move-item|copy-item|set-content|add-content|out-file|new-item|chmod|icacls|takeown|format\s|diskpart|reg\s+(?:delete|add|save)|sc\s+(?:delete|create)|stop-process|taskkill|writefilesync|appendfilesync|unlinksync|rmsync)/i
 
 /** 写入/执行类工具：至少 medium。 */
 const SIDE_EFFECT_TOOLS = new Set([
@@ -215,9 +232,19 @@ export function classifyCall(toolName, rawArguments) {
       risk = 'high'
     }
   }
-  if (SENSITIVE_PATH.test(text)) {
+  if (CRED_PATH.test(text)) {
     reasons.push('敏感路径')
     risk = 'high'
+  } else if (SYS_PATH.test(text)) {
+    // 只读命令只是「看到」系统路径（如查看 hosts）时降为 medium；
+    // 出现破坏/写动作，或只读/写类工具主动碰它，仍判 high。
+    if (SHELL_TOOLS.test(name) && !DESTRUCTIVE_VERB.test(text)) {
+      reasons.push('系统路径（只读命令）')
+      if (risk !== 'high') risk = 'medium'
+    } else {
+      reasons.push('敏感路径')
+      risk = 'high'
+    }
   }
   if (name === 'checkpoint_restore' && /"all"\s*:\s*true/.test(text)) {
     reasons.push('批量回滚')

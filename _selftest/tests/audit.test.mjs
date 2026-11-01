@@ -76,3 +76,26 @@ assert.ok(redactSecrets('curl -H "X: 1" http://example.com').includes('example.c
 assert.ok(!redactSecrets('sk-1234567890abcdef').includes('1234567890abcdef'))
 assert.ok(!redactSecrets('ghp_abcdefghijklmnop').includes('abcdefghijklmnop'))
 ok('redactSecrets：密钥/令牌被抹掉，普通内容保留')
+
+// ---- 误标回归（2026-11-01：当天 51 条 high 里 49 条是这类）----
+{
+  const notHigh = (tool, args) => {
+    const v = classifyCall(tool, JSON.stringify(args))
+    assert.ok(!v || v.risk !== 'high', `${tool} ${JSON.stringify(args)} 不该判 high（实际 ${v && v.risk}）`)
+  }
+  // 1) 只有 Force、没有 Recurse = 日常清理，不是递归删除
+  notHigh('pwsh', { command: 'Remove-Item -Force .verify-upper.mjs' })
+  // 2) 只读命令读到系统路径
+  notHigh('pwsh', { command: 'Get-Content C:\\Windows\\System32\\drivers\\etc\\hosts' })
+  // 3) 文档名里含 credentials，但它不是凭据文件
+  notHigh('write', { file_path: 'D:\\AI-date\\dsh-date\\dsh-创建\\docs\\credentials-guide.md' })
+  // 4) 文档正文提到 System32，不是路径
+  notHigh('write', { file_path: 'D:\\proj\\notes.md', content: 'System32 是系统目录' })
+  // 5) 只读凭据仍然高危（降误标不能松防护）
+  assert.ok(hi('pwsh', { command: 'Get-Content D:\\proj\\.env' }), '只读 .env 仍判 high')
+  assert.ok(hi('read', { file_path: 'C:\\Users\\me\\.ssh\\id_rsa' }), '读私钥仍判 high')
+  // 6) 真递归删除、写系统目录仍 high
+  assert.ok(hi('pwsh', { command: 'Remove-Item -Recurse C:\\foo' }), '递归删除仍 high')
+  assert.ok(hi('pwsh', { command: 'Set-Content C:\\Windows\\System32\\x.txt data' }), '写系统目录仍 high')
+  ok('误标回归：日常清理 / 只读系统路径 / 文档名不再误判 high，真高危仍拦')
+}
