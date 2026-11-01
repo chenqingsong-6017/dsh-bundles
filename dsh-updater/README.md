@@ -87,7 +87,7 @@
 校验门（任何 error 都会中止，本地不动）：
 - `package.json` 存在且合法
 - `dsh.bundle.patch` 声明且指向的文件存在
-- 入口文件存在，且有 `export function apply` 或 `export default`
+- 入口文件存在，且有 `export function apply`（**不接受 `export default`**：Loader 的 unwrapExports 会丢掉 `inject`，见官方 postmortem 0001）
 - 所有入口级 `.js` 过 `node --check` 语法检查
 
 `prune` 默认 **false**：本地插件常有人工改动，盲目对齐会让它们消失。要完全对齐才传 `prune: true`。

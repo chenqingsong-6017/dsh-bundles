@@ -253,9 +253,11 @@ function inspectBundle(root) {
       source = ''
     }
     const hasApply = /export\s+(async\s+)?function\s+apply\b/.test(source)
-    const hasDefault = /export\s+default\b/.test(source)
-    if (!hasApply && !hasDefault) {
-      err('no-export-form', `${entryRel} 既没有 export function apply 也没有 export default`)
+    const hasDefault = /^\s*export\s+default\b/m.test(source)
+    if (hasDefault) {
+      err('default-export', `${entryRel} 用了 export default：Loader 的 unwrapExports 会丢掉 inject（官方 postmortem 0001），只允许 export function apply`)
+    } else if (!hasApply) {
+      err('no-export-form', `${entryRel} 没有 export function apply`)
     }
   }
 

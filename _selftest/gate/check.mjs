@@ -126,8 +126,15 @@ for (const bundle of bundles) {
     const entry = path.join(dir, entryRel)
     if (!existsSync(entry)) {
       failures.push('✗ ' + bundle + ': 入口不存在 ' + entryRel)
-    } else if (!/export\s+(async\s+)?function\s+apply|export\s+default/.test(readFileSync(entry, 'utf8'))) {
-      failures.push('✗ ' + bundle + ': 入口既没有 export function apply 也没有 export default')
+    } else {
+      // 只接受命名导出。官方 postmortem 0001 证明：export default 会让 Loader 的
+      // unwrapExports 丢掉 inject —— 178 个单测全绿、产品完全不可用。门必须拦住这种写法。
+      const source = readFileSync(entry, 'utf8')
+      if (/^\s*export\s+default\b/m.test(source)) {
+        failures.push('✗ ' + bundle + ': 入口用了 export default（Loader 会丢 inject，见官方 postmortem 0001）——只允许 export function apply')
+      } else if (!/export\s+(async\s+)?function\s+apply/.test(source)) {
+        failures.push('✗ ' + bundle + ': 入口没有 export function apply')
+      }
     }
   }
 }
