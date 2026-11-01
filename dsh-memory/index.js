@@ -468,12 +468,28 @@ export function cleanAliases(input) {
 }
 
 /**
+ * v4.1（官方 ADR 的判据）：存储版本高于插件支持版本时**拒绝加载**，不是猜、也不是降级读。
+ * 为什么不能照旧用：旧逻辑会按旧字段写回，把高版本的数据静默洗掉（v3.6 别名被旧版本洗掉就是这类事故的最小版）。
+ * 错误带 code，调用方据此把「版本太新」和「文件损坏」区分开——前者绝不能改名隔离。
+ */
+function schemaTooNewError(from, target) {
+  const error = new Error(
+    '存储版本 ' + from + ' 高于插件支持的 ' + target + '：请升级 dsh-memory 插件，或把记忆库还原为匹配版本的备份。为避免旧逻辑覆盖新数据，本次拒绝加载。',
+  )
+  error.code = 'MEMORY_SCHEMA_TOO_NEW'
+  error.fromVersion = from
+  error.targetVersion = target
+  return error
+}
+
+/**
  * v4.0（考虑以后）：store schema 迁移。只升不降，老条目形状由 normalizeEntry 补齐，**内容一律不动**。
  * 迁移只写脚本、不手改数据——这是「数据能活过插件重写」的最低保证。
  */
 export function migrateState(input, target = SCHEMA_VERSION) {
   const from = Number.isInteger(input?.version) && input.version > 0 ? input.version : 1
-  if (from >= target) return { state: input, from, to: from, changed: false }
+  if (from > target) throw schemaTooNewError(from, target)
+  if (from === target) return { state: input, from, to: from, changed: false }
   const entries = Array.isArray(input?.entries) ? input.entries.map((entry) => normalizeEntry(entry)) : []
   return { state: { ...input, version: target, entries }, from, to: target, changed: true }
 }
@@ -1969,9 +1985,13 @@ export function apply(ctx, config) {
       return match ? Math.max(max, Number(match[1])) : max
     }, 0)
     const storedNextId = Number.isInteger(parsed?.nextId) && parsed.nextId > 0 ? parsed.nextId : 0
+    // v4.1：磁盘上是更高版本 = 旧逻辑不认识的新数据，读进来再写回就会静默洗字段。
+    // 这里带 code 抛出，由调用方决定 fail-loud；mergeWithDisk 会原样上抛而不是吞掉。
+    const diskVersion = Number.isInteger(parsed?.version) && parsed.version > 0 ? parsed.version : 1
+    if (diskVersion > SCHEMA_VERSION) throw schemaTooNewError(diskVersion, SCHEMA_VERSION)
     return {
       entries: kept,
-      version: Number.isInteger(parsed?.version) && parsed.version > 0 ? parsed.version : 1,
+      version: diskVersion,
       nextId: Math.max(storedNextId, maxIdNumber + 1),
     }
   }
@@ -1987,6 +2007,8 @@ export function apply(ctx, config) {
     try {
       disk = readDiskState()
     } catch (error) {
+      // 版本比插件新：不是「坏文件」，旧逻辑绝不能覆盖它 → 原样上抛，让本次写入变成可读失败。
+      if (error?.code === 'MEMORY_SCHEMA_TOO_NEW') throw error
       return // 磁盘上那份坏了：不合并，保住内存里的（损坏保护由 load 负责）
     }
     if (disk === null) return
@@ -2197,6 +2219,16 @@ export function apply(ctx, config) {
       // v3.10（B02）：记下这次的磁盘指纹，persist 据此判断「别的进程写过了没有」。
       lastSignature = storeSignature()
     } catch (error) {
+      // 版本比插件新：既不能当「损坏」改名隔离（那会把更高版本的数据当垃圾挪走），
+      // 也不能半死继续跑（旧逻辑下一次 persist 就会用它覆盖新数据）。
+      // 抛出去 → apply 失败 → 插件拒绝启动，错误信息里带版本与出路。
+      if (error?.code === 'MEMORY_SCHEMA_TOO_NEW') {
+        const refusal = new Error('dsh-memory 拒绝启动：' + error.message + '（存储文件：' + storeFile + '）')
+        refusal.code = 'MEMORY_SCHEMA_TOO_NEW'
+        refusal.fromVersion = error.fromVersion
+        refusal.targetVersion = error.targetVersion
+        throw refusal
+      }
       // 损坏：把原文件改名留证，进入只读保护态；绝不静默覆盖。
       storeHealth = 'corrupt'
       try {
