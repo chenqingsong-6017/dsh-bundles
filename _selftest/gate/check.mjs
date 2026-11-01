@@ -24,14 +24,24 @@
  * 平时只有 2–3 个会被执行，别的插件写好的回归保护等于不存在。实测全量 7.7 秒
  * （最慢 updater 4.1 秒），完全付得起，所以改成每次全跑。
  * 纯配置 bundle（只有 cordis.patch.yml、没有 index.js）不需要测试，单独列出来，不静默跳过。
+ *
+ * 2026-11-01 改：补三个「门可被掏空」的洞（证据见 _research/deepseek-repos/05c-harness-adr-practice.md §4.2）：
+ *   1. 插件目录不存在或 0 个插件 → 失败（exit 1），不再打印「跳过」后 exit 0；
+ *      DSH_ALLOW_EMPTY_BUNDLES=1 是仅给 gate-hollow 测试用的逃生口。
+ *   2. 有入口无测试 → 棘轮：不在 _selftest/tests/coverage-baseline.json 白名单内即失败；
+ *      baseline 只能收紧（新增插件必须补测试，或显式加白名单并写理由）。
+ *   3. DSH_BUNDLES_DIR 可覆盖仓库路径，让测试能在临时假目录上跑真门。
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-const BUNDLES_DIR = 'D:\\AI\\dsh-bundles'
+// DSH_BUNDLES_DIR 给 gate-hollow 测试造临时假目录用；不设时仍是本机默认路径。
+const BUNDLES_DIR_ENV = process.env.DSH_BUNDLES_DIR
+const BUNDLES_DIR = BUNDLES_DIR_ENV ? path.resolve(BUNDLES_DIR_ENV) : 'D:\\AI\\dsh-bundles'
 const SELFTEST_DIR = path.join(BUNDLES_DIR, '_selftest', 'tests')
+const COVERAGE_BASELINE = path.join(SELFTEST_DIR, 'coverage-baseline.json')
 const MAX_OUTPUT_LINES = 60
 
 // --perf 慢门用的基线脚本（DSH_BASELINES 可覆盖，便于换机；默认按本机绝对路径）。
@@ -65,8 +75,18 @@ function listBundles() {
 
 const bundles = listBundles()
 if (bundles.length === 0) {
-  console.log('gate: 没有找到任何插件目录，跳过')
-  process.exit(0)
+  // 洞 1：路径写错/插件仓被移走时，旧版打印「跳过」后 exit 0 —— 门是绿的但什么都没查。
+  const where = BUNDLES_DIR_ENV
+    ? 'DSH_BUNDLES_DIR=' + BUNDLES_DIR_ENV + '（解析为 ' + BUNDLES_DIR + '）'
+    : '默认路径 ' + BUNDLES_DIR
+  if (process.env.DSH_ALLOW_EMPTY_BUNDLES === '1') {
+    console.log('gate: 插件目录为空（' + where + '），但 DSH_ALLOW_EMPTY_BUNDLES=1 —— 仅供测试，跳过')
+    process.exit(0)
+  }
+  console.error('gate: 失败 1 项（插件目录为空 = 门被掏空）\n\n' +
+    '✗ 找不到任何插件目录：' + where + '\n' +
+    '  目录存在=' + existsSync(BUNDLES_DIR) + '。这通常意味着 DSH_BUNDLES_DIR/默认路径写错、插件仓被移走，或目录里没有插件。')
+  process.exit(1)
 }
 
 // ---- 阶段 1：语法门 ----
@@ -176,7 +196,7 @@ for (const bundle of bundles) {
   ].find((candidate) => existsSync(candidate))
 
   if (!testFile) {
-    // 有入口却没测试 → 是缺口，列出来（不判失败，但不能悄悄跳过）
+    // 有入口却没测试 → 记缺口，循环后按 coverage-baseline.json 棘轮判定（洞 2）。
     if (existsSync(path.join(dir, 'index.js'))) noTestWithEntry.push(bundle)
     continue
   }
@@ -208,7 +228,32 @@ for (const name of foundTests) {
 
 if (tested.length > 0) lines.push('测试门：全量跑了 ' + tested.length + ' 个测试（' + (testMs / 1000).toFixed(1) + 's）')
 else lines.push('测试门：_selftest/tests 里没有测试文件')
-if (noTestWithEntry.length > 0) lines.push('测试门：有入口但没测试 —— ' + noTestWithEntry.join(', '))
+
+// 洞 2：覆盖缺口棘轮。baseline 是「当前已欠账」的白名单，只允许收紧：
+//   - 不在白名单里的「有入口无测试」→ 失败（新增插件必须补测试）；
+//   - baseline 缺失/坏掉按空处理（宁严不宽）；
+//   - 已补测试的插件留在 baseline 里只提示「可收紧」，不失败（避免别人补测试时被卡）。
+let coverageAllow = []
+try {
+  const parsed = JSON.parse(readFileSync(COVERAGE_BASELINE, 'utf8'))
+  coverageAllow = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.allow) ? parsed.allow : [])
+} catch (error) {
+  if (existsSync(COVERAGE_BASELINE)) {
+    failures.push('✗ ' + COVERAGE_BASELINE + ' 不是合法 JSON：' + ((error && error.message) || String(error)))
+  }
+}
+const allowSet = new Set(coverageAllow)
+const uncovered = noTestWithEntry.filter((bundle) => !allowSet.has(bundle))
+const staleAllow = coverageAllow.filter((bundle) => !noTestWithEntry.includes(bundle))
+if (noTestWithEntry.length > 0) {
+  lines.push('测试门：有入口但没测试 ' + noTestWithEntry.length + ' 个（baseline 豁免 ' + (noTestWithEntry.length - uncovered.length) + '）')
+}
+for (const bundle of uncovered) {
+  failures.push('✗ ' + bundle + '：有入口但没测试，且不在 coverage-baseline.json —— 新增插件必须补测试；确实要欠账就把它加进 baseline 并在 _note 里写理由')
+}
+if (staleAllow.length > 0) {
+  lines.push('测试门：baseline 可收紧（已有测试可移出）—— ' + staleAllow.join(', '))
+}
 
 // ---- 阶段 4：标准门（report-only，规则见工作区 工业级标准.md） ----
 // 只报告不阻断：老插件缺 CHANGELOG 是已知欠账，按「改到谁就补谁」推进。
