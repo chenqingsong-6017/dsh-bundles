@@ -73,7 +73,7 @@ config:
 | `node --check index.js` | 通过 |
 | 单测 `_selftest/tests/obsidian.test.mjs` | 10 项通过（P1 8 项 + P2 受控写 2 项：纯函数与工具） |
 | 真机 P1（2026-11-01） | ✅ notes=21 / bases=4 / links=18 / brokenLinks=0 / parseErrors=0；重建 2ms、index.json 25.7KB |
-| 真机 P2 | 待重启后填：受控写真调用（白名单 / 拒覆盖 / section / 冲突 / 断指针） |
+| 真机 P2（2026-11-01，源码直跑真实 vault） | ✅ 新建 71 字节成功（自动补 .md）/ 二次写 `file_exists` / `10-Life` 与模板目录 `denied` / append 85 字节 / 检索与读单篇回归正常；验证文件已删，索引重建回 21 篇 |
 
 ## 已知边界（诚实清单）
 
@@ -83,3 +83,4 @@ config:
 - **链接解析按 basename 取第一个**：vault 里同名笔记会有歧义，`brokenLinks` 只统计「解析不到」，不报歧义。
 - **检索是词项打分**：中文按子串命中、不切词；量级到几千篇时再考虑倒排索引（触发线见方案 §7）。
 - **指针漂移只报不修**：`memoryPointers` 不会自动改记忆，断链要人决定删还是补。
+- **删笔记不自动判过期**：`indexStale` 只看「最新 mtime 变大」，删文件不触发；删完用 `obsidian_index({ force: true })`，或拿 `live.notes` 对照索引数（本次真机就踩到：删文件后索引仍报 22）。
