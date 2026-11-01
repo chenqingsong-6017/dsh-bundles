@@ -20,7 +20,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
-import { signature, summarizeRepeat } from './error-stats.mjs'
+import { signature, summarizeRepeat, comparePhase } from './error-stats.mjs'
 
 const argv = process.argv.slice(2)
 const arg = (name, dflt) => {
@@ -41,6 +41,15 @@ const SINCE = SINCE_AT ? Date.parse(SINCE_AT) : Date.now() - DAYS * 86400000
 const WINDOW = SINCE_AT ? ('自 ' + new Date(SINCE).toISOString().slice(0, 16).replace('T', ' ')) : (DAYS + ' 天')
 if (SINCE_AT && Number.isNaN(SINCE)) { console.error('--since 不是合法时间：' + SINCE_AT); process.exit(2) }
 const JSON_OUT = flag('json')
+// --no-write：只做对比/预览，不覆盖权威基线（改前改后的分析不应该改写数据源）。
+const NO_WRITE = flag('no-write')
+// --split <ISO>：按时间切「改前 / 改后」两段，用同一套口径算复发对比（改规则后证明改对没有）。
+const SPLIT_AT = arg('split', null) ? Date.parse(arg('split', null)) : null
+if (SPLIT_AT !== null && Number.isNaN(SPLIT_AT)) { console.error('--split 不是合法时间'); process.exit(2) }
+const makeAgg = () => ({ calls: 0, errors: 0, sigCount: new Map(), sigDays: new Map() })
+const phases = { before: makeAgg(), after: makeAgg() }
+const phaseOf = (t) => (t >= SPLIT_AT ? phases.after : phases.before)
+const aggSummary = (ag) => ({ calls: ag.calls, errors: ag.errors, errorRate: +(ag.calls ? ag.errors / ag.calls : 0).toFixed(4), signatures: ag.sigCount.size, repeat: summarizeRepeat(ag.sigDays) })
 
 const MAGIC = [0x28, 0xb5, 0x2f, 0xfd]
 /** 会话日志是「多帧 zstd 拼接」：单个 frame 只有头一行，必须按魔数切帧逐帧解压。 */
@@ -132,6 +141,7 @@ for (const file of listSessionFiles(SESSIONS)) {
       const cur = perDay.get(day) || { calls: 0, errors: 0 }
       cur.calls++
       perDay.set(day, cur)
+      if (SPLIT_AT !== null) phaseOf(t).calls++
     } else if (ev.type === 'tool/result') {
       const msg = d.message || {}
       if (!msg.isError) continue
@@ -152,6 +162,14 @@ for (const file of listSessionFiles(SESSIONS)) {
       const cur = perDay.get(day) || { calls: 0, errors: 0 }
       cur.errors++
       perDay.set(day, cur)
+      if (SPLIT_AT !== null) {
+        const ag = phaseOf(t)
+        ag.errors++
+        ag.sigCount.set(sig, (ag.sigCount.get(sig) || 0) + 1)
+        const ad = ag.sigDays.get(sig) || new Map()
+        ad.set(day, (ad.get(day) || 0) + 1)
+        ag.sigDays.set(sig, ad)
+      }
     } else if (ev.type === 'agent/inbox/spliced') {
       if (Array.isArray(d.inserted) && d.inserted.length && d.target === 'next-step') steers++
     } else if (ev.type === 'turn/end') {
@@ -194,6 +212,11 @@ const report = {
   }),
   /** 稳定性：同一签名跨几天复发（判据登记在 _contracts/metrics.json 的 repeatErrorShare）。 */
   repeat: summarizeRepeat(sigDays),
+  ...(SPLIT_AT !== null ? (() => {
+    const before = aggSummary(phases.before)
+    const after = aggSummary(phases.after)
+    return { split: { at: new Date(SPLIT_AT).toISOString(), before, after, compare: comparePhase(before, after) } }
+  })() : {}),
 }
 
 if (JSON_OUT) {
@@ -219,9 +242,19 @@ if (JSON_OUT) {
   console.log('')
   console.log('[复发] 签名 ' + rep.signatures + ' 个 · 跨天复发 ' + rep.repeatSignatures + ' 个 · 复发错误占 ' + pct(rep.repeatErrorShare) + ' · 最长 ' + rep.maxDays + ' 天')
   for (const w of rep.worst) console.log('  ' + String(w.count).padStart(3) + ' 次 / ' + w.days + ' 天  ' + w.sig)
+  if (report.split) {
+    const sp = report.split
+    console.log('')
+    console.log('[改前/改后] 切点 ' + sp.at)
+    for (const [name, x] of [['改前', sp.before], ['改后', sp.after]]) {
+      console.log('  ' + name + '：调用 ' + x.calls + ' · 报错 ' + x.errors + ' · 错误率 ' + pct(x.errorRate) + ' · 复发占比 ' + pct(x.repeat.repeatErrorShare) + ' · 签名 ' + x.signatures)
+    }
+    const c = sp.compare
+    console.log('  结论：' + c.verdict + '（错误率 ' + (c.errorRateDelta >= 0 ? '+' : '') + (c.errorRateDelta * 100).toFixed(2) + 'pp，复发 ' + (c.repeatShareDelta >= 0 ? '+' : '') + (c.repeatShareDelta * 100).toFixed(1) + 'pp）')
+  }
 }
 
-try {
+if (!NO_WRITE) try {
   mkdirSync(METRICS_DIR, { recursive: true })
   writeFileSync(path.join(METRICS_DIR, 'tool-error-rate-baseline.json'), JSON.stringify(report, null, 2))
   appendFileSync(path.join(METRICS_DIR, 'tool-error-rate-history.jsonl'), JSON.stringify({ at: report.generatedAt, days: DAYS, calls: totalCalls, errors: totalErrors, rate: report.errorRate, repeatSignatures: report.repeat.repeatSignatures, repeatErrorShare: report.repeat.repeatErrorShare, maxDays: report.repeat.maxDays }) + '\n')

@@ -1,7 +1,7 @@
 // metrics-stability.test.mjs — 错误签名归一化与「跨天复发」汇总（G3 稳定性指标）
 // 口径：repeatErrorShare = 跨 ≥2 天的签名所占总错误数 / 总错误数；worst 按次数降序。
 import assert from 'node:assert/strict'
-import { signature, summarizeRepeat } from '../metrics/error-stats.mjs'
+import { comparePhase, signature, summarizeRepeat } from '../metrics/error-stats.mjs'
 
 let passed = 0
 const ok = (label) => { passed += 1; console.log('  ✓ ' + label) }
@@ -89,5 +89,25 @@ const ok = (label) => { passed += 1; console.log('  ✓ ' + label) }
   assert.match(out, /拒绝写空基线/)
   assert.equal(existsSync(path.join(outDir, 'tool-error-rate-baseline.json')), false, '空基线不得落盘')
   ok('空会话目录 → 拒绝写 0 基线')
+}
+{
+  const before = { calls: 1000, errors: 50, repeat: { repeatErrorShare: 0.5 } }
+  const after = { calls: 1000, errors: 30, repeat: { repeatErrorShare: 0.2 } }
+  const c = comparePhase(before, after)
+  assert.equal(c.verdict, '改善')
+  assert.equal(c.errorRateDelta, -0.02)
+  assert.equal(c.repeatShareDelta, -0.3)
+  ok('comparePhase 改善判定')
+}
+
+{
+  const before = { calls: 1000, errors: 20, repeat: { repeatErrorShare: 0.1 } }
+  const after = { calls: 1000, errors: 40, repeat: { repeatErrorShare: 0.3 } }
+  assert.equal(comparePhase(before, after).verdict, '恶化')
+  // 小样本抖动不算改善：-0.2pp 错误率、-1pp 复发占比都低于阈值
+  const a = { calls: 10000, errors: 200, repeat: { repeatErrorShare: 0.10 } }
+  const b = { calls: 10000, errors: 180, repeat: { repeatErrorShare: 0.09 } }
+  assert.equal(comparePhase(a, b).verdict, '持平', '小变化不算改善，避免拿噪声邀功')
+  ok('comparePhase 恶化/持平判定（含小样本保护）')
 }
 console.log('metrics-stability: ' + passed + ' 组通过')

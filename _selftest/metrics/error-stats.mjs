@@ -27,6 +27,27 @@ export function signature(text) {
  * @returns {{signatures:number, repeatSignatures:number, repeatErrors:number, totalErrors:number,
  *            repeatErrorShare:number, maxDays:number, worst:Array<{sig:string,count:number,days:number}>}}
  */
+/**
+ * 改前 / 改后对比（判据写死在这里，避免每次换一套说法）：
+ *   复发占比变化 ≥ +5pp 或 错误率上升 ≥0.5pp → 恶化
+ *   复发占比下降 ≥5pp 或 错误率下降 ≥0.5pp → 改善
+ *   其余 → 持平（样本太小不算改善）
+ */
+export function comparePhase(before, after) {
+  const rate = (a) => (a.calls ? a.errors / a.calls : 0)
+  const share = (a) => (a.repeat && a.repeat.repeatErrorShare) || 0
+  const dEr = +(rate(after) - rate(before)).toFixed(4)
+  const dRs = +(share(after) - share(before)).toFixed(4)
+  let verdict = '持平'
+  if (dRs <= -0.05 || dEr <= -0.005) verdict = '改善'
+  if (dRs >= 0.05 || dEr >= 0.005) verdict = '恶化'
+  return {
+    errorRateBefore: +rate(before).toFixed(4), errorRateAfter: +rate(after).toFixed(4), errorRateDelta: dEr,
+    repeatShareBefore: +share(before).toFixed(4), repeatShareAfter: +share(after).toFixed(4), repeatShareDelta: dRs,
+    verdict,
+  }
+}
+
 export function summarizeRepeat(sigDays) {
   const norm = new Map()
   for (const [sig, v] of sigDays || []) {
