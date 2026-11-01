@@ -1,5 +1,5 @@
 /**
- * dsh-obsidian v0.2.0 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
+ * dsh-obsidian v0.3.0 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
  *
  * 为什么需要它：vault 是人的成品层，AI 要查画像/日志/调研结论时只能 glob + read 逐个翻；
  * 库一大就会问「哪张卡讲过 X」「断链断在哪」。这个插件把 vault 扫成一份索引（落在 D 盘），
@@ -425,6 +425,49 @@ export function parseMemoryPointers(value) {
   return [...found]
 }
 
+/** 页面契约检查：只做五条能从「找得到/信得过/改得动」倒推出来的规则 */
+export function lintIndex(index, options) {
+  const opts = options || {}
+  const skipPrefixes = Array.isArray(opts.skipPrefixes)
+    ? opts.skipPrefixes.map((item) => String(item).toLowerCase())
+    : ['90-shared/91-templates/', '95-archive/']
+  const pointerTargets = opts.pointerTargets || null
+  const issues = []
+  const idSeen = new Map()
+  for (const entry of index.notes) {
+    const rel = String(entry.path ?? '')
+    const lower = rel.toLowerCase()
+    if (skipPrefixes.some((prefix) => prefix !== '' && lower.startsWith(prefix))) continue
+    const isIndex = /(^|\/)_index\.md$/i.test(rel)
+    const type = String(entry.type ?? '').toLowerCase()
+    for (const field of ['type', 'domain', 'status']) {
+      if (String(entry[field] ?? '').trim() === '') issues.push({ level: 'error', code: 'missing_field', path: rel, detail: '缺 ' + field })
+    }
+    if (isIndex && type !== '' && type !== 'index') issues.push({ level: 'warn', code: 'index_named_content', path: rel, detail: '文件名是 _index.md，但 type=' + type + '（内容页占了导航名）' })
+    if (!isIndex && type === 'index' && rel.includes('/')) issues.push({ level: 'warn', code: 'content_named_index', path: rel, detail: 'type=index，但文件名不是 _index.md（根级导航页如 Home.md 豁免）' })
+    if (!isIndex && type !== 'index' && type !== 'journal' && !String(entry.text ?? '').includes('**一句话**')) issues.push({ level: 'warn', code: 'missing_one_liner', path: rel, detail: '正文缺「一句话」结论头（journal 免检：日志是过程记录）' })
+    const id = String(entry.id ?? '').trim()
+    if (id !== '') {
+      if (idSeen.has(id)) issues.push({ level: 'error', code: 'duplicate_id', path: rel, detail: 'id 重复（先出现于 ' + idSeen.get(id) + '）：' + id })
+      else idSeen.set(id, rel)
+    }
+    if (pointerTargets !== null && pointerTargets.has(lower) && String(entry.status ?? '').trim() !== 'active') {
+      issues.push({ level: 'error', code: 'pointer_to_inactive', path: rel, detail: '被记忆指针指向，但 status=' + (String(entry.status ?? '').trim() || '(空)') + '（指向草稿/归档 = 指向未定）' })
+    }
+  }
+  const errorCount = issues.filter((issue) => issue.level === 'error').length
+  return { total: index.notes.length, errorCount, warnCount: issues.length - errorCount, issues }
+}
+
+/** 记忆里 vault:// 指针指向的相对路径集合（剥锚点，统一小写） */
+export function pointerTargetsOf(memoryText) {
+  const set = new Set()
+  for (const pointer of parseMemoryPointers(memoryText)) {
+    set.add(normalizeVaultPath(String(pointer).split('#')[0]).toLowerCase())
+  }
+  return set
+}
+
 export function apply(ctx, config) {
   const vaultDir = strValue(config?.vaultDir) || DEFAULT_VAULT
   const storeDir = strValue(config?.storeDir) || DEFAULT_STORE
@@ -537,6 +580,25 @@ export function apply(ctx, config) {
       report.error = lastError
     }
     return report
+  }
+
+  /** 读真实 memory.json，取出所有指针目标（lint 用；读不到就当空集，不阻断） */
+  function memoryPointerTargets() {
+    try {
+      if (!existsSync(memoryPath)) return new Set()
+      const parsed = JSON.parse(readFileSync(memoryPath, 'utf8'))
+      const entries = Array.isArray(parsed?.entries) ? parsed.entries : []
+      const set = new Set()
+      for (const entry of entries) {
+        for (const pointer of parseMemoryPointers(entry?.text)) {
+          set.add(normalizeVaultPath(String(pointer).split('#')[0]).toLowerCase())
+        }
+      }
+      return set
+    } catch (error) {
+      note(error)
+      return new Set()
+    }
   }
 
   // 启动时顺带建一次索引（只读扫库，失败不影响启动）
@@ -917,6 +979,67 @@ export function apply(ctx, config) {
         } catch (error) {
           note(error)
           return { ok: false, code: 'error', path: strValue(args?.path), lastError }
+        }
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'obsidian_lint',
+      description: 'Check the vault against the page contract: required frontmatter (type/domain/status), _index naming vs type, missing one-line summary, duplicate ids, and memory pointers aimed at non-active pages. Read-only; rebuilds the index first so the report matches disk.',
+      parameters: {
+        type: 'object',
+        properties: {
+          includeTemplates: { type: 'boolean', description: 'Also lint 90-Shared/91-Templates and 95-Archive (default false).' },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            vault: { type: 'string' },
+            total: { type: 'integer' },
+            errorCount: { type: 'integer' },
+            warnCount: { type: 'integer' },
+            issues: { type: 'array', items: { type: 'object', additionalProperties: true } },
+            tookMs: { type: 'integer' },
+            lastError: { type: 'string' },
+          },
+          required: ['ok', 'total', 'errorCount', 'warnCount', 'issues'],
+          additionalProperties: true,
+        },
+        render(_args, value) {
+          if (value.ok === false) return [text('检查失败：' + (value.lastError || '未知原因'))]
+          if (value.errorCount === 0 && value.warnCount === 0) return [text('库合规：' + value.total + ' 篇全过（' + value.tookMs + 'ms）')]
+          const head = '库检查：' + value.total + ' 篇，' + value.errorCount + ' 错误 / ' + value.warnCount + ' 警告'
+          const lines = value.issues.slice(0, 10).map((item) => '- [' + item.level + '] ' + item.path + '：' + item.detail)
+          const tail = value.issues.length > 10 ? '\n…还有 ' + (value.issues.length - 10) + ' 条（完整看 issues）' : ''
+          return [text(head + '\n' + lines.join('\n') + tail)]
+        },
+      },
+      async execute(args) {
+        const started = Date.now()
+        try {
+          const result = ensureIndex(true)
+          if (!result.ok || !result.index) return { ok: false, total: 0, errorCount: 0, warnCount: 0, issues: [], tookMs: Date.now() - started, lastError: lastError || 'vault 不可读' }
+          const skipPrefixes = args?.includeTemplates === true ? [] : ['90-shared/91-templates/', '95-archive/']
+          const report = lintIndex(result.index, { pointerTargets: memoryPointerTargets(), skipPrefixes })
+          return {
+            ok: true,
+            vault: vaultDir,
+            total: report.total,
+            errorCount: report.errorCount,
+            warnCount: report.warnCount,
+            issues: report.issues,
+            tookMs: Date.now() - started,
+            lastError,
+          }
+        } catch (error) {
+          note(error)
+          return { ok: false, total: 0, errorCount: 0, warnCount: 0, issues: [], tookMs: Date.now() - started, lastError }
         }
       },
     }),

@@ -1,6 +1,6 @@
 # dsh-obsidian
 
-> Obsidian 库的**索引**（P1 只读）+ **受控写**（P2）。把 `vault` 扫成索引给 AI 检索；写只允许进白名单目录，默认不覆盖、冲突即放弃。
+> Obsidian 库的**索引**（P1 只读）+ **受控写**（P2）+ **页面契约检查**（P3）。扫成索引给 AI 检索；写只进白名单、默认不覆盖；契约违规一眼看到。
 
 ## 为什么需要它
 
@@ -16,6 +16,7 @@ vault 是人的成品层（画像 / 3观 / 日志 / 调研索引）。没有索�
 | `obsidian_search` | 按标题 / 别名 / 标签 / 正文打分检索 | 可按 `type` / `domain` / `tag` 过滤；索引过期时内存重建 |
 | `obsidian_note` | 按 vault 相对路径读单篇 | frontmatter + 正文 + 出链；路径越界直接拒 |
 | `obsidian_write` | 受控写（P2） | 白名单内、create 不覆盖、hash/mtime 不符即放弃 |
+| `obsidian_lint` | 页面契约检查（P3） | 缺字段 / 命名混 / 缺一句话 / id 重复 / 指针指向非 active |
 
 ## 写入边界（P2）
 
@@ -27,6 +28,21 @@ vault 是人的成品层（画像 / 3观 / 日志 / 调研索引）。没有索�
 6. **原子写**：tmp + rename，写一半崩了不会留半篇。
 
 失败返回 `code`：`denied` / `escape` / `file_exists` / `conflict` / `section_not_found` / `no_file` / `too_large` / `write_disabled`。
+
+## 页面契约检查（P3）
+
+`obsidian_lint` 只查五条能从「找得到 / 信得过 / 改得动」倒推出来的规则，不多做：
+
+| 检查 | 代码 | 为什么 |
+|---|---|---|
+| 必填字段缺失 | `missing_field` | 缺 `type` / `domain` / `status`，机器分不了类 |
+| 内容页占导航名 | `index_named_content` | `_index.md` 却装结论，人和 AI 都会误判 |
+| type=index 却叫别的名 | `content_named_index` | 子目录导航页必须叫 `_index.md`（根级 `Home.md` / `AGENTS.md` 豁免） |
+| 缺结论头 | `missing_one_liner` | H1 后必须有「一句话」，否则读入口就要爬全文（`journal` 免检） |
+| id 重复 | `duplicate_id` | 改名不断链的前提是 id 唯一 |
+| 指针指向非 active | `pointer_to_inactive` | 指向草稿 = 指向「未定」，会误导引用 |
+
+**真机首跑**：21 篇 / 0 错误 / 0 警告 / 12ms。首跑曾报 6 条，其中 5 条是规则误报（journal 被要求写结论、Home.md 被当命名违规），按「规则服从目的」改规则，没有为了过检而改库。
 
 ## 索引数据布局
 
@@ -73,6 +89,8 @@ config:
 | `node --check index.js` | 通过 |
 | 单测 `_selftest/tests/obsidian.test.mjs` | 10 项通过（P1 8 项 + P2 受控写 2 项：纯函数与工具） |
 | 真机 P1（2026-11-01） | ✅ notes=21 / bases=4 / links=18 / brokenLinks=0 / parseErrors=0；重建 2ms、index.json 25.7KB |
+| 页面契约检查（2026-11-01，真实 vault） | ✅ 21 篇 / **0 错误 0 警告** / 12ms；单测 12 项（含 journal 免检、根级豁免、模板跳过三条正例） |
+| 记忆指针试点（2026-11-01，真实 memory.json） | ✅ 4 条记忆改为「判据 + `vault://` 指针」；扫出 `total:2` 个不同锚点、`broken:0`；记忆 10849 → 10644 字（90.4% → 88.7%） |
 | 真机 P2（2026-11-01，源码直跑真实 vault） | ✅ 新建 71 字节成功（自动补 .md）/ 二次写 `file_exists` / `10-Life` 与模板目录 `denied` / append 85 字节 / 检索与读单篇回归正常；验证文件已删，索引重建回 21 篇 |
 
 ## 已知边界（诚实清单）

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Obsidian index",
-    "description": "Indexes the local Obsidian vault into D:\AI\dsh-data\obsidian\index.json (search / note / status). P2 write is allowlisted, no-overwrite and conflict-abort."
+    "description": "Indexes the local Obsidian vault (search / note / status); controlled allowlisted write with no-overwrite and conflict-abort; page-contract lint."
   }
 }

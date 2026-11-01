@@ -8,6 +8,7 @@ import {
   buildIndex,
   extractLinks,
   isWriteAllowed,
+  lintIndex,
   listVault,
   makeSnippet,
   normalizeTarget,
@@ -134,7 +135,7 @@ put('.git/config', '')
 // ---- 4 个工具真调用 ----
 {
   const h = host(vault, store)
-  assert.deepEqual([...h.defs.keys()].sort(), ['obsidian_index', 'obsidian_note', 'obsidian_search', 'obsidian_status', 'obsidian_write'])
+  assert.deepEqual([...h.defs.keys()].sort(), ['obsidian_index', 'obsidian_lint', 'obsidian_note', 'obsidian_search', 'obsidian_status', 'obsidian_write'])
   const built = await h.defs.get("obsidian_index").execute({})
   assert.equal(built.ok, true)
   assert.equal(built.notes, 4)
@@ -281,6 +282,52 @@ put('.git/config', '')
   assert.equal(st.memoryPointers.broken[0].pointer, '99-Gone/x.md')
 
   ok("工具：write 新建/拒覆盖/追加/section 替换/白名单/模板/越界/冲突 + status 指针漂移")
+}
+
+// ---- 页面契约检查（lint） ----
+{
+  const root2 = mkdtempSync(path.join(os.tmpdir(), "dsh-obsidian-lint-"))
+  const v2 = path.join(root2, "vault")
+  const put2 = (rel, body) => {
+    const abs = path.join(v2, rel)
+    mkdirSync(path.dirname(abs), { recursive: true })
+    writeFileSync(abs, body, 'utf8')
+  }
+  put2('a/good.md', '---\ntype: note\ndomain: life\nstatus: active\nid: good\n---\n# 好卡\n\n> **一句话**：合格。\n')
+  put2('a/missing.md', '---\ntype: note\n---\n# 缺字段\n\n> **一句话**：缺 domain 与 status。\n')
+  put2('a/_index.md', '---\ntype: note\ndomain: life\nstatus: active\n---\n# 命名冲突\n\n> **一句话**：内容页占了导航名。\n')
+  put2('a/dup1.md', '---\ntype: note\ndomain: life\nstatus: active\nid: same\n---\n# 一\n\n> **一句话**：一。\n')
+  put2('a/dup2.md', '---\ntype: note\ndomain: life\nstatus: active\nid: same\n---\n# 二\n\n> **一句话**：二。\n')
+  put2('a/draft.md', '---\ntype: note\ndomain: life\nstatus: draft\nid: draft\n---\n# 草稿\n\n> **一句话**：草稿。\n')
+  put2('a/day.md', '---\ntype: journal\ndomain: life\nstatus: active\n---\n# 日志\n\n今天干了什么。\n')
+  put2('Home.md', '---\ntype: index\ndomain: shared\nstatus: active\n---\n# 总览\n')
+  put2('90-Shared/91-Templates/t.md', '---\n---\n# 模板\n')
+
+  const report = lintIndex(buildIndex(v2), { pointerTargets: new Set(['a/draft.md']) })
+  const codes = report.issues.map((issue) => issue.code)
+  assert.ok(codes.includes('missing_field'), '缺 domain/status 要报')
+  assert.ok(codes.includes('index_named_content'), '_index.md 装内容页要报')
+  assert.ok(codes.includes('duplicate_id'), '重复 id 要报')
+  assert.ok(codes.includes('pointer_to_inactive'), '指针指到草稿要报')
+  assert.ok(!report.issues.some((issue) => issue.path === 'a/good.md'), '合格页不该被报')
+  assert.ok(!report.issues.some((issue) => issue.path.includes('91-Templates')), '模板默认跳过')
+  assert.ok(!report.issues.some((issue) => issue.path === 'a/day.md'), 'journal 免检一句话')
+  assert.ok(!report.issues.some((issue) => issue.path === 'Home.md'), '根级导航页豁免命名检查')
+  assert.ok(report.errorCount >= 3 && report.warnCount >= 1)
+  rmSync(root2, { recursive: true, force: true })
+  ok('lint 纯函数：缺字段 / 命名冲突 / 重复 id / 指针指草稿 / 模板跳过')
+}
+
+// ---- lint 工具真调用 ----
+{
+  const h = host(vault, store)
+  const linted = await h.defs.get("obsidian_lint").execute({})
+  assert.equal(linted.ok, true)
+  assert.ok(linted.total >= 4)
+  assert.ok(linted.errorCount >= 1, '夹具缺 domain/status，应当报出来')
+  assert.ok(linted.issues.some((issue) => issue.code === 'missing_field'))
+  assert.ok(linted.tookMs >= 0)
+  ok('lint 工具：真实扫库返回结构化清单')
 }
 
 rmSync(root, { recursive: true, force: true })

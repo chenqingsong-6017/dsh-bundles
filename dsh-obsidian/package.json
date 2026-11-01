@@ -1,12 +1,12 @@
 {
   "name": "@local/dsh-obsidian",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "engines": {
     "node": ">=22.19.0"
   },
   "type": "module",
-  "description": "Index of the local Obsidian vault: P1 read-only search/read/status, P2 controlled write (allowlist, no-overwrite, conflict-abort) into 00-Inbox/ai-drafts.",
+  "description": "Obsidian vault toolkit: P1 read-only search/read/status, P2 controlled write (allowlist / no-overwrite / conflict-abort), P3 page-contract lint (fields, naming, one-liner, ids, pointer targets).",
   "main": "index.js",
   "exports": {
     ".": "./index.js",

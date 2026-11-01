@@ -2,6 +2,17 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.3.0 — 2026-11-01
+
+### Added
+- `obsidian_lint`：按页面契约扫全库，报五类问题——必填字段缺失（type / domain / status）、`_index.md` 与 type 不一致、非导航页缺「一句话」结论头、id 重复、记忆指针指向非 active 页。只读，先强制重建索引再查。
+- 纯函数导出：`lintIndex` / `pointerTargetsOf`。
+- `journal` 类型免检「一句话」（日志是过程记录）；根级导航页（`Home.md` / `AGENTS.md`）豁免命名检查；模板目录默认跳过（`includeTemplates: true` 可纳入）。
+
+### Design
+- 只做五条能从「找得到 / 信得过 / 改得动」倒推出来的规则；重复检测、过期检测、tag 覆盖留给触发线，不预建。
+- 真机首跑暴露两条误报（journal 被要求写结论、Home.md 被当成命名违规），按「规则服从目的」改规则，不改库。
+
 ## v0.2.0 — 2026-11-01
 
 ### Added
