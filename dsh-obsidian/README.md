@@ -87,7 +87,8 @@ config:
 | 项 | 结果 |
 |---|---|
 | `node --check index.js` | 通过 |
-| 单测 `_selftest/tests/obsidian.test.mjs` | 10 项通过（P1 8 项 + P2 受控写 2 项：纯函数与工具） |
+| 单测 `_selftest/tests/obsidian.test.mjs` | 12 项通过（P1 8 项 + P2 受控写 2 项 + lint 2 项） |
+| `obsidian_status.render` 显示记忆指针（2026-11-01 改） | ⚠️ 单测断言通过（总数/断链/点名词）；**真机未验证——插件未重启，实机输出仍是旧格式**，不得算已生效（见 `_research/postmortems/0003-render-fix-claimed-before-restart.md`） |
 | 真机 P1（2026-11-01） | ✅ notes=21 / bases=4 / links=18 / brokenLinks=0 / parseErrors=0；重建 2ms、index.json 25.7KB |
 | 页面契约检查（2026-11-01，真实 vault） | ✅ 21 篇 / **0 错误 0 警告** / 12ms；单测 12 项（含 journal 免检、根级豁免、模板跳过三条正例） |
 | 记忆指针试点（2026-11-01，真实 memory.json） | ✅ 4 条记忆改为「判据 + `vault://` 指针」；扫出 `total:2` 个不同锚点、`broken:0`；记忆 10849 → 10644 字（90.4% → 88.7%） |

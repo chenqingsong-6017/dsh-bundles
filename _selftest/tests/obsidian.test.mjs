@@ -281,7 +281,12 @@ put('.git/config', '')
   assert.equal(st.memoryPointers.broken.length, 1, '断指针要报出来')
   assert.equal(st.memoryPointers.broken[0].pointer, '99-Gone/x.md')
 
-  ok("工具：write 新建/拒覆盖/追加/section 替换/白名单/模板/越界/冲突 + status 指针漂移")
+  // render 必须把指针断链直接显示出来：不然工具算对了人也看不见（2026-11-01 实测缺口）
+  const rendered = h.defs.get("obsidian_status").output.render({}, st).map((part) => part.text).join('')
+  assert.ok(rendered.includes('记忆指针 3 条（断 1）'), 'render 要直接显示指针总数与断链数')
+  assert.ok(rendered.includes('99-Gone/x.md'), '断链要点名到具体指针')
+
+  ok("工具：write 新建/拒覆盖/追加/section 替换/白名单/模板/越界/冲突 + status 指针漂移 + render 断链可见")
 }
 
 // ---- 页面契约检查（lint） ----

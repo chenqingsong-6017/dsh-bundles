@@ -637,7 +637,19 @@ export function apply(ctx, config) {
           additionalProperties: true,
         },
         render(_args, value) {
-          return [text(value.ok === false ? 'Obsidian 索引不可用：' + (value.lastError || '未知原因') : 'Obsidian：' + value.notes + ' 篇笔记 / ' + value.bases + ' 个视图 / 链接 ' + value.links + '（断 ' + value.brokenLinks + '）/ 解析失败 ' + value.parseErrors)]
+          if (value.ok === false) return [text('Obsidian 索引不可用：' + (value.lastError || '未知原因'))]
+          let line = 'Obsidian：' + value.notes + ' 篇笔记 / ' + value.bases + ' 个视图 / 链接 ' + value.links + '（断 ' + value.brokenLinks + '）/ 解析失败 ' + value.parseErrors
+          const pointer = value.memoryPointers
+          if (pointer !== null && typeof pointer === 'object') {
+            if (pointer.checked === false) {
+              line += '；记忆指针未检查（' + (pointer.error || pointer.file || '未知原因') + '）'
+            } else {
+              const broken = Array.isArray(pointer.broken) ? pointer.broken : []
+              line += '；记忆指针 ' + pointer.total + ' 条（断 ' + broken.length + '）'
+              if (broken.length > 0) line += '：' + broken.slice(0, 3).map((item) => String(item?.pointer ?? '')).join(' / ')
+            }
+          }
+          return [text(line)]
         },
       },
       async execute() {
