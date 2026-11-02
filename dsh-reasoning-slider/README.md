@@ -80,4 +80,5 @@ plugin_manager remove_bundle   target = @local/dsh-reasoning-slider
 - 宿主侧真机：`reasoning_status` 已进工具列表，返回「就绪：客户端插件：滑条在 lib/client.js，走官方 Session RPC，无服务端工具」。
 - rc.5 兼容核对（读 `app.asar` 源码）：`conversation.input.right`（list / session scope）仍存在；`modelCatalog` / `selectModel` Remote 仍在 `dsh-api-session-controller`；`ctx.slots.inject` + `register({ name, id, order })` 与官方示例一致。
 - 验证门：`npm run check` 通过。
-- **待用户验收**：客户端 UI 需刷新页面（`Ctrl+R`，不是重启 DSH）后确认滑条回到输入栏右侧；滑条外观/宽度若与 rc.5 新布局冲突，另开一轮调整。
+- **用户验收通过（2026-11-02 晚）**：装回后无需刷新页面、无需重启 Host —— 官方 `dsh-client-hmr` 把插件图经 `/plugins/events` SSE 推给已打开页面，图里已包含 `@local/dsh-reasoning-slider`（rev `d32032b3f118`，`immediately: true`），页面按图自动挂载，滑条已回到输入栏右侧。bundle 可下载（12,365 字节）且内容核对无误。
+- 教训（已记）：**普通插件启停走 client-hmr 热通道，不要建议用户刷新/重启**；需要刷新的是「已加载 bundle 的代码重建」场景。

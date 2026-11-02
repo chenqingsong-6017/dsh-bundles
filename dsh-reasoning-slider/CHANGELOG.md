@@ -12,7 +12,7 @@
 - 宿主侧真机：`reasoning_status` 出现在工具列表并返回「就绪：客户端插件：滑条在 lib/client.js，走官方 Session RPC，无服务端工具」。
 - rc.5 兼容核对（asar 源码）：`conversation.input.right`（list / session scope）仍在 `dsh-client-ui-conversation`；`modelCatalog` / `selectModel` Remote 仍在 `dsh-api-session-controller`；`ctx.slots.inject` + `register({name,id,order})` 签名与官方示例一致。
 - 验证门 `npm run check` 通过。
-- 待验收：客户端 UI 需刷新页面（`Ctrl+R`）后确认滑条回到输入栏右侧。
+- 真机验收（用户确认「好了」）：官方 `dsh-client-hmr` 图更新走 SSE，`/plugins/events` 图里已含本插件（rev `d32032b3f118`），已打开页面自动挂载，**无需刷新、无需重启**；滑条已回到输入栏右侧。
 
 ## v0.1.1 — 2026-11-01
 
