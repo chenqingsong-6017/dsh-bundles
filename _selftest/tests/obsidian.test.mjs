@@ -9,6 +9,7 @@ import {
   buildIndex,
   extractLinks,
   hasOneLiner,
+  hasTraversalSegment,
   headingAnchors,
   isWriteAllowed,
   lintIndex,
@@ -19,6 +20,7 @@ import {
   normalizeVaultPath,
   parseFrontmatter,
   parseMemoryPointers,
+  readMemoryEntries,
   safeResolve,
   scoreNote,
   sectionRange,
@@ -563,6 +565,93 @@ put('.git/config', '')
   assert.equal(ptrB.broken[0].pointer, '99-Gone/x.md')
   rmSync(rootB, { recursive: true, force: true })
   ok('记忆指针数据源：无 memory.db 时回退 memory.json（source=json，断链照报）')
+}
+
+// ---- v0.4.1（H3）：写白名单 `..` 穿越必须拒（审计 §1 H3：原本 ai-drafts/../../10-Life 判 allow 且真写进 10-Life）----
+{
+  // 纯函数：归一即失败（不折叠成别的路径）
+  assert.equal(normalizeVaultPath('00-Inbox/ai-drafts/../x.md'), '', '含 .. 段归一必须返回空')
+  assert.equal(normalizeVaultPath('00-Inbox/ai-drafts/../../10-Life/x.md'), '', '多级 .. 同样归零')
+  assert.equal(normalizeVaultPath('00-Inbox/ai-drafts/%2e%2e/%2e%2e/10-Life/x.md'), '', '%2e%2e 变体同样拒')
+  assert.equal(hasTraversalSegment('a/../b.md'), true)
+  assert.equal(hasTraversalSegment('%2e%2e/x.md'), true, '百分号编码的 .. 也要认出来')
+  assert.equal(hasTraversalSegment('a/b.md'), false)
+  // 白名单判定：规范化后的相对路径比对，且 .. 直接拒
+  assert.equal(isWriteAllowed('00-Inbox/ai-drafts/../../10-Life/x.md').allowed, false, '穿越路径不能命中白名单前缀')
+  assert.equal(isWriteAllowed('00-Inbox/ai-drafts/../x.md').allowed, false)
+  assert.equal(isWriteAllowed('00-Inbox/ai-drafts/%2e%2e/10-Life/x.md').allowed, false)
+  // safeResolve：vault 内的 .. 也不能当成「合法 vault 内路径」
+  assert.equal(safeResolve(vault, '00-Inbox/ai-drafts/../../10-Life/x.md'), null, 'safeResolve 也要拦 vault 内穿越')
+  assert.equal(safeResolve(vault, '../outside.md'), null, '越出 vault 照旧拒绝')
+  // 正常路径不受影响
+  assert.equal(normalizeVaultPath('00-Inbox/ai-drafts/./a.md'), '00-Inbox/ai-drafts/a.md', '单点段照旧折叠')
+  assert.equal(isWriteAllowed('00-Inbox/ai-drafts/x.md').allowed, true)
+  // 工具级：真写必须拒，且绝不能落盘到 10-Life
+  const hTraversal = host(vault, store)
+  const writeTraversal = hTraversal.defs.get('obsidian_write')
+  for (const bad of ['00-Inbox/ai-drafts/../../10-Life/12-Values/escaped.md', '00-Inbox/ai-drafts/../x.md', '00-Inbox/ai-drafts/%2e%2e/10-Life/x.md']) {
+    const res = await writeTraversal.execute({ path: bad, content: '穿越写入测试' })
+    assert.equal(res.ok, false, bad + ' 必须被拒')
+    assert.equal(res.code, 'DENIED', bad + ' 要报 DENIED，实际 ' + res.code)
+  }
+  assert.equal(existsSync(path.join(vault, '10-Life/12-Values/escaped.md')), false, '穿出 ai-drafts 的文件绝不能落盘')
+  assert.equal(existsSync(path.join(vault, '10-Life/x.md')), false, '第二级穿越同样不能落盘')
+  ok('v0.4.1 H3：白名单 .. 穿越（含 %2e%2e）在归一 / 判定 / safeResolve / 工具四层全被拒，正常路径不误杀')
+}
+
+// ---- v0.4.1（M4）：空 DB + 有 memory.json → 回退 JSON 并带 note（原来报「0 条 0 断」= 假绿）----
+{
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
+  const rootC = mkdtempSync(path.join(os.tmpdir(), 'dsh-obsidian-emptydb-'))
+  const vC = path.join(rootC, 'vault')
+  const storeC = path.join(rootC, 'store')
+  mkdirSync(path.join(vC, 'a'), { recursive: true })
+  writeFileSync(path.join(vC, 'a/Me.md'), ['---', 'type: person', 'status: active', '---', '# 我', ''].join('\n'), 'utf8')
+  const memC = path.join(rootC, 'memory.json')
+  writeFileSync(memC, JSON.stringify({ entries: [
+    { id: 'm1', text: '好的：vault://a/Me.md' },
+    { id: 'm2', text: '断的：vault://99-Gone/x.md' },
+  ] }), 'utf8')
+  // 空 schema 的 DB：能打开、entries 表 0 条（回滚 storage:json 后 / 空库现场）
+  const emptyDb = new DatabaseSync(path.join(rootC, 'memory.db'))
+  emptyDb.exec('CREATE TABLE entries (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT, payload TEXT)')
+  emptyDb.close()
+
+  const directC = readMemoryEntries(memC)
+  assert.equal(directC.source, 'json', '空 DB 必须回退 memory.json')
+  assert.equal(directC.entryCount, 2, '诊断字段 entryCount 要指向回退后的条目数')
+  assert.match(String(directC.note ?? ''), /0 条/, 'note 要说明为什么回退（原来什么都不说）')
+
+  const hC = host(vC, storeC, { memoryPath: memC })
+  assert.equal((await hC.defs.get('obsidian_index').execute({})).ok, true)
+  const stC = await hC.defs.get('obsidian_status').execute({})
+  const ptrC = stC.memoryPointers
+  assert.equal(ptrC.source, 'json', 'status 要如实报 json 源')
+  assert.equal(ptrC.entryCount, 2)
+  assert.equal(ptrC.total, 2)
+  assert.equal(ptrC.broken.length, 1, '回退后断链必须报出来（空库假绿时是 0 条 0 断）')
+  assert.equal(ptrC.broken[0].pointer, '99-Gone/x.md')
+  const renderedC = hC.defs.get('obsidian_status').output.render({}, stC).map((part) => part.text).join('')
+  assert.match(renderedC, /源 json，2 条/, 'render 要露出数据源与条目数，实际：' + renderedC)
+  rmSync(rootC, { recursive: true, force: true })
+
+  // 正常 DB：仍走 sqlite（别为了修假绿把正常路径也降级）
+  const rootD = mkdtempSync(path.join(os.tmpdir(), 'dsh-obsidian-normaldb-'))
+  const vD = path.join(rootD, 'vault')
+  mkdirSync(vD, { recursive: true })
+  const memD = path.join(rootD, 'memory.json')
+  writeFileSync(memD, JSON.stringify({ entries: [{ id: 'json-only', text: 'vault://99-Gone/json.md' }] }), 'utf8')
+  const normalDb = new DatabaseSync(path.join(rootD, 'memory.db'))
+  normalDb.exec('CREATE TABLE entries (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT, payload TEXT)')
+  normalDb.prepare('INSERT INTO entries (id, payload) VALUES (?, ?)').run('m1', JSON.stringify({ id: 'm1', text: '正常：vault://a/Me.md' }))
+  normalDb.close()
+  const directD = readMemoryEntries(memD)
+  assert.equal(directD.source, 'sqlite', '正常 DB 仍以 sqlite 为准')
+  assert.equal(directD.entryCount, 1)
+  assert.equal(directD.note, undefined, '正常路径不该带 note')
+  assert.equal(directD.entries[0].id, 'm1')
+  rmSync(rootD, { recursive: true, force: true })
+  ok('v0.4.1 M4：空 DB + 有 json → 回退 json 且 note 说明；正常 DB 仍走 sqlite（不降级）')
 }
 
 rmSync(root, { recursive: true, force: true })

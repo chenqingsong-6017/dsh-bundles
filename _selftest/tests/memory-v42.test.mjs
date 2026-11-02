@@ -214,4 +214,75 @@ const priming = (h) => h.layers[0].text({ agent: { session: {} } })
   ok('2.4 procedure：verifiedCount≥2 才收 / 落证据 / 可检索 / 可注入 / 可累加 / 不能无证据升级')
 }
 
+// ── 2.5 v4.2.1 修 M1/M2/M3：procedure 门槛的三条绕过路径各有机器判据 ──
+// 审计依据：_reports/global-audit-memory-2026-11-03.md §2 M1/M2/M3（三条均真机复核为真）。
+{
+  const dir = tmp('procedure-gate')
+  const h = host(dir)
+
+  // M1：同一文本先当 fact 入库，再用 kind:'procedure' 走「去重捷径」——原来 :4019 在门槛 :4093 之前 return。
+  const factText = 'M1 绕过用例：同一段正文先当 fact 入库的条目'
+  const early = await h.defs.get('memory_add').execute({ text: factText, kind: 'fact' })
+  assert.equal(early.entry.kind, 'fact')
+  await assert.rejects(
+    () => h.defs.get('memory_add').execute({ text: factText, kind: 'procedure' }),
+    (error) => { assert.equal(error.code, 'MEMORY_PROCEDURE_UNVERIFIED'); return true },
+    'M1：去重命中 + 改 kind=procedure 必须过同一道门槛（不能靠捷径改 kind）',
+  )
+  const upgraded = await h.defs.get('memory_add').execute({ text: factText, kind: 'procedure', verifiedCount: 2 })
+  assert.equal(upgraded.deduped, true, '去重命中仍是同一条（不是新建）')
+  assert.equal(upgraded.entry.kind, 'procedure', '显式给证据后允许去重分支升级 kind')
+  assert.equal(upgraded.entry.verifiedCount, 2, '证据要落库，不能是 undefined')
+
+  // M2：procedure 条目「只累加证据（无 text）+ supersede」——原来会造一条 text:'' 的新条目并作废旧条。
+  const proc = await h.defs.get('memory_add').execute({ text: 'M2 用例：真跑过两遍的可复现流程', kind: 'procedure', verifiedCount: 2 })
+  await assert.rejects(
+    () => h.defs.get('memory_update').execute({ id: proc.entry.id, verifiedCount: 3, supersede: true }),
+    (error) => { assert.equal(error.code, 'MEMORY_ARG_MISSING'); return true },
+    'M2：无 text 的 supersede 必须拒绝（否则造出空正文的新条目）',
+  )
+  const stillThere = await h.defs.get('memory_list').execute({})
+  assert.ok(stillThere.active >= 1, '被拒的 update 不能改库')
+  const superseded = await h.defs.get('memory_update').execute({ id: proc.entry.id, text: 'M2 用例：真跑过两遍的可复现流程（v2）', supersede: true })
+  assert.equal(superseded.superseded, proc.entry.id, '带 text 的 supersede 仍要可用')
+  assert.ok(String(superseded.entry.text).trim() !== '', '新条目正文不能为空')
+
+  // M3：fact 条目先灌 verifiedCount，再改 kind=procedure —— 原来两步都放行。
+  const fact3 = await h.defs.get('memory_add').execute({ text: 'M3 绕过用例：先当事实入库的条目' })
+  await assert.rejects(
+    () => h.defs.get('memory_update').execute({ id: fact3.entry.id, verifiedCount: 2 }),
+    (error) => { assert.equal(error.code, 'MEMORY_VERIFIEDCOUNT_INVALID'); return true },
+    'M3：verifiedCount 只能写在 procedure 条目上（fact 灌计数必须拒）',
+  )
+  await assert.rejects(
+    () => h.defs.get('memory_update').execute({ id: fact3.entry.id, text: fact3.entry.text, kind: 'procedure' }),
+    (error) => { assert.equal(error.code, 'MEMORY_PROCEDURE_UNVERIFIED'); return true },
+    'M3：改 kind=procedure 必须本次显式给 verifiedCount≥2（不能沿用存量值）',
+  )
+  const promoted = await h.defs.get('memory_update').execute({ id: fact3.entry.id, text: fact3.entry.text, kind: 'procedure', verifiedCount: 2 })
+  assert.equal(promoted.entry.kind, 'procedure', '一次性带证据的升级要允许')
+  assert.equal(promoted.entry.verifiedCount, 2)
+  // 已是 procedure 的条目允许累加（正常路径不能被门槛误杀）
+  const accumulated = await h.defs.get('memory_update').execute({ id: promoted.entry.id, verifiedCount: 3 })
+  assert.equal(accumulated.entry.verifiedCount, 3, 'procedure 条目累加证据要允许')
+  // kind 离开 procedure → 清掉证据，堵「降级再升级」的沿用
+  const downgraded = await h.defs.get('memory_update').execute({ id: promoted.entry.id, text: promoted.entry.text, kind: 'fact' })
+  assert.equal(downgraded.entry.kind, 'fact')
+  assert.equal(downgraded.entry.verifiedCount, undefined, '降级离开 procedure 要清掉 verifiedCount')
+
+  // M3 同口径：merge 不能把普通条目「合并成」procedure，除非显式给证据
+  const mergeA = await h.defs.get('memory_add').execute({ text: 'M3 merge 来源甲：部署流程第一步' })
+  const mergeB = await h.defs.get('memory_add').execute({ text: 'M3 merge 来源乙：部署流程第二步' })
+  await assert.rejects(
+    () => h.defs.get('memory_merge').execute({ ids: [mergeA.entry.id, mergeB.entry.id], kind: 'procedure' }),
+    (error) => { assert.equal(error.code, 'MEMORY_PROCEDURE_UNVERIFIED'); return true },
+    'merge：来源没有 procedure 证据时不能合并成 procedure',
+  )
+  const merged = await h.defs.get('memory_merge').execute({ ids: [mergeA.entry.id, mergeB.entry.id], kind: 'procedure', verifiedCount: 2 })
+  assert.equal(merged.entry.kind, 'procedure')
+  assert.equal(merged.entry.verifiedCount, 2, 'merge 显式证据要落库')
+  cleanup(dir)
+  ok('v4.2.1 M1/M2/M3：去重改 kind / 空 text supersede / 两步升级 三条绕过路径全被拒，正常路径不误杀')
+}
+
 console.log('memory-v42: ' + passed + ' 项通过')

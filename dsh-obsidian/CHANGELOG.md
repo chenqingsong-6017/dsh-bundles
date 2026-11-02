@@ -2,6 +2,17 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.4.1 — 2026-11-03
+
+### Fixed
+- **H3 写白名单 `..` 穿越**（`_reports/global-audit-memory-2026-11-03.md` §1 H3，真机确认写进了 `10-Life`）：`normalizeVaultPath` 只做清洗、不折叠 `..`，`isWriteAllowed` 直接比前缀，于是 `00-Inbox/ai-drafts/../../10-Life/x.md` 判 allow 并真的写到 `10-Life`。
+  现在：新增导出 `hasTraversalSegment()`（同时认 `..` 与 `%2e%2e` / `%2f` / `%5c` 编码变体）；`normalizeVaultPath` 先拒 `..` 段再 `path.posix.normalize`，含 `..` 一律返回 `''`；`isWriteAllowed` 用规范化后的相对路径比对、含 `..` 直接 DENIED；`safeResolve` 显式拒 `..` 并按 `path.relative(root, abs)` 复核不以 `..` 开头；`obsidian_write` 对穿越路径报 `DENIED`（越出 vault 仍报 `ESCAPE`，原语义保留）。
+- **M4 记忆指针「假绿」**：`readMemoryEntries` 原来只判 `existsSync(memory.db)`，空 DB / 回滚 `storage:'json'` 后 DB 冻结时返回 0 条，`obsidian_status` 报「0 条 0 断 ok:true」。现在：DB 可打开但 0 条且 `memory.json` 有条目 → 回退 JSON，返回 `source='json'` + `note`，保留 `storeFile` / `entryCount` 诊断字段；正常 DB 仍以 sqlite 为准。
+- `obsidian_status` render 补出数据源与条目数（`［源 sqlite，67 条］`）以及回退原因 `note`（审计 L7：诊断字段算了却不打印，人看不出数字来自哪份数据）。
+
+### 测试
+- `_selftest/tests/obsidian.test.mjs` 新增两组（临时目录，不碰真库/真 vault）：H3 —— `ai-drafts/../x`、`ai-drafts/../../10-Life/x`、`%2e%2e` 变体在归一 / 白名单 / `safeResolve` / `obsidian_write` 四层全被拒且文件不落盘；M4 —— 空 DB + 有 json → 回退 json + `note` + 断链照报，正常 DB 仍 sqlite 且不带 `note`。
+
 ## v0.4.0 — 2026-11-02
 
 ### Changed

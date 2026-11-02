@@ -1,5 +1,5 @@
 /**
- * dsh-obsidian v0.4.0 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
+ * dsh-obsidian v0.4.1 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
  *
  * 为什么需要它：vault 是人的成品层，AI 要查画像/日志/调研结论时只能 glob + read 逐个翻；
  * 库一大就会问「哪张卡讲过 X」「断链断在哪」。这个插件把 vault 扫成一份索引（落在 D 盘），
@@ -343,8 +343,14 @@ export function safeResolve(vaultDir, relPath) {
   const root = path.resolve(String(vaultDir ?? ''))
   const rel = String(relPath ?? '').trim()
   if (rel === '' || rel.includes('\u0000')) return null
+  // v0.4.1（H3）：显式拒绝任何含 .. 段的输入（读路径也一视同仁，别让 ../ 之后再靠 relative 兜）
+  if (hasTraversalSegment(rel)) return null
   const abs = path.resolve(root, rel)
   if (abs !== root && !abs.startsWith(root + path.sep)) return null
+  // v0.4.1（H3）：再按相对路径复核一次 —— 前缀比较足够挡「越出 vault」，
+  // 但「vault 内的 ..」要靠 relative 判定才看得见（如 ai-drafts/../10-Life/x）。
+  const back = path.relative(root, abs)
+  if (back === '' || path.isAbsolute(back) || back.split(path.sep).includes('..')) return null
   return abs
 }
 
@@ -352,20 +358,48 @@ export const DEFAULT_WRITE_ALLOWLIST = ['00-Inbox/ai-drafts/']
 const WRITE_DENY_PREFIXES = ['.obsidian/', '90-Shared/91-Templates/']
 const POINTER_RE = /vault:\/\/([^\s)\]"'，,；;。、：！？」）】]+)/g
 
-/** vault 相对路径归一：去引号 / 反斜杠转正斜杠 / 去前导 ./ 与 / / 自动补 .md */
+/**
+ * v0.4.1（H3）：路径里有没有父目录段（`..`）——含百分号编码绕过（`%2e%2e` = `..`）。
+ * 为什么单独一个函数：`..` 穿越是写白名单唯一的绕过口（审计 global-audit-memory-2026-11-03 §1 H3），
+ * 三处（normalize / isWriteAllowed / obsidian_write）都要用同一个判据，不能各写一套。
+ */
+export function hasTraversalSegment(relPath) {
+  const raw = String(relPath ?? '').replace(/\\/g, '/')
+  const variants = [
+    raw,
+    // 只解 %2e/%2f/%5c 三种：不整串 decodeURIComponent（合法文件名里的 % 不该被判成穿越）
+    raw.replace(/%2e/gi, '.').replace(/%2f|%5c/gi, '/'),
+  ]
+  return variants.some((value) => value.split('/').some((segment) => segment === '..'))
+}
+
+/** vault 相对路径归一：去引号 / 反斜杠转正斜杠 / 去前导 ./ 与 / / 折叠 . 与 .. / 自动补 .md
+ *  v0.4.1（H3）：含 `..` 段的输入一律返回 ''（拒绝），调用方据此报错——不折叠成别的路径。 */
 export function normalizeVaultPath(relPath) {
   let rel = String(relPath ?? '').trim().replace(/^["']+|["']+$/g, '').replace(/\\/g, '/')
   while (rel.startsWith('./')) rel = rel.slice(2)
   rel = rel.replace(/^\/+/, '')
-  if (rel !== '' && !rel.toLowerCase().endsWith('.md')) rel += '.md'
+  if (rel === '') return ''
+  // 先拒绝父目录段，再做 posix.normalize（顺序不能反：normalize 会把 ai-drafts/../.. 悄悄折叠掉）
+  if (hasTraversalSegment(rel)) return ''
+  rel = path.posix.normalize(rel)
+  if (rel === '' || rel === '.' || rel.startsWith('../')) return ''
+  if (hasTraversalSegment(rel)) return ''
+  if (!rel.toLowerCase().endsWith('.md')) rel += '.md'
   return rel
 }
 
 /** 写白名单判定：受保护前缀优先拒，其次必须命中 allowlist。
  *  2026-11-02 修 #21：Windows 路径大小写不敏感，比较前统一 toLowerCase()，
- *  否则 00-inbox/、00-Inbox/AI-Drafts/ 会被误拒，90-shared/91-templates/ 会绕过保护区判定。 */
+ *  否则 00-inbox/、00-Inbox/AI-Drafts/ 会被误拒，90-shared/91-templates/ 会绕过保护区判定。
+ *  v0.4.1（H3）：判定前先规范化——`00-Inbox/ai-drafts/../../10-Life/x.md` 原本靠前缀命中被判 allow，
+ *  实际写到 10-Life。现在：含 `..` 段直接拒；deny/allow 前缀都用规范化后的相对路径比对。 */
 export function isWriteAllowed(relPath, allowlist) {
-  const rel = String(relPath ?? '').replace(/\\/g, '/').toLowerCase()
+  const input = String(relPath ?? '').replace(/\\/g, '/')
+  if (hasTraversalSegment(input)) return { allowed: false, reason: '路径含 .. 段（禁止穿越白名单）' }
+  const normalized = path.posix.normalize(input.replace(/^\/+/, ''))
+  if (normalized === '..' || normalized.startsWith('../')) return { allowed: false, reason: '路径越界（..）' }
+  const rel = normalized.toLowerCase()
   const denied = WRITE_DENY_PREFIXES.find((prefix) => {
     const lower = prefix.toLowerCase()
     return rel === lower.slice(0, -1) || rel.startsWith(lower)
@@ -548,7 +582,21 @@ export function parseMemoryPointers(value) {
  * 返回 { entries, source, file, error? }：entries 为 null 表示两处都读不到（由调用方判空，fail-safe）；
  * source = 'sqlite' | 'json'，file = 实际读取的文件——诊断用，防止「以为读了 db、其实读了 json」。
  * 为什么要有它：2026-11-02 前 memoryPointerReport 直读 memory.json，报的是旧快照。
+ * v0.4.1（M4）：DB 能打开但 0 条时**不再当正常**——可能是「回滚 storage:json 后 DB 冻结」或空 schema 库，
+ *   此时若 memory.json 有条目就回退 JSON，并在 note 里写明原因（原实现只判 existsSync(memory.db)，
+ *   空库会让断链检查报「0 条 0 断 ok:true」，即假绿）。
  */
+function readJsonEntries(memFile) {
+  if (!existsSync(memFile)) return { entries: null, source: 'json', file: memFile, error: '记忆文件不存在：' + memFile }
+  try {
+    const parsed = JSON.parse(readFileSync(memFile, 'utf8'))
+    if (!Array.isArray(parsed?.entries)) return { entries: null, source: 'json', file: memFile, error: '记忆文件没有 entries 数组：' + memFile }
+    return { entries: parsed.entries, source: 'json', file: memFile }
+  } catch (error) {
+    return { entries: null, source: 'json', file: memFile, error: errText(error).slice(0, 200) }
+  }
+}
+
 export function readMemoryEntries(memoryPath) {
   const memFile = String(memoryPath ?? '')
   const dbFile = path.join(path.dirname(memFile), 'memory.db')
@@ -568,22 +616,34 @@ export function readMemoryEntries(memoryPath) {
             // 单条坏 payload 跳过（与插件加载口径一致）
           }
         }
-        return { entries, source: 'sqlite', file: dbFile }
+        if (entries.length > 0) return { entries, source: 'sqlite', file: dbFile, entryCount: entries.length }
+        // v0.4.1（M4）：空 DB 不再当成「0 条正常」——先看 memory.json，有货就回退并留 note。
+        const fallback = readJsonEntries(memFile)
+        if (fallback.entries !== null && fallback.entries.length > 0) {
+          return {
+            ...fallback,
+            dbFile,
+            entryCount: fallback.entries.length,
+            note: `memory.db 可打开但 0 条，已回退 memory.json（${fallback.entries.length} 条）：DB 可能是回滚前的冻结快照或空库`,
+          }
+        }
+        return {
+          entries,
+          source: 'sqlite',
+          file: dbFile,
+          dbFile,
+          entryCount: 0,
+          note: 'memory.db 0 条，memory.json 也没有可用条目（断链检查将显示 0 条）',
+        }
       } finally {
         database.close()
       }
     } catch (error) {
       // node:sqlite 不可用 / DB 打不开：回退 JSON（fail-safe，读取方自己判空）
+      return { ...readJsonEntries(memFile), dbFile, note: 'memory.db 打不开（' + errText(error).slice(0, 120) + '），已回退 memory.json' }
     }
   }
-  if (!existsSync(memFile)) return { entries: null, source: 'json', file: memFile, error: '记忆文件不存在：' + memFile }
-  try {
-    const parsed = JSON.parse(readFileSync(memFile, 'utf8'))
-    if (!Array.isArray(parsed?.entries)) return { entries: null, source: 'json', file: memFile, error: '记忆文件没有 entries 数组：' + memFile }
-    return { entries: parsed.entries, source: 'json', file: memFile }
-  } catch (error) {
-    return { entries: null, source: 'json', file: memFile, error: errText(error).slice(0, 200) }
-  }
+  return readJsonEntries(memFile)
 }
 
 /** 页面契约检查：只做五条能从「找得到/信得过/改得动」倒推出来的规则 */
@@ -628,7 +688,9 @@ export function lintIndex(index, options) {
 export function pointerTargetsOf(memoryText) {
   const set = new Set()
   for (const pointer of parseMemoryPointers(memoryText)) {
-    set.add(normalizeVaultPath(String(pointer).split('#')[0]).toLowerCase())
+    // v0.4.1（H3）：含 .. 的指针归一后是 ''，不进目标集合（否则空串会和别的东西撞）
+    const target = normalizeVaultPath(String(pointer).split('#')[0]).toLowerCase()
+    if (target !== '') set.add(target)
   }
   return set
 }
@@ -737,11 +799,13 @@ export function apply(ctx, config) {
    *  并加 source / storeFile / entryCount 三个诊断字段——「检查在跑、数字是旧快照」要能从输出上看出来。
    *  broken 用 kind 区分 file-missing / anchor-missing；pointer / memoryIds 保持向后兼容。 */
   function memoryPointerReport() {
-    const report = { file: memoryPath, source: '', storeFile: '', entryCount: 0, checked: false, ok: true, total: 0, anchorChecked: 0, anchorSkipped: 0, fileMissing: 0, anchorMissing: 0, broken: [], sample: [] }
+    const report = { file: memoryPath, source: '', storeFile: '', entryCount: 0, checked: false, ok: true, total: 0, anchorChecked: 0, anchorSkipped: 0, fileMissing: 0, anchorMissing: 0, broken: [], sample: [], note: '' }
     try {
       const loaded = readMemoryEntries(memoryPath)
       report.source = loaded.source
       report.storeFile = loaded.file
+      // v0.4.1（M4）：把「为什么读了这份数据」传给渲染层，否则空库/回滚场景看起来和正常一样。
+      report.note = loaded.note ?? ''
       if (loaded.entries === null) { report.error = loaded.error || ('记忆文件不存在：' + memoryPath); return report }
       const entries = loaded.entries
       report.entryCount = entries.length
@@ -799,7 +863,9 @@ export function apply(ctx, config) {
       const set = new Set()
       for (const entry of entries) {
         for (const pointer of parseMemoryPointers(entry?.text)) {
-          set.add(normalizeVaultPath(String(pointer).split('#')[0]).toLowerCase())
+          // v0.4.1（H3）：含 .. 的指针归一后是 ''，跳过（不往目标集合塞空串）
+          const target = normalizeVaultPath(String(pointer).split('#')[0]).toLowerCase()
+          if (target !== '') set.add(target)
         }
       }
       return set
@@ -858,6 +924,10 @@ export function apply(ctx, config) {
             } else {
               const broken = Array.isArray(pointer.broken) ? pointer.broken : []
               line += '；记忆指针 ' + pointer.total + ' 条（断 ' + broken.length + '）'
+              // v0.4.1（M4/L7）：数据源与条目数要露出来 —— 空库/回滚 JSON 场景下，
+              // 「67 条（断 0）」看不出读的是哪份数据（审计 §2 M4 扩展）。
+              if (pointer.source) line += '［源 ' + pointer.source + '，' + (pointer.entryCount ?? 0) + ' 条］'
+              if (pointer.note) line += '｜' + pointer.note
               if (broken.length > 0) {
                 // 断链要能看出是「文件没了」还是「文件在、锚点没了」——不然人不知道该去建卡还是改指针
                 line += '：' + broken.slice(0, 3).map((item) => {
@@ -1154,8 +1224,26 @@ export function apply(ctx, config) {
       async execute(args) {
         try {
           if (!writeEnabled) return { ok: false, code: 'WRITE_DISABLED', path: '', lastError: '受控写已关闭（writeEnabled=false）' }
-          const rel = normalizeVaultPath(args?.path)
-          if (rel === '') return { ok: false, code: 'bad_path', path: '', lastError: 'path 为空' }
+          const rawPath = strValue(args?.path)
+          const rel = normalizeVaultPath(rawPath)
+          if (rel === '') {
+            if (rawPath.trim() === '') return { ok: false, code: 'bad_path', path: '', lastError: 'path 为空' }
+            // v0.4.1（H3）：归一失败几乎只有一种原因 —— 含 `..` 段。`..` 穿越是白名单唯一的绕过口：
+            // 00-Inbox/ai-drafts/../../10-Life/x.md 原本靠前缀命中被判 allow，实际写到 10-Life。
+            // 越出 vault 的仍报 ESCAPE（保留原语义），vault 内的穿越报 DENIED。
+            const cleaned = rawPath.trim().replace(/^["']+|["']+$/g, '').replace(/\\/g, '/').replace(/^\/+/, '')
+            const collapsed = path.posix.normalize(cleaned)
+            if (path.isAbsolute(rawPath.trim()) || collapsed === '..' || collapsed.startsWith('../')) {
+              return { ok: false, code: 'ESCAPE', path: rawPath.trim(), lastError: '路径越界：只允许 vault 内部路径' }
+            }
+            return {
+              ok: false,
+              code: 'DENIED',
+              path: rawPath.trim(),
+              allowlist: writeAllowlist,
+              lastError: '路径含 .. 段（禁止穿越写白名单：只允许 vault 内 00-Inbox/ai-drafts/ 下的规范化路径）',
+            }
+          }
           const content = String(args?.content ?? '')
           if (content === '') return { ok: false, code: 'empty_content', path: rel, lastError: 'content 为空' }
           const abs = safeResolve(vaultDir, rel)

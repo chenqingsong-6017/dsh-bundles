@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -1849,6 +1850,68 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(cards.some((card) => card.includes('sources:')), '导出卡片要带来源')
   ok('v4.0 导出卡片补全 entities/sources/invalidAt 且可回读')
   rmSync(d, { recursive: true, force: true })
+}
+
+// ---- v4.2.1（H1）：storeDir 不存在/不可写时 memory_add 必须**快速**返回错误，不能同步死循环 ----
+// 判据是「子进程 5 秒内退出」，不能直接 await —— 原 bug 是同步忙等，同进程里连断言都跑不到。
+// 三种情况：① 目录不存在（可创建，应写入成功）；② storeDir 本身是普通文件（不可写）；
+//          ③ storeDir 的父级是普通文件（不存在 + 不可创建 = 审计里的「不可写」）。
+{
+  const mkRunner = () => [
+    'import { apply } from ' + JSON.stringify(new URL('../../dsh-memory/index.js', import.meta.url).href),
+    'const defs = new Map()',
+    'const ctx = { tools: { register: (d) => { defs.set(d.name, d); return () => {} } }, effect: (fn) => { fn(); return () => {} }, on: () => () => {}, get: (name) => (name === \'workingDirectory\' ? { get: () => \'\' } : undefined), systemPrompt: { context: () => () => {} } }',
+    'apply(ctx, { storeDir: process.argv[2], maxInjectChars: 1500, maxBytes: 20000, captureCandidates: false, captureRuleFiles: false })',
+    'try {',
+    '  const out = await defs.get(\'memory_add\').execute({ text: \'H1 快速失败探针：临时目录，不写真库\' })',
+    '  console.log(\'RESULT \' + JSON.stringify({ ok: true, id: out?.entry?.id ?? \'\' }))',
+    '} catch (error) {',
+    '  console.log(\'RESULT \' + JSON.stringify({ ok: false, code: String(error?.code ?? \'\'), message: String(error?.message ?? error) }))',
+    '}',
+    '',
+  ].join('\n')
+  const root = makeTmp('dsh-memory-h1')
+  const runnerFile = path.join(root, 'runner.mjs')
+  writeFileSync(runnerFile, mkRunner(), 'utf8')
+  const blocker = path.join(root, 'blocker')
+  writeFileSync(blocker, 'not a directory', 'utf8')
+  const run = (storeDir) => {
+    const startedAt = Date.now()
+    const result = spawnSync(process.execPath, [runnerFile, storeDir], { cwd: root, timeout: 5000, encoding: 'utf8' })
+    const elapsed = Date.now() - startedAt
+    const line = String(result.stdout ?? '').split('\n').find((item) => item.startsWith('RESULT ')) ?? ''
+    let payload = null
+    try {
+      payload = line === '' ? null : JSON.parse(line.slice('RESULT '.length))
+    } catch (error) {
+      payload = null
+    }
+    return { result, elapsed, payload, stderr: String(result.stderr ?? '') }
+  }
+  // ① 目录不存在：修法是 mkdir 提前，所以应当**快速成功**（回滚后第一次写入不再卡死）
+  const missing = run(path.join(root, 'not-created-yet', 'store'))
+  assert.equal(missing.result.error, undefined, '目录不存在时子进程不能超时（原 bug：同步死循环）')
+  assert.equal(missing.result.status, 0, '子进程要正常退出，stderr=' + missing.stderr.slice(0, 200))
+  assert.ok(missing.elapsed < 5000, '必须在 5 秒内返回，实际 ' + missing.elapsed + 'ms')
+  assert.ok(missing.payload !== null, '子进程要输出 RESULT 行，实际输出：' + String(missing.result.stdout).slice(0, 200))
+  assert.equal(missing.payload.ok, true, '目录不存在但可创建 → 写入应成功（mkdir 已提前）')
+  assert.ok(existsSync(path.join(root, 'not-created-yet', 'store', 'memory.json')), '落盘文件要真的生成')
+  // ② storeDir 是普通文件 → 快速结构化错误
+  const unwritable = run(blocker)
+  assert.equal(unwritable.result.error, undefined, '不可写时子进程不能超时')
+  assert.equal(unwritable.result.status, 0, '子进程要正常退出，stderr=' + unwritable.stderr.slice(0, 200))
+  assert.ok(unwritable.elapsed < 5000, '必须在 5 秒内返回，实际 ' + unwritable.elapsed + 'ms')
+  assert.equal(unwritable.payload?.ok, false, '不可写必须返回错误而不是假装成功')
+  assert.match(String(unwritable.payload?.code), /^MEMORY_STORE_(LOCKED|WRITE_FAILED)$/, '要带可识别 code，实际 ' + String(unwritable.payload?.code))
+  assert.match(String(unwritable.payload?.message), /记忆目录|锁文件/, '错误要可读（说清是哪个目录），实际：' + String(unwritable.payload?.message).slice(0, 200))
+  // ③ 不存在 + 不可创建（父级是文件）
+  const nested = run(path.join(blocker, 'store'))
+  assert.equal(nested.result.error, undefined, '父级不可用时子进程不能超时')
+  assert.ok(nested.elapsed < 5000, '必须在 5 秒内返回，实际 ' + nested.elapsed + 'ms')
+  assert.equal(nested.payload?.ok, false, '父级不可用必须返回错误')
+  assert.match(String(nested.payload?.code), /^MEMORY_STORE_(LOCKED|WRITE_FAILED)$/)
+  rmSync(root, { recursive: true, force: true })
+  ok('v4.2.1 H1：storeDir 不存在能快速写入；不可写/父级不可用时快速报错（子进程 5s 内退出，无死循环）')
 }
 
 console.log(`memory: ${passed} 项通过`)

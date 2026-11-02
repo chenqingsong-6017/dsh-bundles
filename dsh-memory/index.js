@@ -3164,6 +3164,8 @@ export function apply(ctx, config) {
       if (db !== null) refreshSqliteState()
       return
     }
+    // v4.2.1（H1）：锁目录必须先存在（见 ensureStoreDir / acquireLock 的注释）。
+    ensureStoreDir()
     const release = acquireLock()
     try {
       mergeWithDisk()
@@ -3185,9 +3187,44 @@ export function apply(ctx, config) {
     }
   }
 
-  /** 跨进程互斥：memory.json.lock 用 wx 原子创建；陈旧锁（进程崩了）超过 5 秒直接抢。 */
+  /**
+   * v4.2.1（H1）：storeDir 必须**先**存在 —— 原 persist() 先 acquireLock 后 mkdirSync，
+   * 目录不存在/不可写时 wx 写锁抛错 → 内层 catch `continue` → deadline 检查永远走不到 →
+   * 同步死循环把整个 DSH 进程堵死（审计 global-audit-memory-2026-11-03 §1 H1）。
+   * 这里把「目录可用」收敛成一个入口：失败就抛可读错误，绝不重试。
+   */
+  function ensureStoreDir() {
+    try {
+      mkdirSync(storeDir, { recursive: true })
+    } catch (error) {
+      throw fail(
+        'MEMORY_STORE_WRITE_FAILED',
+        `记忆目录不可用（${storeDir}）：${error?.code ?? ''} ${error?.message ?? String(error)}。` +
+          '本次写入没有生效，别当成已保存；先确认该路径存在且可写（或改 config.storeDir），再重试。',
+      )
+    }
+  }
+
+  /**
+   * 跨进程互斥：memory.json.lock 用 wx 原子创建；陈旧锁（进程崩了）超过 5 秒直接抢。
+   * v4.2.1（H1）：三条硬约束，缺一条就可能退化成同步死循环——
+   *   ① 锁所在目录不存在 → 立刻抛可读错误，不重试；
+   *   ② 内层 catch（stat 锁失败）不 `continue`，统一落到 deadline 判定 / sleep；
+   *   ③ wx 写锁失败的 errno 不是「别人占着锁」（如 ENOENT/ENOTDIR/EACCES/EPERM/EROFS）→ 立刻抛，不重试。
+   */
   function acquireLock() {
     const lockFile = `${storeFile}.lock`
+    const lockDir = path.dirname(lockFile)
+    try {
+      const info = statSync(lockDir)
+      if (!info.isDirectory()) throw Object.assign(new Error('not a directory'), { code: 'ENOTDIR' })
+    } catch (error) {
+      throw fail(
+        'MEMORY_STORE_LOCKED',
+        `记忆目录不存在或不可用（${lockDir}）：${error?.code ?? ''} ${error?.message ?? String(error)}。` +
+          '本次写入没有生效；先让该目录可写（或改 config.storeDir）再重试。',
+      )
+    }
     const deadline = Date.now() + LOCK_WAIT_MS
     for (;;) {
       try {
@@ -3200,18 +3237,33 @@ export function apply(ctx, config) {
           }
         }
       } catch (error) {
+        // 只有 EEXIST 才算「别人正占着锁」；其余（目录只读/路径不是目录/磁盘满）重试也不会好。
+        if (error?.code !== 'EEXIST') {
+          throw fail(
+            'MEMORY_STORE_LOCKED',
+            `无法创建记忆锁文件（${lockFile}）：${error?.code ?? ''} ${error?.message ?? String(error)}。` +
+              '本次写入没有生效；确认该目录可写后重试。',
+          )
+        }
+        let stale = false
         try {
           const info = statSync(lockFile)
-          if (Date.now() - info.mtimeMs > LOCK_STALE_MS) {
-            try {
-              unlinkSync(lockFile)
-            } catch (inner) {
-              // 撞车了就让下一轮重试
-            }
-            continue
-          }
+          stale = Date.now() - info.mtimeMs > LOCK_STALE_MS
         } catch (inner) {
-          continue
+          // 锁在这一瞬间被别的进程清掉了：既不算「被占着」，也不能 continue（原 bug），
+          // 落到下面的 deadline / sleep 后重试。
+          stale = false
+        }
+        if (stale) {
+          let removed = false
+          try {
+            unlinkSync(lockFile)
+            removed = true
+          } catch (inner) {
+            // 删不掉（撞车 / 权限）就走 deadline 判定，绝不原地空转
+          }
+          // 只有真的删掉了才抢下一轮；否则继续走到 deadline，保证循环必然终止。
+          if (removed) continue
         }
         if (Date.now() > deadline) {
           throw fail('MEMORY_STORE_LOCKED', '另一个 DSH 进程正在写记忆（memory.json.lock 被占），等它写完重试一次即可。')
@@ -3226,10 +3278,11 @@ export function apply(ctx, config) {
     if (storeHealth === 'corrupt') return false
     ensureDailyBackup()
     // v3.10（B02）：跨进程互斥 + 写前合并。见 acquireLock / mergeWithDisk 的注释。
+    // v4.2.1（H1）：mkdir 必须在 acquireLock **之前** —— 否则目录缺失时拿锁先失败，退化成死循环。
+    ensureStoreDir()
     const releaseLock = acquireLock()
     try {
       mergeWithDisk()
-      mkdirSync(storeDir, { recursive: true })
       // v3.20：归档分文件冷存。主库只写生效条目；归档条目落 archive.json。
       // 顺序：**先写归档、再写主库** —— 归档写失败就整体失败（主库原样不动），
       // 不会出现「主库已经把条目摘掉、归档却没写成功」的丢数据窗口。
@@ -3284,7 +3337,14 @@ export function apply(ctx, config) {
       recordHistoryDiff()
       return true
     } catch (error) {
-      if (error instanceof Error && (error.message.startsWith('记忆落盘失败') || error.message.includes('memory.json.lock'))) throw error
+      if (
+        error instanceof Error &&
+        (error.message.startsWith('记忆落盘失败') || error.message.includes('memory.json.lock') || error.code === 'MEMORY_STORE_LOCKED' || error.code === 'MEMORY_STORE_WRITE_FAILED')
+      ) {
+        // 锁竞争 / 目录不可用是可恢复的环境问题，保持原 code、不要把 storeHealth 打成 readonly
+        // （否则一次并发写就让本进程后续全部写入被拒）。
+        throw error
+      }
       storeHealth = 'readonly'
       throw fail('MEMORY_STORE_WRITE_FAILED', `记忆落盘失败（${error?.message ?? 'unknown'}）。本次写入没有生效，别当成已保存。`)
     } finally {
@@ -4017,6 +4077,31 @@ export function apply(ctx, config) {
         // v4.0：显式 supersede 不能被「文本完全一致」的去重捷径吞掉 —— 调用方的意图是「换掉旧条」，
         // 必须真的走推翻路径（旧条标失效 + 新条入库），而不是返回旧条说「已存在」。
         if (duplicate && args?.supersede !== true) {
+          // v4.2.1（M1）：去重捷径原本在 procedure 门槛（下面的 :4095）之前 return，且 :4041 直接改 kind ——
+          // 「先 add{text, kind:'fact'}，再用同一文本 add{kind:'procedure'}」就能绕开门槛。
+          // 这里对「去重后实际 kind」跑同一道闸，口径与 update 一致（改 procedure 必须显式给证据）。
+          const dedupeKindRaw = typeof args?.kind === 'string' ? args.kind.trim() : ''
+          const dedupeWasProcedure = duplicate.kind === KIND_PROCEDURE
+          const dedupeKind = dedupeKindRaw !== '' ? dedupeKindRaw : dedupeWasProcedure ? KIND_PROCEDURE : ''
+          const dedupeExplicitVerified = Number.isInteger(args?.verifiedCount) ? args.verifiedCount : 0
+          const dedupeNextVerified = Number.isInteger(args?.verifiedCount)
+            ? dedupeExplicitVerified
+            : dedupeWasProcedure && Number.isInteger(duplicate.verifiedCount)
+              ? duplicate.verifiedCount
+              : 0
+          if (Number.isInteger(args?.verifiedCount) && dedupeKind !== KIND_PROCEDURE) {
+            throw fail(
+              'MEMORY_VERIFIEDCOUNT_INVALID',
+              'verifiedCount 只能写在 kind=procedure 的条目上（当前去重命中的条目 kind=' + (dedupeKind || '(空)') + '）：先把流程真跑 ≥2 次，再用 {kind:"procedure", verifiedCount:2} 一起写入。',
+            )
+          }
+          if (dedupeKind === KIND_PROCEDURE && dedupeNextVerified < PROCEDURE_MIN_VERIFIED) {
+            throw fail(
+              'MEMORY_PROCEDURE_UNVERIFIED',
+              'kind=procedure 只收「真跑成功 ≥' + PROCEDURE_MIN_VERIFIED + ' 次」的工作流：去重命中的条目还不是 procedure 且本次没给证据（verifiedCount=' + dedupeNextVerified + '）。' +
+                ' 做法：先真跑两遍，再 memory_add {text, kind:"procedure", verifiedCount:' + PROCEDURE_MIN_VERIFIED + '}。',
+            )
+          }
           let changed = false
           const unionInto = (field, incoming) => {
             if (!Array.isArray(incoming)) return
@@ -4038,9 +4123,22 @@ export function apply(ctx, config) {
             duplicate.scope = incomingScope
             changed = true
           }
-          if (typeof args?.kind === 'string' && args.kind.trim() !== '' && duplicate.kind !== args.kind.trim()) {
-            duplicate.kind = args.kind.trim()
+          if (dedupeKindRaw !== '' && duplicate.kind !== dedupeKindRaw) {
+            duplicate.kind = dedupeKindRaw
             changed = true
+            // v4.2.1（M3）：kind 离开 procedure 时要清掉复用证据，否则「降级再升级」可沿用存量计数过闸。
+            if (dedupeKindRaw !== KIND_PROCEDURE) {
+              delete duplicate.verifiedCount
+              delete duplicate.lastVerifiedAt
+            }
+          }
+          // v4.2.1（M3）：只有 procedure 条目能持有 verifiedCount，且必须是本次显式给的证据。
+          if (dedupeKind === KIND_PROCEDURE && Number.isInteger(args?.verifiedCount)) {
+            if (duplicate.verifiedCount !== dedupeExplicitVerified) {
+              duplicate.verifiedCount = dedupeExplicitVerified
+              duplicate.lastVerifiedAt = new Date().toISOString()
+              changed = true
+            }
           }
           if (Number.isFinite(args?.importance)) {
             const value = Math.max(1, Math.min(10, Math.round(args.importance)))
@@ -4092,6 +4190,14 @@ export function apply(ctx, config) {
         }
         const incomingKind = typeof args?.kind === 'string' ? args.kind.trim() : ''
         const incomingVerified = Number.isInteger(args?.verifiedCount) ? args.verifiedCount : 0
+        // v4.2.1（M3）：verifiedCount 只属于 procedure。原来任意 kind 都能灌计数，
+        // 「fact 先灌 verifiedCount=2 → 再 update 改 kind=procedure」就能绕开复用门槛。
+        if (Number.isInteger(args?.verifiedCount) && incomingKind !== KIND_PROCEDURE) {
+          throw fail(
+            'MEMORY_VERIFIEDCOUNT_INVALID',
+            'verifiedCount 只能写在 kind=procedure 的条目上（本次 kind=' + (incomingKind || '(空)') + '）：先把流程真跑 ≥2 次，再用 {kind:"procedure", verifiedCount:2} 一起写入。',
+          )
+        }
         if (incomingKind === KIND_PROCEDURE && incomingVerified < PROCEDURE_MIN_VERIFIED) {
           throw fail(
             'MEMORY_PROCEDURE_UNVERIFIED',
@@ -4315,12 +4421,25 @@ export function apply(ctx, config) {
           throw fail('MEMORY_ARG_INVALID', 'verifiedCount 必须是 ≥0 的整数。')
         }
         // v4.2：procedure 的复用门槛对「改成 procedure / 已是 procedure」都生效——不能绕过门槛把普通条目升级成流程。
-        const nextKind = typeof args?.kind === 'string' && args.kind.trim() !== '' ? args.kind.trim() : typeof entry.kind === 'string' ? entry.kind : ''
-        const nextVerified = Number.isInteger(args?.verifiedCount) ? args.verifiedCount : Number.isInteger(entry.verifiedCount) ? entry.verifiedCount : 0
+        // v4.2.1（M3）两处收紧：
+        //   ① verifiedCount 只允许写在 procedure 条目上（原来任何 kind 都能灌，之后改 kind 就能过闸）；
+        //   ② 把 kind 改成 procedure 时必须**本次显式**给 verifiedCount ≥2，不沿用条目存量值。
+        const explicitKind = typeof args?.kind === 'string' && args.kind.trim() !== '' ? args.kind.trim() : ''
+        const nextKind = explicitKind !== '' ? explicitKind : typeof entry.kind === 'string' ? entry.kind : ''
+        const becomingProcedure = nextKind === KIND_PROCEDURE && entry.kind !== KIND_PROCEDURE
+        const entryVerified = Number.isInteger(entry.verifiedCount) ? entry.verifiedCount : 0
+        if (Number.isInteger(args?.verifiedCount) && nextKind !== KIND_PROCEDURE) {
+          throw fail(
+            'MEMORY_VERIFIEDCOUNT_INVALID',
+            'verifiedCount 只能写在 kind=procedure 的条目上（当前 kind=' + (nextKind || '(空)') + '）：' +
+              '要把普通条目升级成流程，必须一次性给 {kind:"procedure", verifiedCount:' + PROCEDURE_MIN_VERIFIED + '}（真跑成功 ≥' + PROCEDURE_MIN_VERIFIED + ' 次的证据）。',
+          )
+        }
+        const nextVerified = Number.isInteger(args?.verifiedCount) ? args.verifiedCount : becomingProcedure ? 0 : entryVerified
         if (nextKind === KIND_PROCEDURE && nextVerified < PROCEDURE_MIN_VERIFIED) {
           throw fail(
             'MEMORY_PROCEDURE_UNVERIFIED',
-            'procedure 需要 verifiedCount ≥ ' + PROCEDURE_MIN_VERIFIED + '（当前 ' + nextVerified + '）：先真跑成功 ≥2 次再入库/改 kind。',
+            'procedure 需要 verifiedCount ≥ ' + PROCEDURE_MIN_VERIFIED + '（当前 ' + nextVerified + (becomingProcedure ? '；改成 procedure 必须本次显式给证据，不能沿用存量值' : '') + '）：先真跑成功 ≥2 次再入库/改 kind。',
           )
         }
         const projected = usedChars() - entry.text.length + (next !== '' ? next.length : 0)
@@ -4328,6 +4447,14 @@ export function apply(ctx, config) {
           throw fail('MEMORY_BUDGET_EXCEEDED', `更新后会到 ${projected} / ${maxBytes} 字符，超预算。请精简或先删掉别的条目。`)
         }
         if (args?.supersede === true) {
+          // v4.2.1（M2）：supersede 会「新条目生效 + 旧条作废」，没有正文就只会造出一条空记忆并废掉旧条。
+          // verifiedCount-only 更新（next === ''）不允许 supersede。
+          if (next === '') {
+            throw fail(
+              'MEMORY_ARG_MISSING',
+              'supersede=true 需要新的 text：只有 verifiedCount 的更新不能推翻旧条（否则会造出空正文的新条目）。要先改正文再用 supersede。',
+            )
+          }
           // 时序失效（Graphiti 式）：新条目生效，旧条目留档不删、不再注入。
           const now = new Date().toISOString()
           const replacement = normalizeEntry({
@@ -4375,7 +4502,15 @@ export function apply(ctx, config) {
           else delete entry.aliases
         }
         if (typeof args?.scope === 'string' && args.scope.trim() !== '') entry.scope = normalizeScope(args.scope)
-        if (typeof args?.kind === 'string' && args.kind.trim() !== '') entry.kind = args.kind.trim()
+        if (typeof args?.kind === 'string' && args.kind.trim() !== '') {
+          entry.kind = args.kind.trim()
+          // v4.2.1（M3）：kind 离开 procedure 就清掉复用证据——否则「降级 → 再改回 procedure」
+          // 可以沿用存量 verifiedCount 过闸（审计 M3 的绕法就是靠存量值）。
+          if (entry.kind !== KIND_PROCEDURE) {
+            delete entry.verifiedCount
+            delete entry.lastVerifiedAt
+          }
+        }
         if (Array.isArray(args?.workspaces)) {
           const workspaces = args.workspaces.filter((item) => typeof item === 'string' && item.trim() !== '')
           if (workspaces.length > 0) entry.workspaces = workspaces
@@ -4702,6 +4837,11 @@ export function apply(ctx, config) {
           tags: { type: 'array', items: { type: 'string' } },
           scope: { type: 'string' },
           kind: { type: 'string', description: 'Merged kind (rule | preference | fact | reference | procedure | note); defaults to the first source kind.' },
+          verifiedCount: {
+            type: 'integer',
+            minimum: 0,
+            description: 'v4.2.1: reuse-success count when merging into kind=procedure (>= 2 required); only honored together with kind=procedure.',
+          },
           pinned: { type: 'boolean' },
         },
         required: ['ids'],
@@ -4740,12 +4880,25 @@ export function apply(ctx, config) {
           throw fail('MEMORY_TEXT_TOO_LONG', `合并后最多 ${MAX_TEXT_CHARS} 字符（当前 ${mergedText.length}）。${TEXT_TOO_LONG_HINT}`)
         }
         // v4.2：procedure 合并同样要过复用门槛（不能把两条普通记忆「合并成」一条流程）。
+        // v4.2.1（M3）：证据只认 kind=procedure 的来源（普通条目上不该有计数，也不该被继承），
+        // 且与 update 同口径——显式 verifiedCount 优先；没有 procedure 来源时合并成 procedure 必须显式给证据。
         const mergedKind = typeof args?.kind === 'string' && args.kind.trim() !== '' ? args.kind.trim() : typeof first.kind === 'string' ? first.kind : ''
-        const mergedVerified = Math.max(0, ...sources.map((item) => (Number.isInteger(item.verifiedCount) ? item.verifiedCount : 0)))
+        const mergedSourceVerified = Math.max(
+          0,
+          ...sources.map((item) => (item.kind === KIND_PROCEDURE && Number.isInteger(item.verifiedCount) ? item.verifiedCount : 0)),
+        )
+        if (Number.isInteger(args?.verifiedCount) && mergedKind !== KIND_PROCEDURE) {
+          throw fail(
+            'MEMORY_VERIFIEDCOUNT_INVALID',
+            'verifiedCount 只能与 kind=procedure 一起用（本次 mergedKind=' + (mergedKind || '(空)') + '）。',
+          )
+        }
+        const mergedVerified = Number.isInteger(args?.verifiedCount) ? args.verifiedCount : mergedSourceVerified
         if (mergedKind === KIND_PROCEDURE && mergedVerified < PROCEDURE_MIN_VERIFIED) {
           throw fail(
             'MEMORY_PROCEDURE_UNVERIFIED',
-            '合并成 procedure 需要来源里已有「真跑成功 ≥' + PROCEDURE_MIN_VERIFIED + ' 次」的证据（当前最高 verifiedCount=' + mergedVerified + '）。',
+            '合并成 procedure 需要「真跑成功 ≥' + PROCEDURE_MIN_VERIFIED + ' 次」的证据：来源里没有 procedure 条目（最高 verifiedCount=' + mergedVerified + '）。' +
+              ' 做法：先真跑两遍，再用 memory_merge {ids, kind:"procedure", verifiedCount:' + PROCEDURE_MIN_VERIFIED + '} 显式给证据。',
           )
         }
         const freed = sources.reduce((sum, entry) => sum + entry.text.length, 0)

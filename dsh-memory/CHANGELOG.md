@@ -3,6 +3,21 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.2.1 — 2026-11-03
+
+标题：「修全局审计 H1 + M1/M2/M3」——JSON 后端不再同步死循环；procedure 复用门槛的三条绕过路径全部堵住。工具名与既有参数集不变（`memory_merge` 只新增可选 `verifiedCount`；新增错误码 `MEMORY_VERIFIEDCOUNT_INVALID`）。证据：`_reports/global-audit-memory-2026-11-03.md` §1 H1、§2 M1–M3。
+
+### Fixed（高危）
+- **H1 JSON 后端同步死循环**：`persist()` 原顺序是「先 `acquireLock()` 后 `mkdirSync`」。`storeDir` 不存在/不可写时锁文件 `wx` 写失败 → `statSync` 也失败 → `acquireLock()` 内层 catch `continue`，deadline 检查永远走不到 → 纯自旋堵死整个 DSH 进程（事件循环全停，只能杀进程），而 `storage:'json'` 正是官方给的「回滚开关」。
+  现在：`mkdirSync(storeDir,{recursive:true})` 提到取锁之前（新增 `ensureStoreDir()`，失败抛 `MEMORY_STORE_WRITE_FAILED`）；锁目录不存在 → 立刻抛 `MEMORY_STORE_LOCKED`（可读错误，不重试）；`wx` 失败且 errno 不是 `EEXIST` → 立刻抛；内层 catch 不再 `continue`，统一落到 deadline/sleep；陈旧锁只有「真删掉」才 `continue`，否则仍受 deadline 约束。
+- **M1 去重分支绕过 procedure 门槛**：`memory_add` 命中完全重复时在 procedure 门槛之前 `return`，且可任意改 `kind`——「先 add fact，再用同一文本 add kind:procedure」即可绕过。现在去重分支对「去重后实际 kind」跑同一道闸：改成 procedure 必须本次显式给 `verifiedCount ≥ 2`，否则 `MEMORY_PROCEDURE_UNVERIFIED`。
+- **M2 空条目 supersede**：`memory_update {verifiedCount, supersede:true}` 不带 `text` 会造出 `text:''` 的新条目并把旧条作废。现在 `supersede` 要求 `text` 非空（`MEMORY_ARG_MISSING`）。
+- **M3 两步升级 procedure**：`verifiedCount` 原来任意 kind 都能写，「fact 先灌 2 → 再改 kind=procedure」即可过闸。现在：`verifiedCount` 只允许写在 procedure 条目上（`MEMORY_VERIFIEDCOUNT_INVALID`，add/update/merge 三处同口径）；把 kind 改成 procedure 必须**本次显式**给 `verifiedCount ≥ 2`（不沿用存量值）；kind 离开 procedure 时清掉 `verifiedCount/lastVerifiedAt`（堵「降级再升级」）；`memory_merge` 只继承 procedure 来源的证据，并新增可选 `verifiedCount` 参数。
+
+### 测试
+- `_selftest/tests/memory.test.mjs`：H1 用 `child_process.spawnSync` + 5s 超时断言「子进程必须退出」，不直接 `await`——① storeDir 不存在 → 快速成功（mkdir 已提前）；② storeDir 是普通文件 → 快速结构化错误；③ 父级是文件（不存在且不可创建）→ 快速结构化错误。
+- `_selftest/tests/memory-v42.test.mjs`：M1/M2/M3 三条绕过路径各一条用例，并覆盖「正常路径不误杀」（procedure 累加证据、一次性带证据升级、带 text 的 supersede、merge 显式证据）。
+
 ## v4.2.0 — 2026-11-02
 
 标题：「集百家所长，补写入侧四长板」——skip 可推导 / kind=reference / 预算见顶精简建议 / kind=procedure。检索打分一行未动；14 个工具名不变，参数集只增不减。唯一的契约放宽：`memory_update` 的 `text` 在只更新 `verifiedCount` 时可省略（`required` 由 `['id','text']` → `['id']`）；`memory_add` 跳过写入时 `entry` 变可选并新增诊断字段。
