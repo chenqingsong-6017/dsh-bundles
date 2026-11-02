@@ -5,6 +5,7 @@
  * 所以可以 mock 一个 ctx 拿到工具，按真实 execute 驱动四个台账工具（不装进 profile）。
  */
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -273,6 +274,79 @@ try {
   assert.equal(allList.value.total, 3)
   assert.ok(allList.value.removedCount >= 1)
   ok('inventory_list：status=all 能看到历史条目')
+
+  // ── 9) 危险动作锁回归（2026-11-03 全局审计 T1 confirm 击穿 / T2 红线绕过）
+  // 9.1 confirm 必须是严格布尔 true：字符串 "false"/"true"、数字 1/0、对象一律视为「未确认」
+  const sandbox = path.join(ROOT, 'tidy-lock')
+  mkdirSync(sandbox, { recursive: true })
+  writeFileSync(path.join(sandbox, 'a.txt'), 'a')
+  writeFileSync(path.join(sandbox, 'b.pdf'), 'b')
+  const beforeLock = readdirSync(sandbox).sort()
+  for (const confirm of ['false', 'true', 1, 0, 'no', {}, null]) {
+    const attempt = await call('tidy_apply', { kind: 'organize', target: sandbox, confirm })
+    assert.equal(attempt.value.code, 'CONFIRM_REQUIRED', `confirm=${JSON.stringify(confirm)} 必须被拒绝`)
+    assert.equal(attempt.value.moved, 0, `confirm=${JSON.stringify(confirm)} 不得移动任何文件`)
+  }
+  assert.deepEqual(readdirSync(sandbox).sort(), beforeLock, '非布尔 confirm 不得改动沙箱文件')
+  ok('tidy_apply：confirm 只认布尔 true（"false"/"true"/1/0/{}/null 全部拒，文件未动）')
+
+  // tidy_undo 同一缺陷：写一份假清单，confirm 非布尔时必须拒绝且不还原
+  const manifestsDir = path.join(STORE, 'manifests')
+  mkdirSync(manifestsDir, { recursive: true })
+  const fakeManifest = 'organize-20260101-000000-000.json'
+  writeFileSync(path.join(manifestsDir, fakeManifest), JSON.stringify({ at: new Date().toISOString(), moves: [] }), 'utf8')
+  for (const confirm of ['false', 1, 'true']) {
+    const undo = await call('tidy_undo', { manifest: fakeManifest, confirm })
+    assert.equal(undo.value.code, 'CONFIRM_REQUIRED', `tidy_undo confirm=${JSON.stringify(confirm)} 必须被拒绝`)
+    assert.equal(undo.value.restored, 0)
+  }
+  ok('tidy_undo：confirm 只认布尔 true（字符串/数字一律拒，未执行还原）')
+
+  // 9.2 红线路径三种写法：junction / \\?\ 设备前缀 / \\localhost\D$ 管理共享
+  const REDLINE = 'D:\\AI\\dsh-bundles\\dsh-checkpoint'
+  const link = path.join(ROOT, 'redline-link')
+  let linkCreated = false
+  try {
+    execFileSync('cmd', ['/c', 'mklink', '/J', link, REDLINE], { windowsHide: true, stdio: 'ignore' })
+    linkCreated = true
+    const jumped = await call('tidy_plan', { kind: 'organize', target: link })
+    assert.equal(jumped.value.code, 'TARGET_REJECTED', 'junction 指向红线时 tidy_plan 必须拒绝出方案')
+    assert.match(jumped.value.hint, /junction|符号链接|重解析点|红线/)
+
+    const jumpedScan = await call('tidy_scan', { path: link })
+    assert.equal(jumpedScan.value.inspect.verdict, 'forbidden', 'junction 指向红线时 tidy_scan 必须给「勿动」')
+    ok('红线绕过 #1 junction：tidy_plan 拒绝出方案、tidy_scan 结论「勿动」')
+  } finally {
+    if (linkCreated) {
+      // 只删链接本身，不跟随目标（本仓规矩：junction 一律 cmd /c rmdir）
+      try {
+        execFileSync('cmd', ['/c', 'rmdir', link], { windowsHide: true, stdio: 'ignore' })
+      } catch {
+        /* 断言失败时也要保证清掉链接 */
+      }
+    }
+  }
+
+  const devicePlan = await call('tidy_plan', { kind: 'organize', target: '\\\\?\\' + sandbox })
+  assert.equal(devicePlan.value.code, 'TARGET_REJECTED', '\\\\?\\ 设备路径必须被拒绝')
+  assert.match(devicePlan.value.hint, /不能安全判定/)
+  ok('红线绕过 #2 \\\\?\\ 设备前缀：tidy_plan 直接拒（fail-closed）')
+
+  const uncTarget = '\\\\localhost\\D$' + sandbox.slice(2)
+  if (existsSync(uncTarget)) {
+    const uncPlan = await call('tidy_plan', { kind: 'organize', target: uncTarget })
+    assert.equal(uncPlan.value.code, 'TARGET_REJECTED', 'UNC 管理共享路径必须被拒绝')
+    assert.match(uncPlan.value.hint, /不能安全判定/)
+    ok('红线绕过 #3 \\\\localhost\\D$ 管理共享：tidy_plan 直接拒（fail-closed）')
+  } else {
+    console.log('  - 跳过 UNC 用例：本机访问不到 \\\\localhost\\D$')
+  }
+
+  // 反向保险：普通本地路径仍能正常出方案（别把红线修成「什么都不让动」）
+  const normalPlan = await call('tidy_plan', { kind: 'organize', target: sandbox })
+  assert.equal(normalPlan.value.code, undefined, '普通临时目录必须仍可出方案')
+  assert.equal(normalPlan.value.totalFiles, 2)
+  ok('反向保险：普通本地临时目录仍正常出方案（2 个文件）')
 } finally {
   rmSync(ROOT, { recursive: true, force: true })
 }

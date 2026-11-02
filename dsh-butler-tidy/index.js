@@ -23,11 +23,13 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   readSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmdirSync,
   rmSync,
@@ -173,13 +175,78 @@ function buildTypeMap(config) {
 
 // ───────────────────────────── 路径与保护 ─────────────────────────────
 
+/**
+ * Windows 设备前缀（`\\?\`、`\\.\`）与 UNC（`\\server\share`，含 `\\localhost\D$`
+ * 这类本地管理共享）一律视为「不能安全判定」的写法。
+ * 2026-11-03 审计 T2：`\\?\D:\AI\dsh-bundles\...` / `\\localhost\D$\...` 都能让纯
+ * 字符串前缀比较判不出「在红线内」——这里直接 fail-closed。
+ */
+const UNSAFE_PATH_PREFIX = /^[\\/]{2}/
+
+/** 路径写法本身就不能安全判定（UNC / 设备路径 / 空值 / 含空字节） */
+function isUnsafePath(value) {
+  if (typeof value !== 'string') return true
+  const raw = value.trim()
+  if (raw === '') return true
+  if (UNSAFE_PATH_PREFIX.test(raw)) return true
+  if (raw.includes('\u0000')) return true
+  return false
+}
+
+/** 路径（含任一级祖先）是不是 reparse point：junction / 符号链接 / 其他重解析点 */
+function hasReparsePoint(resolvedPath) {
+  let cursor = resolvedPath
+  for (;;) {
+    try {
+      if (lstatSync(cursor).isSymbolicLink()) return true
+    } catch {
+      // 这一级不存在，继续往上看
+    }
+    const parent = path.dirname(cursor)
+    if (parent === cursor) return false
+    cursor = parent
+  }
+}
+
+/**
+ * 真实路径：先拒绝 UNC / 设备前缀，再 realpath 解析 junction 与符号链接。
+ * - 解析链条上任何一级是 reparse point → 返回 ''（调用方按红线/fail-closed 处理）；
+ * - 路径不存在 → 逐级向上找最近可解析祖先再拼回剩余段（这样父目录的 junction 也能解析）；
+ * - 全都不存在 → 退回 path.resolve（审计要求：不存在的路径用 resolve）。
+ */
+function realPathOf(value) {
+  if (isUnsafePath(value)) return ''
+  const resolved = path.resolve(value.trim())
+  if (hasReparsePoint(resolved)) return ''
+  try {
+    return realpathSync.native(resolved)
+  } catch {
+    let cursor = resolved
+    const tail = []
+    for (;;) {
+      const parent = path.dirname(cursor)
+      if (parent === cursor) return resolved
+      tail.unshift(path.basename(cursor))
+      cursor = parent
+      try {
+        return path.join(realpathSync.native(cursor), ...tail)
+      } catch {
+        // 继续向上
+      }
+    }
+  }
+}
+
+/** 归一化：真实路径 + 小写 + 去尾部分隔符；不能安全判定时返回 '' */
 function norm(p) {
-  return path.resolve(p).replace(/[\\/]+$/, '').toLowerCase()
+  const real = realPathOf(p)
+  return real === '' ? '' : real.replace(/[\\/]+$/, '').toLowerCase()
 }
 
 function isUnder(child, parent) {
   const c = norm(child)
   const p = norm(parent)
+  if (c === '' || p === '') return false
   return c === p || c.startsWith(`${p}${path.sep}`)
 }
 
@@ -226,8 +293,18 @@ function protectedDirs(config) {
   return [...new Set(base.map((item) => path.resolve(item)))]
 }
 
+/**
+ * 目标是否落在红线（或根本无法安全判定）：
+ * 写法不安全 / 含 reparse point / 解析不出真实路径 → 一律 true（fail-closed）。
+ * 2026-11-03 审计 T2/T3：junction、`\\?\`、UNC 三种写法都曾绕过这里的字符串比较。
+ */
 function isProtected(target, guard) {
-  return guard.some((dir) => isUnder(target, dir))
+  const c = norm(target)
+  if (c === '') return true
+  return guard.some((dir) => {
+    const p = norm(dir)
+    return p !== '' && (c === p || c.startsWith(`${p}${path.sep}`))
+  })
 }
 
 // ───────────────────────────── 目录度量 ─────────────────────────────
@@ -404,7 +481,7 @@ function collectFiles(target, { subfolders = false, typeMap, guard, maxFiles = P
       if (entry.isSymbolicLink()) continue
       if (entry.isDirectory()) {
         if (!subfolders || current.depth >= 3) continue
-        if (guard.some((dir) => isUnder(full, dir))) continue
+        if (isProtected(full, guard)) continue
         queue.push({ dir: full, depth: current.depth + 1 })
         continue
       }
@@ -568,8 +645,17 @@ function validateTarget(target, guard, store) {
   if (typeof target !== 'string' || target.trim() === '') {
     return { error: '没给整理目录。请用 target 指定一个文件夹，例如 D:\\下载。' }
   }
-  const resolved = path.resolve(target.trim())
+  const raw = target.trim()
+  // 2026-11-03 审计 T2：UNC（含 \\localhost\D$ 管理共享）与 \\?\ 设备路径不能安全判定 → 直接拒
+  if (isUnsafePath(raw)) {
+    return { error: `这个路径写法不能安全判定（UNC / 设备路径）：${raw}，不动。请用普通盘符路径，例如 D:\\下载。` }
+  }
+  const resolved = path.resolve(raw)
   if (!existsSync(resolved)) return { error: `这个目录不存在：${resolved}。先确认路径再试。` }
+  // 2026-11-03 审计 T2：junction / 符号链接会骗过字符串比较（曾指向红线目录仍给方案）→ 直接拒
+  if (hasReparsePoint(resolved)) {
+    return { error: `${resolved} 是 junction / 符号链接（重解析点），真实位置无法安全判定，不动。` }
+  }
   let stat
   try {
     stat = statSync(resolved)
@@ -577,14 +663,16 @@ function validateTarget(target, guard, store) {
     return { error: `这个目录读不到：${resolved}（${lockHint(error)}）。` }
   }
   if (!stat.isDirectory()) return { error: `这不是文件夹：${resolved}。` }
-  if (isUnder(resolved, store.dir)) return { error: '这是本插件自己的数据目录，不能整理它。' }
-  if (guard.some((dir) => isUnder(resolved, dir))) {
-    return { error: `${resolved} 在红线目录内（系统目录/插件源码/学习空间），不动。` }
+  const real = realPathOf(resolved)
+  if (real === '') return { error: `${resolved} 解析不出真实路径，按不可动处理。` }
+  if (isUnder(real, store.dir)) return { error: '这是本插件自己的数据目录，不能整理它。' }
+  if (isProtected(real, guard)) {
+    return { error: `${real} 在红线目录内（系统目录/插件源码/学习空间），不动。` }
   }
-  if (resolved.toLowerCase() === 'c:\\') {
+  if (real.toLowerCase() === 'c:\\') {
     return { error: 'C 盘根目录是系统盘要害，不能整体整理。请指定具体文件夹，例如 C:\\Users\\<你>\\Downloads。' }
   }
-  return { resolved }
+  return { resolved: real }
 }
 
 // ───────────────────────────── 主逻辑：扫描 ─────────────────────────────
@@ -940,7 +1028,21 @@ function inspectTarget(target, guard, store, options = {}) {
     verdict: 'safe',
     reason: '',
   }
-  if (guard.some((dir) => isUnder(target, dir))) {
+  // 2026-11-03 审计 T3：原先只做字符串比较，junction / \\?\ / UNC 写法会给出「可动」的相反结论。
+  if (isUnsafePath(target)) {
+    result.verdict = 'forbidden'
+    result.reason = '路径写法不能安全判定（UNC / 设备路径），按不可动处理。'
+    return result
+  }
+  const inspectResolved = path.resolve(target)
+  if (hasReparsePoint(inspectResolved)) {
+    result.verdict = 'forbidden'
+    result.reason = '是 junction / 符号链接（重解析点），真实位置无法安全判定，按不可动处理。'
+    return result
+  }
+  const inspectReal = realPathOf(inspectResolved)
+  result.path = inspectReal === '' ? target : inspectReal
+  if (inspectReal === '' || isProtected(inspectReal, guard)) {
     result.verdict = 'forbidden'
     result.reason = '在红线目录内（系统目录 / 插件源码 / 学习空间），不许动。'
     return result
@@ -1188,7 +1290,7 @@ function doPlanFolders(args, guard, store) {
   for (const entry of entries) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue
     const full = path.join(target, entry.name)
-    if (guard.some((dir) => isUnder(full, dir))) continue
+    if (isProtected(full, guard)) continue
     if (isUnder(full, store.dir)) continue
     let size = { bytes: 0, files: 0, truncated: true }
     let didMeasure = false
@@ -1246,7 +1348,7 @@ function validateRename(item, guard) {
     return { error: `读不到（${lockHint(error)}）` }
   }
   if (!stat.isFile() && !stat.isDirectory()) return { error: '这个对象既不是文件也不是目录，改不了名' }
-  if (guard.some((dir) => isUnder(from, dir))) return { error: '在红线目录内' }
+  if (isProtected(from, guard)) return { error: '在红线目录内' }
 
   const rawName = item.name.trim()
   if (rawName !== path.basename(rawName)) return { error: '新名字不要带路径' }
@@ -1335,7 +1437,7 @@ function doApplyFolders(args, guard, store) {
   if (items.length === 0) {
     return { ...base, code: 'MISSING_INPUT', hint: '没给要归并的目录（items:[{from, into, name?}]）。先用 tidy_plan（kind=folders）看候选。' }
   }
-  if (!Boolean(args && args.confirm)) {
+  if (args?.confirm !== true) {
     return { ...base, code: 'CONFIRM_REQUIRED', hint: '目录归并会移动整个文件夹。先给用户看方案，得到同意后传 confirm:true。' }
   }
   const force = Boolean(args && args.force)
@@ -1365,7 +1467,7 @@ function doApplyFolders(args, guard, store) {
       errors.push(`${path.basename(from)}：不是目录`)
       continue
     }
-    if (guard.some((dir) => isUnder(from, dir)) || guard.some((dir) => isUnder(into, dir))) {
+    if (isProtected(from, guard) || isProtected(into, guard)) {
       skipped += 1
       errors.push(`${path.basename(from)}：在红线目录内`)
       continue
@@ -1457,7 +1559,7 @@ function doApplyRename(args, guard, store) {
   }
   const list = Array.isArray(args?.renames) ? args.renames : []
   if (list.length === 0) return { ...base, code: 'MISSING_INPUT', hint: '没给改名清单（renames:[{path, name}]）。' }
-  if (!Boolean(args && args.confirm)) {
+  if (args?.confirm !== true) {
     return { ...base, code: 'CONFIRM_REQUIRED', hint: '改名会动文件名。先给用户看预览，得到同意后传 confirm:true。' }
   }
   const records = []
@@ -1503,7 +1605,7 @@ function doApplyRename(args, guard, store) {
 
 function doApply(config, args, guard, store) {
   const kind = args && args.kind === 'clean' ? 'clean' : 'organize'
-  const confirm = Boolean(args && args.confirm)
+  const confirm = args?.confirm === true
   const maxFiles = Number.isInteger(args && args.maxFiles) ? Math.min(Math.max(args.maxFiles, 1), 2000) : DEFAULT_MAX_APPLY
 
   // ── 清理
@@ -1689,7 +1791,7 @@ function findEmptyDirs(root, guard, { maxEntries = 30000, deadlineMs = 12000 } =
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) continue
       const full = path.join(dir, entry.name)
-      if (guard.some((dir) => isUnder(full, dir))) continue
+      if (isProtected(full, guard)) continue
       stack.push(full)
     }
   }
@@ -1738,7 +1840,7 @@ function findDuplicates(root, guard, { maxFiles = 20000, maxBytes = 100 * 1024 *
       if (entry.isSymbolicLink()) continue
       const full = path.join(dir, entry.name)
       if (entry.isDirectory()) {
-        if (guard.some((dir2) => isUnder(full, dir2))) continue
+        if (isProtected(full, guard)) continue
         stack.push(full)
         continue
       }
@@ -1901,7 +2003,7 @@ function doApplyEmpty(args, guard, store) {
   }
   const checked = validateTarget(args && args.target, guard, store)
   if (checked.error) return { ...base, code: 'TARGET_REJECTED', hint: checked.error }
-  if (!Boolean(args && args.confirm)) {
+  if (args?.confirm !== true) {
     return { ...base, code: 'CONFIRM_REQUIRED', hint: '空目录本身没有内容，删除是安全的，但仍需先给用户看清单；确认后传 confirm:true。' }
   }
   // 自底向上多扫几轮：删掉空子目录后，父目录可能也空了
@@ -1951,7 +2053,7 @@ function doApplyDupes(args, guard, store) {
   }
   const checked = validateTarget(args && args.target, guard, store)
   if (checked.error) return { ...base, code: 'TARGET_REJECTED', hint: checked.error }
-  if (!Boolean(args && args.confirm)) {
+  if (args?.confirm !== true) {
     return { ...base, code: 'CONFIRM_REQUIRED', hint: '查重要动文件。先给用户看 tidy_plan（kind=dupes）的结果，确认后传 confirm:true。' }
   }
   const result = findDuplicates(checked.resolved, guard)
@@ -2136,7 +2238,7 @@ function doApplyResidue(args, guard, store) {
     remaining: 0,
     hint: '',
   }
-  if (!Boolean(args && args.confirm)) {
+  if (args?.confirm !== true) {
     return { ...base, code: 'CONFIRM_REQUIRED', hint: '改注册表/环境变量前必须先看清单；确认后传 confirm:true。' }
   }
   // 改前备份：把 HKCU 的 Run 与 Environment 两个键导出成 .reg，出事能还原
@@ -2214,7 +2316,7 @@ foreach ($name in $wantedRun) {
 // ───────────────────────────── 主逻辑：撤销 ─────────────────────────────
 
 function doUndo(store, args) {
-  const confirm = Boolean(args && args.confirm)
+  const confirm = args?.confirm === true
   const manifests = listManifests(store)
   if (manifests.length === 0) {
     return {
@@ -3083,11 +3185,11 @@ function doPlanUninstall(args, store, guard) {
   const processes = probe.ok ? probe.processes : []
   const locksResult = args?.locks ? detectLocks(target, store) : { checked: false, holders: [] }
   const redlineNotes = []
-  if (target !== '' && guard.some((dir) => isUnder(target, dir))) {
+  if (target !== '' && isProtected(target, guard)) {
     redlineNotes.push('安装路径在红线目录内（系统目录 / 插件源码 / 学习空间）：真要删请逐项人工确认，插件不会代删。')
   }
   for (const dir of entry.dataDirs) {
-    if (guard.some((redline) => isUnder(dir, redline))) redlineNotes.push('数据目录在红线目录内：' + dir)
+    if (isProtected(dir, guard)) redlineNotes.push('数据目录在红线目录内：' + dir)
   }
   if (store && target !== '' && isUnder(target, store.dir)) {
     redlineNotes.push('安装路径就是本插件自己的数据目录：删掉会连整理记录和台账一起丢。')

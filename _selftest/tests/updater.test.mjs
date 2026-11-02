@@ -304,6 +304,47 @@ assert.equal(rolledManifest.version, '1.0.0')
 ok('回滚后版本回到 1.0.0')
 ok('回滚按创建时间选最新备份（名字序反转也不受影响）')
 
+// ------------------------------------------------------------ 回滚参数穿越
+// 回归（2026-11-03 全局审计 U1）：backup 原样进 path.join 会让 `..\..\..\evil`
+// 穿越到备份根目录之外，再配合 restoreDir 的「树外即删」变成任意目录覆盖。
+// 三种越界写法都必须 UPDATER_ARG_INVALID，且不执行任何回滚动作。
+section('回滚参数穿越必须拒绝')
+
+const safetyDirCount = () => readdirSync(backupRoot).filter((name) => name.startsWith('safety-')).length
+const badBackupCases = [
+  ['../../', '纯 .. 穿越'],
+  ['..\\..\\evil', 'Windows 风格 .. 穿越'],
+  ['C:\\AI\\dsh-bundles\\evil', '绝对路径'],
+  ['\\\\localhost\\D$\\AI\\evil', 'UNC 路径'],
+  ['sub/child', '带路径分隔符'],
+  ['not-a-backup', '合法单段名但不在备份清单'],
+]
+for (const [badBackup, label] of badBackupCases) {
+  const safetyBefore = safetyDirCount()
+  const versionBefore = JSON.parse(readFileSync(path.join(localPlugin, 'package.json'), 'utf8')).version
+  result = await tool('updater_rollback').execute({ name: 'demo', confirm: true, backup: badBackup })
+  assert.equal(result.ok, false, `${label} 必须被拒：${JSON.stringify(result)}`)
+  assert.equal(result.code, 'UPDATER_ARG_INVALID', `${label} 应回 UPDATER_ARG_INVALID，实际 ${result.code}: ${result.message}`)
+  assert.equal(JSON.parse(readFileSync(path.join(localPlugin, 'package.json'), 'utf8')).version, versionBefore, `${label} 不得改动本地文件`)
+  assert.equal(safetyDirCount(), safetyBefore, `${label} 不得创建安全备份（证明没有真回滚）`)
+}
+ok('backup 越界（../../、..\\..、盘符绝对路径、UNC、带分隔符、未知名）全部 UPDATER_ARG_INVALID，未执行回滚')
+
+// 反向保险：合法显式备份名仍可用；同时验证「树外即删」只删白名单内文件
+const userFile = path.join(localPlugin, 'user-notes.md')
+writeFileSync(userFile, '这不是插件产物，回滚不许删\n')
+const validBackupName = listBackupNames().find((name) => !name.startsWith('safety-'))
+assert.ok(validBackupName, '应有一份正常备份可选')
+result = await tool('updater_rollback').execute({ name: 'demo', confirm: true, backup: validBackupName })
+assert.equal(result.status, 'restored', JSON.stringify(result).slice(0, 400))
+assert.ok(existsSync(userFile), '白名单外的用户文件必须保留（原实现会当「多余文件」删掉）')
+assert.match(result.message, /白名单外 \d+ 个文件保留未删/)
+ok('合法备份名仍可回滚；白名单外的 user-notes.md 保留未删')
+
+function listBackupNames() {
+  return readdirSync(backupRoot).filter((name) => name !== '')
+}
+
 // ------------------------------------------------------------ 校验门
 
 section('校验门拦截坏提交')

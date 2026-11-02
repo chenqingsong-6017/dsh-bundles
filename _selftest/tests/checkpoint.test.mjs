@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { diffTextLines, buildHunks, apply } from '../../dsh-checkpoint/index.js'
 
@@ -375,7 +376,7 @@ try {
   assert.equal(singleDiff.entries[0].path, ambA)
   ok('checkpoint_diff：唯一后缀 index-a.txt 只对比一个目标')
 
-  const restoredOne = await call(amb, 'checkpoint_restore', { path: 'index-a.txt' })
+  const restoredOne = await call(amb, 'checkpoint_restore', { path: 'index-a.txt', confirm: true })
   assert.equal(restoredOne.restored.length, 1, 'restore 只处理一个目标')
   assert.equal(restoredOne.restored[0].path, ambA)
   assert.equal(ambFiles.get(ambA), 'snap a', '唯一命中的目标被恢复成快照内容')
@@ -383,7 +384,7 @@ try {
   assert.equal((await ambList()).total, 2)
   ok('checkpoint_restore：只动一个目标，index-b 原样保留')
 
-  const restoredExact = await call(amb, 'checkpoint_restore', { path: ambB })
+  const restoredExact = await call(amb, 'checkpoint_restore', { path: ambB, confirm: true })
   assert.equal(restoredExact.restored.length, 1)
   assert.equal(ambFiles.get(ambB), 'snap b', '全等路径（含盘符大小写差异也可）直接可用')
   ok('checkpoint_restore：全等路径可直接恢复')
@@ -394,6 +395,118 @@ try {
   assert.ok(existsSync(ambOther), 'forget 只丢快照，不删文件')
   amb.flush()
   ok('checkpoint_forget：唯一后缀只丢一条，文件不动')
+
+  // ---------- 红线与 confirm 语义回归（2026-11-03 全局审计 C1 / C4） ----------
+  // C1：红线目录（学习空间 / DSH 安装目录 / .dsh 凭据目录）里的目标，restore 一律拒绝，
+  // confirm: true 也不放行；且一个字节都不许写。用假 fs 记录所有写调用。
+  const redlineStore = path.join(root, 'redline-store')
+  const redlineLearning = 'D:\\AI-date\\workbuddy-date\\学习\\__checkpoint_selftest_probe__.md'
+  const redlineInstall = 'D:\\AI\\deepsek harness\\__checkpoint_selftest_probe__.md'
+  const redlineCred = path.join(os.homedir(), '.dsh', '__checkpoint_selftest_probe__.md')
+  const redlineNormal = path.join(root, 'redline-normal.txt')
+  writeFileSync(redlineNormal, 'live normal', 'utf8')
+  seedStore(redlineStore, [
+    { path: redlineLearning, content: 'SHOULD NOT WRITE', capturedAt: isoDaysAgo(1), created: false },
+    { path: redlineInstall, content: 'SHOULD NOT WRITE', capturedAt: isoDaysAgo(1), created: false },
+    { path: redlineCred, content: 'SHOULD NOT WRITE', capturedAt: isoDaysAgo(1), created: true },
+    { path: redlineNormal, content: 'snap normal', capturedAt: isoDaysAgo(1), created: false },
+  ])
+  const redWrites = []
+  const redFs = {
+    resolve: async (raw) => ({ displayPath: String(raw) }),
+    stat: async () => ({ type: 'file', size: 1 }),
+    readText: async () => '',
+    processPath: (target) => target.displayPath,
+    writeText: async (target) => {
+      redWrites.push(target.displayPath)
+    },
+  }
+  const red = makeHarness({ storeDir: redlineStore }, { fs: redFs })
+  for (const [label, redPath] of [
+    ['学习空间', redlineLearning],
+    ['DSH 安装目录', redlineInstall],
+    ['.dsh 凭据目录', redlineCred],
+  ]) {
+    for (const confirm of [true, false]) {
+      const out = await call(red, 'checkpoint_restore', { path: redPath, confirm })
+      assert.equal(out.restored.length, 0, `${label}（confirm=${confirm}）必须拒绝回滚：${JSON.stringify(out)}`)
+      assert.equal(out.failed.length, 1, `${label} 应报一条失败`)
+      assert.match(out.failed[0].reason, /红线/, `${label} 失败原因应点明红线`)
+    }
+  }
+  assert.equal(redWrites.length, 0, '红线目标一个字节都不能写（confirm 不放行）')
+  ok('红线路径 restore 一律拒绝（学习空间 / DSH 安装目录 / .dsh 凭据目录），confirm 不放行且零写入')
+
+  // all:true + confirm：普通目标照常回滚，红线目标跳过并报失败（不能因红线把整批也拒绝）
+  const allOut = await call(red, 'checkpoint_restore', { all: true, confirm: true })
+  assert.equal(allOut.restored.length, 1, `all:true 应只回滚普通目标：${JSON.stringify(allOut)}`)
+  assert.equal(allOut.restored[0].path, redlineNormal)
+  assert.equal(allOut.failed.length, 3, '三个红线目标必须出现在 failed 里')
+  assert.deepEqual(redWrites, [redlineNormal], '只允许写普通目标')
+  red.flush()
+  ok('restore all:true：普通目标回滚、3 个红线目标全部拒绝（不会因红线整批放行）')
+
+  // C4：普通路径（不在工作区 / 白名单内）不带 confirm 必须拒绝；带 confirm 才回滚
+  const plainRoot = path.join(root, 'plain')
+  const plainStore = path.join(root, 'plain-store')
+  mkdirSync(plainRoot, { recursive: true })
+  const plainFile = path.join(plainRoot, 'plain.txt')
+  const plainFiles = new Map([[plainFile, 'live value']])
+  seedStore(plainStore, [{ path: plainFile, content: 'snap value', capturedAt: isoDaysAgo(1), created: false }])
+  const plainFs = {
+    resolve: async (raw) => ({ displayPath: String(raw) }),
+    stat: async (target) => (plainFiles.has(target.displayPath) ? { type: 'file', size: 1 } : null),
+    readText: async (target) => plainFiles.get(target.displayPath) ?? '',
+    processPath: (target) => target.displayPath,
+    writeText: async (target, content) => {
+      plainFiles.set(target.displayPath, content)
+    },
+  }
+  const plain = makeHarness({ storeDir: plainStore }, { fs: plainFs })
+  const blocked = await call(plain, 'checkpoint_restore', { path: plainFile })
+  assert.equal(blocked.restored.length, 0, '普通路径无 confirm 必须拒绝')
+  assert.match(blocked.failed[0].reason, /confirm: true/)
+  assert.equal(plainFiles.get(plainFile), 'live value', '被拒时不得改动文件')
+  const allowed = await call(plain, 'checkpoint_restore', { path: plainFile, confirm: true })
+  assert.equal(allowed.restored.length, 1)
+  assert.equal(plainFiles.get(plainFile), 'snap value', '带 confirm 后正常回滚')
+  plain.flush()
+  ok('普通路径（不在工作区/白名单）：无 confirm 拒绝且文件不动，confirm 后才回滚')
+
+  // 工作区内免 confirm：sessionCwd 内的目标仍可直接回滚（别把确认做成"样样都要"）
+  const wsStore = path.join(root, 'ws-store')
+  const wsFile = path.join(work, 'workspace-file.txt')
+  const wsFiles = new Map([[wsFile, 'live ws']])
+  seedStore(wsStore, [{ path: wsFile, content: 'snap ws', capturedAt: isoDaysAgo(1), created: false }])
+  const wsFs = {
+    resolve: async (raw) => ({ displayPath: String(raw) }),
+    stat: async (target) => (wsFiles.has(target.displayPath) ? { type: 'file', size: 1 } : null),
+    readText: async (target) => wsFiles.get(target.displayPath) ?? '',
+    processPath: (target) => target.displayPath,
+    writeText: async (target, content) => {
+      wsFiles.set(target.displayPath, content)
+    },
+  }
+  const ws = makeHarness({ storeDir: wsStore }, { fs: wsFs, workingDirectory: { ensure: async () => work } })
+  const wsRestore = await ws.registered.get('checkpoint_restore').execute({ path: wsFile }, { agent: { id: 'sess-ws' } })
+  assert.equal(wsRestore.restored.length, 1, '工作区内的目标无需 confirm')
+  assert.equal(wsFiles.get(wsFile), 'snap ws')
+  ws.flush()
+  ok('工作区内目标免 confirm（sessionCwd 内），语义与「工作区外要确认」对称')
+
+  // C1 采集侧：受保护/红线目录不进账本（统计里计 excluded，不新增记录）
+  const captureFileInProtected = path.join(protectedDir, 'keep.txt')
+  const beforeExcludedRecords = (await call(captureHarness, 'checkpoint_list', {})).total
+  await preExecute(
+    { name: 'write', arguments: { file_path: captureFileInProtected }, agent: { id: 'sess-x' }, signal: undefined },
+    async () => {},
+  )
+  const afterExcludedRecords = (await call(captureHarness, 'checkpoint_list', {})).total
+  assert.equal(afterExcludedRecords, beforeExcludedRecords, '受保护目录里的写不得新增快照')
+  const capStatus = await call(captureHarness, 'checkpoint_status', {})
+  assert.ok(capStatus.skipped.excluded >= 1, '应计入 skipped.excluded')
+  captureHarness.flush()
+  ok('采集侧：protectDirs/红线目录不进快照账本（计 excluded）')
 
   console.log(`checkpoint: ${passed} 项通过`)
 } finally {

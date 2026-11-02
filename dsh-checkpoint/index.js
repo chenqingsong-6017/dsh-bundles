@@ -259,23 +259,76 @@ export function apply(ctx, config) {
   const sandboxPolicy = ctx.get('sandboxPolicy')
   const sessions = ctx.get('sessions')
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
-  const protectDirs = Array.isArray(config?.protectDirs)
+
+  /**
+   * 内置红线目录（2026-11-03 全局审计 C1）：**永不采集、永不回滚**，即使传 confirm: true 也拒绝。
+   * 与 tidy 的红线名单对齐：系统目录 / 学习空间 / DSH 安装目录 / `.dsh` 凭据目录。
+   * 为什么是硬拒绝而不是 confirm 放行：红线是「根本不该被这个工具碰」的东西，
+   * 而 checkpoint 恰好是唯一能把旧内容写回去、还能删掉「agent 新建文件」的回滚工具。
+   */
+  const BUILTIN_REDLINE = [
+    'C:\\Windows',
+    'C:\\Program Files',
+    'C:\\Program Files (x86)',
+    'C:\\ProgramData',
+    path.join(os.homedir(), 'AppData'),
+    'D:\\AI-date\\workbuddy-date\\学习',
+    'D:\\AI\\deepsek harness',
+    path.dirname(process.execPath), // DSH 安装目录（运行时按真实可执行文件定位）
+    path.join(os.homedir(), '.dsh'), // DSH 凭据目录（.credentials.yaml 等）
+  ]
+  const configuredProtectDirs = Array.isArray(config?.protectDirs)
     ? config.protectDirs.filter((dir) => typeof dir === 'string' && dir.trim() !== '').map((dir) => path.resolve(dir.trim()))
     : []
+  const configuredRedlineDirs = Array.isArray(config?.redlineDirs)
+    ? config.redlineDirs.filter((dir) => typeof dir === 'string' && dir.trim() !== '').map((dir) => path.resolve(dir.trim()))
+    : []
+  const redlineDirs = [...new Set([...BUILTIN_REDLINE, ...configuredRedlineDirs].map((dir) => path.resolve(dir)))]
+  /** 受保护目录：红线 + 配置项。里面的目标回滚/删除需要 confirm（红线则直接拒绝）。 */
+  const protectDirs = [...new Set([...redlineDirs, ...configuredProtectDirs])]
+  /** 显式允许免 confirm 的额外根目录（默认只有会话工作区免 confirm） */
+  const allowRestoreDirs = Array.isArray(config?.allowRestoreDirs)
+    ? config.allowRestoreDirs.filter((dir) => typeof dir === 'string' && dir.trim() !== '').map((dir) => path.resolve(dir.trim()))
+    : []
+
+  /**
+   * Windows 扩展前缀 / UNC 归一：`\\?\D:\x` → `D:\x`；UNC（`\\server\share`、`\\localhost\D$`）
+   * 无法安全判定真实位置 → 返回 ''（调用方按红线处理）。
+   */
+  function normalizeGuardPath(value) {
+    const raw = String(value ?? '')
+    if (raw === '') return ''
+    if (/^\\\\\?\\UNC\\/i.test(raw)) return ''
+    if (/^\\\\\?\\/i.test(raw)) return raw.slice(4)
+    if (/^\\\\[^\\]/i.test(raw)) return ''
+    return raw
+  }
+
+  /** 目标是否落在内置/配置的红线目录里（回滚/删除一律拒绝，confirm 不放行） */
+  function isRedline(osPath) {
+    const normalized = normalizeGuardPath(osPath)
+    if (normalized === '') return typeof osPath === 'string' && osPath !== ''
+    return redlineDirs.some((dir) => isInside(dir, normalized))
+  }
 
   /** 目标是否落在受保护目录里（回滚/删除需要 confirm） */
   function isProtected(osPath) {
     if (typeof osPath !== 'string' || osPath === '') return false
-    return protectDirs.some((dir) => isInside(dir, osPath))
+    const normalized = normalizeGuardPath(osPath)
+    if (normalized === '') return true
+    return protectDirs.some((dir) => isInside(dir, normalized))
   }
 
-  // 采集排除（UX 优先）：受保护目录 + 本插件自己的数据目录都不进账本。
-  // 理由：用户不该因为"改插件源码"或"插件自己写数据"而看到一堆内部快照。
+  // 采集排除（UX 优先）：受保护目录（含红线）+ 本插件自己的数据目录都不进账本。
+  // 理由：用户不该因为"改插件源码"或"插件自己写数据"而看到一堆内部快照；
+  // 红线内容更不该落进快照库（2026-11-03 审计 C1：`学习` 里的文件曾被抓进 snapshots.json）。
   const excludeDirs = [...protectDirs, path.resolve(storeDir)]
 
   function isExcluded(osPath) {
     if (typeof osPath !== 'string' || osPath === '') return false
-    return excludeDirs.some((dir) => isInside(dir, osPath))
+    const normalized = normalizeGuardPath(osPath)
+    if (normalized === '') return true
+    return excludeDirs.some((dir) => isInside(dir, normalized))
   }
 
   /**
@@ -656,7 +709,7 @@ export function apply(ctx, config) {
     tools.register({
       name: 'checkpoint_restore',
       description:
-        'Restore files captured before this agent modified them, and delete files this agent created. Pass "path" for one target, or "all": true for everything.',
+        'Restore files captured before this agent modified them, and delete files this agent created. Pass "path" for one target, or "all": true for everything. Targets outside the session workspace / allowRestoreDirs need confirm: true; red-line directories (学习空间 / DSH install dir / .dsh credentials / system dirs) are always refused, even with confirm: true.',
       parameters: {
         type: 'object',
         properties: {
@@ -669,7 +722,7 @@ export function apply(ctx, config) {
           confirm: {
             type: 'boolean',
             description:
-              'Required together with "all": true. Acknowledges that the rollback rewrites/deletes every captured target, which can include live plugin sources.',
+              'Required together with "all": true, for targets under config protectDirs, and for single targets outside the session workspace / allowRestoreDirs whitelist. Red-line targets are refused even with confirm: true.',
           },
         },
         additionalProperties: false,
@@ -747,17 +800,43 @@ export function apply(ctx, config) {
         const restored = []
         const failed = []
         const confirmed = args?.confirm === true
+        // 2026-11-03 审计 C1/C4：单目标回滚在「工作区 / allowRestoreDirs 白名单」之外也必须 confirm，
+        // 与 tidy_undo / updater_rollback 的约定拉齐；红线目标无论 confirm 与否一律拒绝。
+        const sessionCwdPath = all ? undefined : await sessionCwd(exec)
+        const insideAllowedRestore = (osPath) => {
+          const normalized = normalizeGuardPath(osPath)
+          if (normalized === '') return false
+          const roots = [...(sessionCwdPath ? [sessionCwdPath] : []), ...allowRestoreDirs]
+          return roots.some((root) => isInside(root, normalized))
+        }
         for (const [key, record] of targets) {
           restoring.add(key)
           try {
             const target = await fs.resolve(record.path)
             const osPath = typeof fs.processPath === 'function' ? fs.processPath(target) : record.path
-            if (!confirmed && isProtected(osPath)) {
+            // 红线：即使 confirm: true 也拒绝（红线是「根本不该被碰」，不是「多点一次就行」）
+            if (isRedline(osPath) || isRedline(record.path)) {
               failed.push({
                 path: record.path,
-                reason: '目标在受保护目录（protectDirs）里，回滚/删除需要显式传 confirm: true。',
+                reason: '目标在红线目录（学习空间 / DSH 安装目录 / .dsh 凭据目录 / 系统目录），拒绝回滚或删除；传 confirm 也不放行。',
               })
               continue
+            }
+            if (!confirmed) {
+              if (isProtected(osPath)) {
+                failed.push({
+                  path: record.path,
+                  reason: '目标在受保护目录（protectDirs）里，回滚/删除需要显式传 confirm: true。',
+                })
+                continue
+              }
+              if (!insideAllowedRestore(osPath)) {
+                failed.push({
+                  path: record.path,
+                  reason: '目标不在工作区 / allowRestoreDirs 白名单内，回滚/删除需要显式传 confirm: true。',
+                })
+                continue
+              }
             }
             if (record.created) {
               await deleteFile(target, policy)

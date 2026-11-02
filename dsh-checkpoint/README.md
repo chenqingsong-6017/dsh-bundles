@@ -15,7 +15,7 @@ DSH bundle（Host 侧插件）：在 agent **写/改/删文件之前**把原内�
 |---|---|
 | `checkpoint_list` | 列出可回滚目标：`[N 字节]` 表示修改过、`[新建→回滚即删]` 表示 agent 创建的文件 |
 | `checkpoint_diff` | **回滚前先看**：先给"会恢复/会删除/会重建各几个"的摘要，再按文件给 `+A/-R 行` 与行级 diff（`@@` 行号 + 2 行上下文）；`path` 支持文件名片段（输入 `hermes-lessons` 就能命中 `hermes-lessons-for-dsh.md`） |
-| `checkpoint_restore` | `path` 回滚单个/整个目录（支持唯一路径后缀）；`all: true` 回滚全部，**必须同时传 `confirm: true`**；修改过的恢复内容，创建过的删除 |
+| `checkpoint_restore` | `path` 回滚单个/整个目录（支持唯一路径后缀）；`all: true` 回滚全部，**必须同时传 `confirm: true`**；修改过的恢复内容，创建过的删除。**工作区外 / 白名单外的单目标回滚也要 `confirm: true`**；红线目录一律拒绝（见下） |
 | `checkpoint_forget` | **只丢快照、不动文件**（`path` 或 `all: true`），用来清掉过时/失效目标 |
 | `checkpoint_prune` | **按会话 / 按时间清理快照记录**（`sessionId` / `olderThanDays`，可组合）：默认 `dryRun: true` 只报告"会清几条"，真删必须 `dryRun: false` + `confirm: true`；只丢记录、**永不读写用户文件**；受保护目录里的快照永远跳过 |
 | `checkpoint_status` | 诊断：存档路径、钩子计数、捕获/跳过统计、加载时丢弃的失效快照数 |
@@ -27,10 +27,12 @@ DSH bundle（Host 侧插件）：在 agent **写/改/删文件之前**把原内�
    - `pwsh` / `bash` / `sh` / `shell` / `terminal`：命令行里出现破坏性动词（`Remove-Item`/`del`/`rm`/`mv`/`ren`/`Set-Content`/`Out-File`/`sed -i`/`> 重定向`）时，提取路径候选，对**已存在**的文件留底。
 2. **持久化**：快照写到 `config.storeDir`（本机为 `D:\AI\dsh-data\checkpoint\snapshots.json`；未配置时默认 `~/.dsh/dsh-checkpoint/`），启动时加载、变更后 150ms 防抖原子落盘，插件卸载前强制 flush。
 3. **回滚**：修改过的用 `fs.writeText(target, 原文)`；创建过的用 node fs 删除。两者都先按**当前会话**解析沙箱策略——`read-only` 直接拒绝，`workspace-write` 下还要求目标在会话 cwd 之内。`path` 参数支持三种匹配：全等、唯一后缀、目录前缀（传一个目录会批量命中，回滚/对比都能用）。
-4. **安全刹车**（v1.2 → v1.3）：
+4. **安全刹车**（v1.2 → v1.3 → v1.5.2）：
    - `all: true` 必须显式 `confirm: true`，否则直接报错并提示先 `checkpoint_diff all:true` 看影响面；
    - `config.protectDirs`（本机配置了 `D:\AI\dsh-bundles`）里的目标，回滚/删除也要 `confirm: true`，防止把**正在运行的插件源码**当成"agent 新建的文件"删掉；
-   - **采集排除**（v1.3）：受保护目录 + 本插件自己的数据目录**根本不进账本**——改插件源码或插件写数据都不会污染列表（`checkpoint_status` 的 `skipped.excluded` 可核对）；
+   - **单目标也要确认**（v1.5.2）：目标不在当前会话工作区、也不在 `config.allowRestoreDirs` 白名单内时，同样必须 `confirm: true`；工作区内维持免确认（日常 agent 改动就在那里）。想给别的目录免确认就把它加进 `allowRestoreDirs`；
+   - **红线目录硬拒绝**（v1.5.2）：内置红线 = `C:\Windows` / `Program Files` / `ProgramData` / `%USERPROFILE%\AppData` / `D:\AI-date\workbuddy-date\学习` / DSH 安装目录 / `%USERPROFILE%\.dsh`（DSH 凭据目录），可用 `config.redlineDirs` 追加。**命中红线一律拒绝回滚/删除，`confirm: true` 也不放行**（红线不是"多点一次就行"的东西）；UNC / `\\?\` 等无法判定真实位置的路径同样按红线处理；
+   - **采集排除**（v1.3）：受保护目录 + 红线目录 + 本插件自己的数据目录**根本不进账本**——改插件源码或插件写数据都不会污染列表，红线内容也不会被写进快照库（`checkpoint_status` 的 `skipped.excluded` 可核对）；
    - 加载时自动丢弃"文件不存在且父目录也不存在"的失效快照（目录迁移/删除留下的旧路径），避免误回滚时按旧路径重建目录（例如写回 C 盘）；丢弃数量见 `checkpoint_status`。
 5. **预览**：`checkpoint_diff` 用行级 LCS 算 diff，输出带 `@@ -a,b +c,d @@` 的 hunk（各 2 行上下文）；任一侧超过 600 行退化为"只给行数统计"；渲染超过 200 行会截断。状态分 `modified` / `created`（回滚即删）/ `missing`（快照后文件被删）/ `unchanged`。
 6. **预算**：单文件 1 MiB、最多 200 个目标、总量 64 MiB，超了淘汰最旧的；更主动的清理见第 7 条。

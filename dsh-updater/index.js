@@ -124,6 +124,47 @@ function walkFiles(root, options = {}) {
 }
 
 /**
+ * 把「备份目录内的相对路径」安全地拼到根目录下：
+ * 含 `..` / 绝对路径 / 盘符 / 空段一律返回 ''，由调用方拒绝或跳过（2026-11-03 审计 U1）。
+ */
+function safeJoinInside(rootDir, relPath) {
+  const posix = toPosix(String(relPath ?? ''))
+  if (posix === '' || posix.startsWith('/') || /^[A-Za-z]:/.test(posix)) return ''
+  const parts = posix.split('/')
+  if (parts.some((part) => part === '' || part === '.' || part === '..')) return ''
+  const joined = path.join(rootDir, ...parts)
+  return isInside(rootDir, joined) ? joined : ''
+}
+
+/** 备份目录名白名单：只允许单段名字，禁止任何路径分隔符 / `..` / 盘符（2026-11-03 审计 U1） */
+function isSafeBackupName(name) {
+  if (typeof name !== 'string') return false
+  const trimmed = name.trim()
+  if (trimmed === '' || trimmed === '.' || trimmed === '..') return false
+  if (trimmed.includes('..')) return false
+  if (/[\\/:*?"<>|\u0000-\u001f]/.test(trimmed)) return false
+  if (path.isAbsolute(trimmed)) return false
+  return true
+}
+
+/** 插件产物白名单：老备份没有元数据时，「树外即删」只允许删这些相对路径 */
+const BUNDLE_TOP_FILES = new Set(['package.json', 'cordis.patch.yml', 'index.js', 'icon.svg', 'readme.md', 'changelog.md'])
+const BUNDLE_DIRS = new Set(['locale', 'lib', 'dist', 'assets', 'src', 'examples'])
+
+function isBundleArtifact(relPath) {
+  const parts = toPosix(String(relPath ?? ''))
+    .split('/')
+    .filter(Boolean)
+  if (parts.length === 0) return false
+  if (parts.length === 1) {
+    const name = parts[0].toLowerCase()
+    if (BUNDLE_TOP_FILES.has(name)) return true
+    return /\.(?:js|mjs|cjs|json|ya?ml|md|svg)$/i.test(name)
+  }
+  return BUNDLE_DIRS.has(parts[0].toLowerCase())
+}
+
+/**
  * 删除目录/文件。
  *
  * Windows 上两个坑叠在一起：
@@ -524,44 +565,84 @@ export function apply(ctx, config) {
    * 刻意**不备份 .git / node_modules**：apply 只覆盖和新增文件，从不改动 .git，
    * 所以 .git 不需要进备份；而 .git 可能是几十 MB，备份它纯粹浪费空间。
    * 还原时同理不会删 .git —— 它在 SKIP_DIRS 里，删除逻辑会跳过。
+   *
+   * 2026-11-03 审计 U1：备份里同时写一份 `backup.json` 元数据，记录
+   * 「这份备份覆盖了哪些相对路径」+「当时 apply 会新增哪些文件」（options.added）。
+   * 回滚时「树外即删」只允许删这份白名单里的文件，避免拿备份当借口删用户文件。
    */
-  function backupDir(sourceDir, destination) {
+  function backupDir(sourceDir, destination, options = {}) {
+    mkdirSync(destination, { recursive: true })
     const files = walkFiles(sourceDir)
     const root = path.join(destination, 'tree')
     for (const file of files) {
       const relPath = toPosix(path.relative(sourceDir, file))
-      const target = path.join(root, relPath)
+      const target = safeJoinInside(root, relPath)
+      if (target === '') continue // 源目录里的越界相对路径一律跳过（防御污染）
       mkdirSync(path.dirname(target), { recursive: true })
       copyFileSync(file, target)
+    }
+    const meta = {
+      at: new Date().toISOString(),
+      sourceDir,
+      files: files.map((file) => toPosix(path.relative(sourceDir, file))),
+      added: Array.isArray(options.added) ? options.added.map((item) => toPosix(String(item))) : [],
+    }
+    try {
+      writeFileSync(path.join(destination, 'backup.json'), JSON.stringify(meta, null, 2), 'utf8')
+    } catch {
+      /* 元数据写不了不影响备份本身：回滚时会退回保守的「插件产物」白名单 */
     }
     return { dir: destination, files: files.length }
   }
 
   /** 用备份目录替换目标目录的内容（保留 .git、node_modules 这类跳过项）。 */
-  function restoreDir(backupTree, targetDir) {
+  function restoreDir(backupTree, targetDir, options = {}) {
+    // 2026-11-03 审计 U1：备份树必须在备份根目录内，越界一律拒绝（含 .. / 绝对路径穿越）
+    if (!isInside(backupsDir, backupTree)) {
+      throw Object.assign(new Error(`备份树不在备份根目录内，拒绝还原：${backupTree}`), { code: 'UPDATER_ARG_INVALID' })
+    }
     const files = walkFiles(backupTree)
-    const wanted = new Set(files.map((file) => toPosix(path.relative(backupTree, file))))
+    const planned = []
+    const wanted = new Set()
+    for (const file of files) {
+      const relPath = toPosix(path.relative(backupTree, file))
+      const dst = safeJoinInside(targetDir, relPath)
+      if (dst === '') {
+        throw Object.assign(new Error(`备份里有越界路径（.. / 绝对路径），拒绝还原：${relPath}`), { code: 'UPDATER_ARG_INVALID' })
+      }
+      wanted.add(relPath)
+      planned.push({ relPath, dst })
+    }
+    // 「树外即删」白名单：优先用备份元数据里记录的 apply 新增文件；
+    // 老备份没有元数据时，只允许删插件产物（package.json / index.js / locale/* 等）。
+    const added = Array.isArray(options.added) ? options.added.map((item) => toPosix(String(item))).filter(Boolean) : []
+    const allowDelete = added.length > 0 ? new Set(added) : null
     let removed = 0
+    let kept = 0
     for (const file of walkFiles(targetDir)) {
       const relPath = toPosix(path.relative(targetDir, file))
-      if (!wanted.has(relPath) && !relPath.split('/').some((part) => SKIP_DIRS.has(part))) {
-        try {
-          rmSync(file, { force: true })
-          removed += 1
-        } catch {
-          /* 删不掉就留着，不阻塞还原 */
-        }
+      if (wanted.has(relPath)) continue
+      if (relPath.split('/').some((part) => SKIP_DIRS.has(part))) continue
+      const allowed = allowDelete ? allowDelete.has(relPath) : isBundleArtifact(relPath)
+      const dst = allowed ? safeJoinInside(targetDir, relPath) : ''
+      if (dst === '') {
+        kept += 1 // 白名单外 / 越界：留着，不借回滚之名删用户文件
+        continue
+      }
+      try {
+        rmSync(dst, { force: true })
+        removed += 1
+      } catch {
+        /* 删不掉就留着，不阻塞还原 */
       }
     }
     const restored = []
-    for (const file of files) {
-      const relPath = toPosix(path.relative(backupTree, file))
-      const dst = path.join(targetDir, relPath)
+    for (const { relPath, dst } of planned) {
       mkdirSync(path.dirname(dst), { recursive: true })
-      copyFileSync(file, dst)
+      copyFileSync(path.join(backupTree, ...relPath.split('/')), dst)
       restored.push(relPath)
     }
-    return { restored: restored.length, removed }
+    return { restored: restored.length, removed, kept }
   }
 
   /** 备份目录的创建时间（毫秒）。名字可能同秒或被人工重命名，排序只能看文件系统时间。 */
@@ -621,6 +702,19 @@ export function apply(ctx, config) {
         .filter((entry) => entry.isDirectory() && !entry.name.startsWith('safety-'))
         .map((entry) => entry.name)
       return sortByCreatedAt(root, names)
+    } catch {
+      return []
+    }
+  }
+
+  /** 回滚时自动留的安全备份（名字以 safety- 开头，不进 listBackups 的「可选备份」列表） */
+  function listSafetyBackups(sourceName) {
+    const root = path.join(backupsDir, sourceName)
+    if (!existsSync(root)) return []
+    try {
+      return readdirSync(root, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith('safety-'))
+        .map((entry) => entry.name)
     } catch {
       return []
     }
@@ -1317,7 +1411,7 @@ export function apply(ctx, config) {
         const backupPath = path.join(backupsDir, sourceName, backupName)
         let backupInfo
         try {
-          backupInfo = backupDir(localDir, backupPath)
+          backupInfo = backupDir(localDir, backupPath, { added: newFiles })
         } catch (error) {
           forceRm(target)
           return { ...base, fromVersion, toVersion, status: 'error', code: 'BACKUP_FAILED', message: `备份失败，已放弃写入：${error instanceof Error ? error.message : String(error)}` }
@@ -1339,7 +1433,7 @@ export function apply(ctx, config) {
         } catch (error) {
           // 落位中途失败：立刻用刚做的备份还原，避免留下半套文件
           try {
-            restoreDir(path.join(backupPath, 'tree'), localDir)
+            restoreDir(path.join(backupPath, 'tree'), localDir, { added: newFiles })
           } catch {
             /* 还原也失败：消息里点明备份位置 */
           }
@@ -1457,8 +1551,34 @@ export function apply(ctx, config) {
           return { name: sourceName, ok: false, status: 'error', code: 'NO_BACKUP', restoredFrom: '', safetyBackup: '', files: 0, message: '这个源还没有任何备份，无法回滚（只应用过一次且没备份过？）', reloadHint: '' }
         }
 
-        const wanted = typeof args?.backup === 'string' && args.backup.trim() !== '' ? args.backup.trim() : entries[entries.length - 1]
-        const backupPath = path.join(backupsDir, sourceName, wanted)
+        // 2026-11-03 审计 U1：backup 参数只接受备份根目录下的单段目录名。
+        // 原实现 `path.join(backupsDir, sourceName, wanted)` 让 `..\..\..\evil` 这类
+        // 参数穿越到任意目录，配 restoreDir 的「树外即删」等于用任意目录覆盖插件源码。
+        const requested = typeof args?.backup === 'string' ? args.backup.trim() : ''
+        const wanted = requested !== '' ? requested : entries[entries.length - 1]
+        const invalidBackup = (reason) => ({
+          name: sourceName,
+          ok: false,
+          status: 'refused',
+          code: 'UPDATER_ARG_INVALID',
+          restoredFrom: '',
+          safetyBackup: '',
+          files: 0,
+          message: `backup 参数不合法（${reason}）：${JSON.stringify(requested)}。只接受这个源备份目录下的单段名字，可选：${entries.join(', ')}`,
+          reloadHint: '',
+        })
+        if (requested !== '' && !isSafeBackupName(requested)) {
+          return invalidBackup('含路径分隔符 / .. / 绝对路径 / 盘符 / 非法字符')
+        }
+        const sourceBackupRoot = path.join(backupsDir, sourceName)
+        const backupPath = path.join(sourceBackupRoot, wanted)
+        if (!isInside(backupsDir, backupPath) || !isInside(sourceBackupRoot, backupPath)) {
+          return invalidBackup('解析后越出备份根目录')
+        }
+        const knownBackups = new Set([...entries, ...listSafetyBackups(sourceName)])
+        if (!knownBackups.has(wanted)) {
+          return invalidBackup('不在这个源的备份清单里')
+        }
         const backupTree = path.join(backupPath, 'tree')
         if (!existsSync(backupTree)) {
           return { name: sourceName, ok: false, status: 'error', code: 'BACKUP_INCOMPLETE', restoredFrom: wanted, safetyBackup: '', files: 0, message: `备份 ${wanted} 不完整（缺 tree 目录）；可选：${entries.join(', ')}`, reloadHint: '' }
@@ -1472,11 +1592,24 @@ export function apply(ctx, config) {
           return { name: sourceName, ok: false, status: 'error', code: 'BACKUP_FAILED', restoredFrom: wanted, safetyBackup: '', files: 0, message: `回滚前的安全备份失败，已放弃：${error instanceof Error ? error.message : String(error)}`, reloadHint: '' }
         }
 
+        // 备份元数据里记着「当时 apply 新增了哪些文件」→ 回滚的「树外即删」只删这批
+        const backupMeta = readJson(path.join(backupPath, 'backup.json'))
         let outcome
         try {
-          outcome = restoreDir(backupTree, localDir)
+          outcome = restoreDir(backupTree, localDir, { added: backupMeta && Array.isArray(backupMeta.added) ? backupMeta.added : undefined })
         } catch (error) {
-          return { name: sourceName, ok: false, status: 'error', code: 'RESTORE_FAILED', restoredFrom: wanted, safetyBackup: safetyPath, files: 0, message: `还原失败：${error instanceof Error ? error.message : String(error)}；安全备份在 ${safetyPath}`, reloadHint: '' }
+          const code = error && error.code === 'UPDATER_ARG_INVALID' ? 'UPDATER_ARG_INVALID' : 'RESTORE_FAILED'
+          return {
+            name: sourceName,
+            ok: false,
+            status: 'error',
+            code,
+            restoredFrom: wanted,
+            safetyBackup: safetyPath,
+            files: 0,
+            message: `还原失败：${error instanceof Error ? error.message : String(error)}；安全备份在 ${safetyPath}`,
+            reloadHint: '',
+          }
         }
 
         // 从备份名里还原当时的提交（形如 20261027-223501-abc12345 或 -baseline）
@@ -1496,7 +1629,7 @@ export function apply(ctx, config) {
           restoredFrom: wanted,
           safetyBackup: safetyPath,
           files: outcome.restored,
-          message: `已还原（删除 ${outcome.removed} 个多余文件/${outcome.restored} 个文件写回）。回滚前的状态保存在 ${safetyPath}。`,
+          message: `已还原（删除 ${outcome.removed} 个多余文件/${outcome.restored} 个文件写回${outcome.kept > 0 ? `；白名单外 ${outcome.kept} 个文件保留未删` : ''}）。回滚前的状态保存在 ${safetyPath}。`,
           reloadHint: '需要重载才生效：plugin_manager remove_bundle + install_bundle。',
         }
       },
