@@ -3,6 +3,29 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.2.0 — 2026-11-02
+
+标题：「集百家所长，补写入侧四长板」——skip 可推导 / kind=reference / 预算见顶精简建议 / kind=procedure。检索打分一行未动；14 个工具名不变，参数集只增不减。唯一的契约放宽：`memory_update` 的 `text` 在只更新 `verifiedCount` 时可省略（`required` 由 `['id','text']` → `['id']`）；`memory_add` 跳过写入时 `entry` 变可选并新增诊断字段。
+
+### 写入路径过滤（A4）
+- `memory_add` 写入前比对规则源（工作区 AGENTS.md、`.dsh/rules/*.md`、全局 AGENTS.md）的每一行：近重复（bigram Jaccard ≥0.86 或原文被包含）→ 不写库，返回 `skipped/deriveSource/deriveReason/deriveSimilarity`；`force:true` 与配置 `deriveGate:'off'` 两条逃生口。
+- 新增导出函数 `derivableHit()` / `normalizeRuleLine()`（纯函数，可单测）。
+
+### kind=reference
+- 重要度基线 5、复核期 180 天；注入行（含索引行）带 `↗` 前缀。
+
+### 预算见顶主动精简（A2）
+- `MEMORY_BUDGET_EXCEEDED` 报错改为：现状 + 合并建议（相似 ≥0.62 的条目对）+ drop 建议（stale / 从未命中且 >7 天未更新）+ 无候选时的诚实说明。
+
+### kind=procedure
+- 入库门槛 `verifiedCount ≥ 2`（未达抛 `MEMORY_PROCEDURE_UNVERIFIED`）；落 `verifiedCount/lastVerifiedAt`；`memory_update` 可只传 `verifiedCount` 累加证据（参数 required 从 `['id','text']` 放宽为 `['id']`）；`memory_merge` 合并成 procedure 同样过门槛。
+- 重要度基线 7；注入行带 `⚙` 前缀；卡片导出带证据字段。
+- 修 `normalizeEntry` 白名单：新增字段若不在白名单会在 load→persist 一轮被洗掉（v3.20 archivedAt 同款坑，本次单测当场抓到）。
+
+### 测试
+- 新增 `_selftest/tests/memory-v42.test.mjs`（5 组断言）：可推导命中/不误判/跳过/逃生口；reference 写入·重要度·180 天·检索·注入标记；预算见顶报错含 `m1+m2` 合并建议与 `m3` stale drop 建议；procedure 门槛（0/1 拒、2 收、可累加、不能无证据升级、schema 声明、导出带证据）。
+- 旧套件全过：`memory.test.mjs` 131 项、`memory-sqlite.test.mjs` 9 组、`memory-schema.test.mjs` 7 组、`memory-oracle.test.mjs` 12 项。
+
 ## v4.1.0 — 2026-11-02
 
 标题：「换底座、不换公式」——存储从 JSON 整库重写换成 SQLite 单文件（P2.1），检索从全量遍历换成 FTS5 候选集 + df 统计（P2.2）；打分公式一行没改、14 工具 schema 逐位不变、两条回滚路。依据 `_reports/memory-storage-bench-2026-11-02.json`：10000 条时 JSON 全量读 65.4ms / 写 32.1ms，先破百的是检索遍历（5000 条 171.3ms、10000 条 319.4ms，瓶颈是每轮重新分词）——所以先换存储是「为增长留余量」，检索热路径才用候选集解决。

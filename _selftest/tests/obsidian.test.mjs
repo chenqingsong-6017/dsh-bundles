@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -491,6 +492,77 @@ put('.git/config', '')
   assert.ok(linted.issues.some((issue) => issue.code === 'missing_field'))
   assert.ok(linted.tookMs >= 0)
   ok('lint 工具：真实扫库返回结构化清单')
+}
+
+// ---- 任务3 记忆指针数据源：优先 memory.db（v0.4.0） ----
+{
+  const rootA = mkdtempSync(path.join(os.tmpdir(), 'dsh-obsidian-db-'))
+  const vA = path.join(rootA, 'vault')
+  const storeA = path.join(rootA, 'store')
+  const putA = (rel, body) => {
+    const abs = path.join(vA, rel)
+    mkdirSync(path.dirname(abs), { recursive: true })
+    writeFileSync(abs, body, 'utf8')
+  }
+  putA('a/Me.md', ['---', 'type: person', 'status: active', '---', '# 我', '', '## 硬规则', ''].join('\n'))
+  putA('b/Values.md', ['---', 'type: values', 'status: active', '---', '# 价值观', '', '## 取舍标准', ''].join('\n'))
+  // 冻结的旧快照：只有一条指向不存在文件的指针。若误读 json，total=1 且 broken=1，下面断言会红
+  const memA = path.join(rootA, 'memory.json')
+  writeFileSync(memA, JSON.stringify({ entries: [
+    { id: 'm-old', text: '旧快照：vault://99-Gone/x.md' },
+  ] }), 'utf8')
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
+  const dbA = new DatabaseSync(path.join(rootA, 'memory.db'))
+  dbA.exec('CREATE TABLE entries (seq INTEGER NOT NULL, payload TEXT NOT NULL)')
+  const insert = dbA.prepare('INSERT INTO entries (seq, payload) VALUES (?, ?)')
+  insert.run(1, JSON.stringify({ id: 'm1', text: '细节见 vault://a/Me.md#硬规则' }))
+  insert.run(2, JSON.stringify({ id: 'm2', text: '另一条 vault://b/Values.md#取舍标准' }))
+  insert.run(3, '不是 JSON 的坏 payload')
+  dbA.close()
+
+  const hA = host(vA, storeA, { memoryPath: memA })
+  assert.equal((await hA.defs.get('obsidian_index').execute({})).ok, true)
+  const stA = await hA.defs.get('obsidian_status').execute({})
+  const ptrA = stA.memoryPointers
+  assert.equal(ptrA.source, 'sqlite', '同目录有 memory.db 时必须读 db，而不是 json 旧快照')
+  assert.equal(ptrA.storeFile, path.join(rootA, 'memory.db'))
+  assert.equal(ptrA.entryCount, 2, '坏 payload 跳过：只剩 2 条有效条目')
+  assert.equal(ptrA.total, 2, 'total = db 里去重后的指针数（旧 json 只有 1 条）')
+  assert.equal(ptrA.broken.length, 0, '文件与锚点都在，不该报断链（误读 json 会报 99-Gone/x.md）')
+  assert.equal(ptrA.checked, true)
+  assert.equal(ptrA.ok, true)
+  rmSync(rootA, { recursive: true, force: true })
+  ok('记忆指针数据源：memory.db 优先（source=sqlite / total=db 去重数 / 坏 payload 跳过）')
+}
+
+// ---- 任务3 记忆指针数据源：无 db 时回退 memory.json ----
+{
+  const rootB = mkdtempSync(path.join(os.tmpdir(), 'dsh-obsidian-json-'))
+  const vB = path.join(rootB, 'vault')
+  const storeB = path.join(rootB, 'store')
+  const putB = (rel, body) => {
+    const abs = path.join(vB, rel)
+    mkdirSync(path.dirname(abs), { recursive: true })
+    writeFileSync(abs, body, 'utf8')
+  }
+  putB('a/Me.md', ['---', 'type: person', 'status: active', '---', '# 我', ''].join('\n'))
+  const memB = path.join(rootB, 'memory.json')
+  writeFileSync(memB, JSON.stringify({ entries: [
+    { id: 'm1', text: '旧写法：vault://a/Me.md' },
+    { id: 'm2', text: '断的：vault://99-Gone/x.md' },
+  ] }), 'utf8')
+  const hB = host(vB, storeB, { memoryPath: memB })
+  assert.equal((await hB.defs.get('obsidian_index').execute({})).ok, true)
+  const stB = await hB.defs.get('obsidian_status').execute({})
+  const ptrB = stB.memoryPointers
+  assert.equal(ptrB.source, 'json', '没有 memory.db 时回退 memory.json')
+  assert.equal(ptrB.storeFile, memB)
+  assert.equal(ptrB.entryCount, 2)
+  assert.equal(ptrB.total, 2)
+  assert.equal(ptrB.broken.length, 1, 'json 回退仍要报断链（原语义不回退）')
+  assert.equal(ptrB.broken[0].pointer, '99-Gone/x.md')
+  rmSync(rootB, { recursive: true, force: true })
+  ok('记忆指针数据源：无 memory.db 时回退 memory.json（source=json，断链照报）')
 }
 
 rmSync(root, { recursive: true, force: true })

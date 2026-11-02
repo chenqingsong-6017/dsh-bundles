@@ -61,6 +61,19 @@ const TEXT_TOO_LONG_HINT =
 // 实测库里 >30 天的条目长期是 0 条，于是 makeRoom 永远找不到候选、正常写入被硬拒（扫描 #11）。
 // 7 天是「已经放了一周、且一次都没被检索命中」的条目：仍可 memory_restore 恢复，归档不删数据。
 const ROOM_MIN_AGE_DAYS = 7
+// ── v4.2（集百家所长）：kind 语义、可推导过滤、见顶精简 ──
+// reference：外部信息在哪找（Anthropic 四类笔记之一）。位置会变，180 天后标「待重验」。
+// procedure：验证过的工作流（Google ADK 四层模型的 Procedural）。门槛是「真跑成功 ≥2 次」，
+//   不是「用户说记住」——来自 Voyager 的 skill 入库规则（_research/memory-classic-ideas.md:10）。
+// 未知 kind 仍允许（存量库已有 state/handoff/progress 等自定义 kind），按 fact 口径处理，不拒绝。
+const KIND_REFERENCE = 'reference'
+const KIND_PROCEDURE = 'procedure'
+const REFERENCE_STALE_DAYS = 180
+const PROCEDURE_MIN_VERIFIED = 2
+// v4.2（Anthropic A4 / 论文 write-path filtering）：写入前判「这条能不能从规则源推出来」。
+// 能推出来 → 不记（规则每轮已注入，再记一遍只占预算）。保守阈值 + 逃生口 force:true。
+const DERIVABLE_FLOOR = 0.86
+const DERIVABLE_MIN_CHARS = 16
 // v3.9：别名也是存储，不能无限灌（B15）。
 const MAX_ALIASES = 8
 const MAX_ALIAS_CHARS = 60
@@ -185,7 +198,8 @@ const CANDIDATE_RULES = [
 
 const normalizePath = (value) => String(value ?? '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
 
-const IMPORTANCE_BASE = { rule: 8, preference: 6, fact: 4, note: 2 }
+// v4.2：reference（去哪找）5 分；procedure（验证过的流程）7 分——高于普通事实，低于硬规则。
+const IMPORTANCE_BASE = { rule: 8, procedure: 7, preference: 6, reference: 5, fact: 4, note: 2 }
 
 /**
  * 工作区级条件注入（v3.0）。
@@ -217,7 +231,7 @@ const CANDIDATE_TTL_DAYS = 7
  * 只对新写入生效，存量条目不动（避免一次性给 63 条补上今天的日期）。
  */
 export function deriveStaleAfter(kind, base = new Date()) {
-  const days = kind === 'fact' ? 90 : kind === 'note' ? 30 : 0
+  const days = kind === 'fact' ? 90 : kind === 'note' ? 30 : kind === KIND_REFERENCE ? REFERENCE_STALE_DAYS : 0
   if (days === 0) return ''
   return localDateOf(new Date(base.getTime() + days * 86400000))
 }
@@ -449,6 +463,50 @@ export function collectRuleFiles(cwd) {
       return false
     }
   })
+}
+
+/** v4.2：规则行归一化（去 markdown 装饰，只留语义文本），供「可推导」判定用。 */
+export function normalizeRuleLine(line) {
+  return String(line ?? '')
+    .replace(/^\s*[-*+]\s+/, '')
+    .replace(/^\s*\d+[.、)]\s+/, '')
+    .replace(/^\s*>\s?/, '')
+    .replace(/`+/g, '')
+    .replace(/\*\*|__/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * v4.2（Anthropic A4 / write-path filtering）：这条记忆能不能从规则源（工作区 AGENTS.md /
+ * .dsh/rules/*.md / 全局 AGENTS.md）推出来？能推出 → 返回 { source, similarity, quote }，调用方据此不记。
+ *
+ * 判据故意保守：与某一行「近重复」（bigram Jaccard ≥ DERIVABLE_FLOOR）或原文被该行包含才算命中。
+ * 把多条规则压缩成一句「判据」的相似度低于门槛 → 照常入库（那是判据，不是第二份正文）。
+ * 只扫规则源，不扫全仓代码：全仓扫描的 IO 成本与误杀率都不可接受（诚实边界见交付报告）。
+ */
+export function derivableHit(raw, cwd) {
+  // 真机教训（2026-11-02）：规则行里带反引号/加粗，候选文本不带（或反过来），
+  // 不归一化就做 includes 会假阴性——单测夹具没有反引号时看不出来，所以两边都过同一个归一化。
+  const text = normalizeRuleLine(raw)
+  if (text.length < 12) return null
+  for (const file of collectRuleFiles(cwd)) {
+    let body = ''
+    try {
+      body = readFileSync(file, 'utf8')
+    } catch (error) {
+      continue
+    }
+    body = body.replace(/^---[\s\S]*?\n---/, '')
+    for (const line of body.split(/\r?\n/)) {
+      const chunk = normalizeRuleLine(line)
+      if (chunk.length < DERIVABLE_MIN_CHARS) continue
+      if (chunk.includes(text)) return { source: file, similarity: 1, quote: chunk.slice(0, 120) }
+      const similarity = textSimilarity(chunk, text)
+      if (similarity >= DERIVABLE_FLOOR) return { source: file, similarity, quote: chunk.slice(0, 120) }
+    }
+  }
+  return null
 }
 
 const MEMORY_HEADER =
@@ -783,6 +841,9 @@ export function normalizeEntry(input) {
   // v3.23：inject:false = 只检索、不注入（事实/历史类条目用）。缺省等于 true。
   if (input.inject === false) out.inject = false
   if (typeof input.lastUsedAt === 'string' && input.lastUsedAt !== '') out.lastUsedAt = input.lastUsedAt
+  // v4.2：procedure 的复用证据必须在白名单里，否则 load→persist 一轮就被洗掉（v3.20 archivedAt 同款坑）。
+  if (Number.isInteger(input.verifiedCount) && input.verifiedCount >= 0) out.verifiedCount = input.verifiedCount
+  if (typeof input.lastVerifiedAt === 'string' && input.lastVerifiedAt !== '') out.lastVerifiedAt = input.lastVerifiedAt
   out.addedAt = typeof input.addedAt === 'string' ? input.addedAt : new Date().toISOString()
   out.updatedAt = typeof input.updatedAt === 'string' ? input.updatedAt : new Date().toISOString()
   return out
@@ -802,7 +863,10 @@ export function trustMark(entry, today = localDateOf()) {
 
 // v3.9：text 不是字符串时（手改 memory.json 写坏、或外部直接调 renderMemory）不能整块崩。
 const textOf = (entry) => (typeof entry?.text === 'string' ? entry.text : String(entry?.text ?? ''))
-const lineFull = (entry) => `- ${trustMark(entry)}${entry.pinned ? '📌 ' : ''}${textOf(entry)}`
+// v4.2：reference / procedure 在注入行上带可辨识前缀，一眼看出「这是去哪找 / 这是流程」。
+const KIND_MARK = { [KIND_REFERENCE]: '↗ ', [KIND_PROCEDURE]: '⚙ ' }
+const kindMark = (entry) => KIND_MARK[entry?.kind] ?? ''
+const lineFull = (entry) => `- ${trustMark(entry)}${kindMark(entry)}${entry.pinned ? '📌 ' : ''}${textOf(entry)}`
 
 const entryDate = (entry) => {
   const raw = typeof entry.updatedAt === 'string' && entry.updatedAt !== '' ? entry.updatedAt : entry.addedAt
@@ -815,7 +879,7 @@ const entryTag = (entry) => (Array.isArray(entry.tags) && entry.tags.length > 0 
 const lineRelevant = (entry) => {
   const tag = entryTag(entry) ? ` [${entryTag(entry)}]` : ''
   const date = entryDate(entry)
-  return `- (${entry.id})${trustMark(entry)}${tag}${date ? ` ${date}` : ''} ${textOf(entry)}`
+  return `- (${entry.id})${trustMark(entry)}${tag}${date ? ` ${date}` : ''} ${kindMark(entry)}${textOf(entry)}`
 }
 
 const lineIndexCompact = (entry) => {
@@ -823,7 +887,7 @@ const lineIndexCompact = (entry) => {
   // v2.7：只留 <scope> 标签等于没注入——模型看不出这条讲什么，也就不会去搜。压到 14 字主题仍可辨识。
   const flat = String(entry.text ?? '').replace(/\s+/g, ' ').trim()
   const peek = flat.length > COMPACT_PEEK_CHARS ? `${flat.slice(0, COMPACT_PEEK_CHARS)}…` : flat
-  return `- (${entry.id})${trustMark(entry)}${scope ? ` <${scope}>` : ''} ${peek}`
+  return `- (${entry.id})${trustMark(entry)}${scope ? ` <${scope}>` : ''} ${kindMark(entry)}${peek}`
 }
 
 const lineIndex = (entry) => {
@@ -831,7 +895,7 @@ const lineIndex = (entry) => {
   const summary = flat.length > INDEX_SUMMARY_CHARS ? `${flat.slice(0, INDEX_SUMMARY_CHARS)}…` : flat
   const tag = entryTag(entry) ? ` [${entryTag(entry)}]` : ''
   const date = entryDate(entry)
-  return `- (${entry.id})${trustMark(entry)}${tag}${date ? ` ${date}` : ''} ${summary}`
+  return `- (${entry.id})${trustMark(entry)}${tag}${date ? ` ${date}` : ''} ${kindMark(entry)}${summary}`
 }
 
 /**
@@ -1692,6 +1756,9 @@ export const memoryEntrySchema = {
     // v4.0：实体标签（纯字符串）与失效时刻（对齐双时间戳里可用的那一半）。
     entities: { type: 'array', items: { type: 'string' } },
     invalidAt: { type: 'string' },
+    // v4.2：procedure 的复用证据（Voyager「验证过才入库」；只在 kind=procedure 时写）。
+    verifiedCount: { type: 'integer' },
+    lastVerifiedAt: { type: 'string' },
   },
   required: ['id', 'text', 'addedAt', 'updatedAt'],
   additionalProperties: false,
@@ -1723,6 +1790,9 @@ export function cardMarkdown(entry, today = localDateOf()) {
     if (entry.staleAfter < today) lines.push('recheck: true')
   }
   if (typeof entry.verifiedAt === 'string' && entry.verifiedAt !== '') lines.push('verifiedAt: ' + entry.verifiedAt)
+  // v4.2：procedure 的复用证据也要导出（否则换机器就丢了「验证过几次」）。
+  if (Number.isInteger(entry.verifiedCount) && entry.verifiedCount > 0) lines.push('verifiedCount: ' + entry.verifiedCount)
+  if (typeof entry.lastVerifiedAt === 'string' && entry.lastVerifiedAt !== '') lines.push('lastVerifiedAt: ' + entry.lastVerifiedAt)
   if (typeof entry.supersededBy === 'string' && entry.supersededBy !== '') lines.push('supersededBy: ' + entry.supersededBy)
   if (Number.isInteger(entry.usedCount) && entry.usedCount > 0) lines.push('usedCount: ' + entry.usedCount)
   if (typeof entry.addedAt === 'string' && entry.addedAt !== '') lines.push('created: ' + entry.addedAt.slice(0, 10))
@@ -1772,6 +1842,8 @@ export function apply(ctx, config) {
       'maxInjectChars(' + maxInjectChars + ') 大于 maxBytes(' + maxBytes + ')：已钳到 ' + maxBytes + '。注入预算不该超过存储预算。'
     maxInjectChars = maxBytes
   }
+  // v4.2：可推导写入过滤开关（默认 'skip'；'off' 整体关闭）。这是写策略，不碰检索路径。
+  const deriveGate = config?.deriveGate === 'off' ? 'off' : 'skip'
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
   // v3.20：归档条目分文件冷存 —— 主库只留生效记忆，归档落 archive.json（与 aliases.json 同级的旁路文件）。
   // 起因：归档条目永远占着 memory.json，且 memory_list 每次都把 93 条一起吐出来（实测 37 KB），
@@ -2762,6 +2834,82 @@ export function apply(ctx, config) {
     return { ok: usedChars() + size <= maxBytes, archived }
   }
 
+  /**
+   * v4.2（Anthropic A2「索引硬预算超了要报错强制精简」）：见顶时给**可执行**建议——
+   * 哪几条能合并（合计多少字符）、哪几条 stale / 从未命中可以 drop。
+   * 只读、只算候选，不改库；真正的合并/删除仍由 memory_merge / memory_remove 显式执行。
+   */
+  function pruneSuggestions() {
+    const pool = activeEntries().filter((entry) => entry.pinned !== true)
+    // 两两相似度是 O(n²)：上限取最近 120 条，避免在写入主路径上算几万次。
+    const capped = pool.slice(-120)
+    const pairs = []
+    for (let i = 0; i < capped.length; i += 1) {
+      for (let j = i + 1; j < capped.length; j += 1) {
+        const similarity = textSimilarity(capped[i].text, capped[j].text)
+        if (similarity >= SIMILAR_HINT_FLOOR) pairs.push({ a: capped[i], b: capped[j], similarity })
+      }
+    }
+    pairs.sort((x, y) => y.similarity - x.similarity)
+    const merges = pairs.slice(0, 3).map((pair) => ({
+      a: pair.a.id,
+      b: pair.b.id,
+      similarity: Math.round(pair.similarity * 1000) / 1000,
+      total: pair.a.text.length + pair.b.text.length,
+    }))
+    const today = localDateOf()
+    const cutoff = Date.now() - ROOM_MIN_AGE_DAYS * 86400000
+    const dropCandidates = []
+    for (const entry of pool) {
+      // 规则条目永不作为 drop 候选：它们由规则文件自动入库 / pinned 硬约定，删了会被重新沉淀；
+      // 与 makeRoom 的 lowestValueCandidate（kind !== 'rule'）保持同一口径（2026-11-02 独立复核抓到不一致）。
+      if (entry.kind === 'rule') continue
+      if (isStaleEntry(entry, today)) {
+        dropCandidates.push({ entry, reason: 'staleAfter ' + entry.staleAfter + ' 已过（待重验）' })
+        continue
+      }
+      const updated = Date.parse(String(entry.updatedAt ?? entry.addedAt ?? ''))
+      if ((entry.usedCount ?? 0) === 0 && Number.isFinite(updated) && updated < cutoff) {
+        dropCandidates.push({ entry, reason: '从未被检索命中、>' + ROOM_MIN_AGE_DAYS + ' 天未更新' })
+      }
+    }
+    dropCandidates.sort((x, y) => effectiveImportance(x.entry) - effectiveImportance(y.entry))
+    const drops = dropCandidates.slice(0, 5).map((item) => ({
+      id: item.entry.id,
+      chars: item.entry.text.length,
+      reason: item.reason,
+    }))
+    return { merges, drops, scanned: capped.length, truncated: pool.length > capped.length }
+  }
+
+  /** v4.2：见顶报错 = 现状 + 可执行精简建议（合并 / drop），不再只说「超预算」。 */
+  function budgetExceededMessage(need, archivedIds) {
+    const plan = pruneSuggestions()
+    const lines = []
+    lines.push('记忆已占用 ' + usedChars() + ' / ' + maxBytes + ' 字符，本次需 ' + need + ' 字符；自动归档腾地方后仍不够。')
+    if (Array.isArray(archivedIds) && archivedIds.length > 0) {
+      lines.push('本轮已自动归档：' + archivedIds.join(' ') + '（可 memory_restore 恢复）。')
+    }
+    lines.push('主动精简建议（v4.2）：')
+    if (plan.merges.length > 0) {
+      lines.push('  ① 合并（memory_merge {ids:["a","b"]}，相似条目并成一条）：')
+      for (const item of plan.merges) {
+        lines.push('     - ' + item.a + ' + ' + item.b + ' 相似 ' + item.similarity + '，合计 ' + item.total + ' 字符 → 合并成一条')
+      }
+    }
+    if (plan.drops.length > 0) {
+      lines.push('  ② drop（memory_remove {id}，每条都可先 memory_list 确认）：')
+      for (const item of plan.drops) {
+        lines.push('     - ' + item.id + '（' + item.reason + '，' + item.chars + ' 字符）')
+      }
+    }
+    if (plan.merges.length === 0 && plan.drops.length === 0) {
+      lines.push('  没有可合并 / 可 drop 的候选：其余条目都是 pinned / 规则 / 刚写入或高价值，只能 memory_update 精简长条目。')
+    }
+    lines.push('若还不够：memory_update 精简长条目，或调大 maxBytes（配置 dsh-memory.maxBytes）。')
+    return lines.join('\n')
+  }
+
   function autoPromoteRule(candidate, scope) {
     const raw = String(candidate?.text ?? '').trim()
     if (raw === '') return null
@@ -3703,7 +3851,11 @@ export function apply(ctx, config) {
             type: 'string',
             description: 'Optional scope: global | plugin-dev | data-infra | dsh-date | machine. Unmatched scopes get no boost, never filtered out.',
           },
-          kind: { type: 'string', description: 'Optional kind: rule | preference | fact | note.' },
+          kind: {
+            type: 'string',
+            description:
+              'Optional kind: rule | preference | fact | reference | procedure | note. reference = where external info lives (dashboard/issue tracker); procedure = a workflow verified by real reuse (needs verifiedCount >= 2). Unknown kinds are allowed and get fact-level defaults.',
+          },
           importance: { type: 'integer', minimum: 1, maximum: 10, description: 'Optional importance 1-10; derived from kind/pinned/usage when omitted.' },
           pinned: {
             type: 'boolean',
@@ -3754,6 +3906,16 @@ export function apply(ctx, config) {
             type: 'boolean',
             description: 'v3.23: set false for facts/history that should be retrievable by memory_search but must NOT occupy the per-turn injection budget. Hard rules should stay injected (default).',
           },
+          force: {
+            type: 'boolean',
+            description:
+              'v4.2: bypass the derivable-write gate. The gate skips entries that are near-duplicates of AGENTS.md / .dsh/rules (already injected every turn); only pass force:true when the fact is genuinely new.',
+          },
+          verifiedCount: {
+            type: 'integer',
+            minimum: 0,
+            description: 'v4.2: only for kind=procedure — how many times the workflow has been reused successfully (>= 2 required, Voyager-style gate).',
+          },
         },
         required: ['text'],
         additionalProperties: false,
@@ -3766,6 +3928,11 @@ export function apply(ctx, config) {
             deduped: { type: 'boolean' },
             usedChars: { type: 'integer' },
             maxBytes: { type: 'integer' },
+            // v4.2：可推导过滤命中时 entry 缺省（不写库），改为返回诊断三件套。
+            skipped: { type: 'boolean' },
+            deriveReason: { type: 'string' },
+            deriveSource: { type: 'string' },
+            deriveSimilarity: { type: 'number' },
             aliasHint: {
               type: 'object',
               properties: {
@@ -3789,10 +3956,20 @@ export function apply(ctx, config) {
               },
             },
           },
-          required: ['entry', 'deduped', 'usedChars', 'maxBytes'],
+          // v4.2：跳过时不写库，entry 缺省——所以不再把 entry 放进 required。
+          required: ['deduped', 'usedChars', 'maxBytes'],
           additionalProperties: false,
         },
         render(_args, value) {
+          if (value?.skipped === true) {
+            return [
+              text(
+                `未入库（能从已有规则推出）：${value?.deriveReason ?? ''}\n` +
+                  `规则源：${value?.deriveSource ?? '?'}（相似度 ${Math.round((value?.deriveSimilarity ?? 0) * 100) / 100}）\n` +
+                  `这条规则每轮已由 path-rules 注入，再记一遍只占预算。确属新事实时用 force:true 重试；长篇正文请写 vault 卡再留 vault:// 指针。`,
+              ),
+            ]
+          }
           const entry = value?.entry
           const head = value?.deduped ? `已存在相同记忆：${entry?.id}` : `已记住：${entry?.id}${entry?.pinned ? '（已置顶）' : ''}`
           const similar = Array.isArray(value?.similar) ? value.similar : []
@@ -3897,6 +4074,31 @@ export function apply(ctx, config) {
         // makeRoom 永远找不到候选 → 正常写入被硬拒，且「腾地方」这条路径等于不存在。
         // 7 天既保护刚写进来的记忆不被挤掉，又保证真有候选可归档；错误里的候选名单用同一门槛，
         // 避免「点名了却归档不了」的两套口径（原候选名单不看年龄，本身就是不一致的）。
+        // ── v4.2：写入路径过滤（Anthropic A4）与 procedure 入库门槛 ──
+        // 顺序刻意：完全重复先走上面的 deduped 捷径；这里只拦「规则/AGENTS.md 的近重复副本」。
+        if (deriveGate !== 'off' && args?.force !== true) {
+          const hit = derivableHit(raw, lastKnownCwd)
+          if (hit !== null) {
+            return {
+              deduped: false,
+              usedChars: usedChars(),
+              maxBytes,
+              skipped: true,
+              deriveReason: '与规则源近重复：' + hit.quote,
+              deriveSource: hit.source,
+              deriveSimilarity: Math.round(hit.similarity * 1000) / 1000,
+            }
+          }
+        }
+        const incomingKind = typeof args?.kind === 'string' ? args.kind.trim() : ''
+        const incomingVerified = Number.isInteger(args?.verifiedCount) ? args.verifiedCount : 0
+        if (incomingKind === KIND_PROCEDURE && incomingVerified < PROCEDURE_MIN_VERIFIED) {
+          throw fail(
+            'MEMORY_PROCEDURE_UNVERIFIED',
+            'kind=procedure 只收「真跑成功 ≥' + PROCEDURE_MIN_VERIFIED + ' 次」的工作流（Voyager skill 入库规则 / Google ADK Procedural）：本次 verifiedCount=' + incomingVerified + '，未达门槛。' +
+              ' 做法：先把流程真跑两遍确认可复现，再 memory_add {kind:"procedure", verifiedCount:' + PROCEDURE_MIN_VERIFIED + '}；之后每次复用成功用 memory_update {id, verifiedCount:N+1} 累计。',
+          )
+        }
         if (usedChars() + raw.length > maxBytes) {
           const room = makeRoom(raw.length, { reason: 'auto-archive: 为新记忆腾预算', minAgeDays: ROOM_MIN_AGE_DAYS })
           if (!room.ok) {
@@ -3912,12 +4114,8 @@ export function apply(ctx, config) {
               )
               .map((entry) => entry.id)
               .slice(0, 10)
-            throw fail('MEMORY_BUDGET_EXCEEDED', 
-              `记忆已占用 ${usedChars()} / ${maxBytes} 字符，归档腾地方后仍不够（需 ${raw.length} 字符）。` +
-                (candidates.length > 0
-                  ? `可归档候选（≥${ROOM_MIN_AGE_DAYS} 天未动、从未用过、非规则）：${candidates.join(' ')}。用 memory_remove 精确删，或 memory_update 精简长条目。`
-                  : `已没有「≥${ROOM_MIN_AGE_DAYS} 天未动且从未使用过」的可归档条目了（刚写的、规则、draft、pinned 都不动），只能 memory_remove 或 memory_update 精简。`)
-            )
+            // v4.2（Anthropic A2）：不只拒绝，给出「合并哪几条 / drop 哪些 stale」的具体建议。
+            throw fail('MEMORY_BUDGET_EXCEEDED', budgetExceededMessage(raw.length, room.archived))
           }
         }
         const now = new Date().toISOString()
@@ -3944,6 +4142,8 @@ export function apply(ctx, config) {
           ...(Array.isArray(args?.entities) ? { entities: args.entities } : {}),
           ...(typeof args?.invalidAt === 'string' && args.invalidAt !== '' ? { invalidAt: args.invalidAt } : {}),
           ...(Array.isArray(args?.workspaces) ? { workspaces: args.workspaces } : {}),
+          // v4.2：procedure 的复用证据（Voyager 门槛：≥2 次成功复运用）。
+          ...(incomingKind === KIND_PROCEDURE ? { verifiedCount: incomingVerified, lastVerifiedAt: now } : {}),
           addedAt: now,
           updatedAt: now,
         })
@@ -4033,7 +4233,7 @@ export function apply(ctx, config) {
         type: 'object',
         properties: {
           id: { type: 'string', description: 'Entry id from memory_list, e.g. "m1".' },
-          text: { type: 'string', description: `New text (<= ${MAX_TEXT_CHARS} chars).` },
+          text: { type: 'string', description: `New text (<= ${MAX_TEXT_CHARS} chars). Omit it only for a verifiedCount-only update.` },
           tag: { type: 'string', description: 'Optional new tag; omit to keep the current one.' },
           tags: { type: 'array', items: { type: 'string' }, description: 'Optional new tags; omit to keep the current ones.' },
           aliases: {
@@ -4042,7 +4242,7 @@ export function apply(ctx, config) {
             description: 'Optional new aliases (synonyms) for retrieval; omit to keep the current ones, empty array clears them.',
           },
           scope: { type: 'string', description: 'Optional new scope (global | plugin-dev | data-infra | dsh-date | machine).' },
-          kind: { type: 'string', description: 'Optional new kind (rule | preference | fact | note).' },
+          kind: { type: 'string', description: 'Optional new kind (rule | preference | fact | reference | procedure | note).' },
           importance: { type: 'integer', minimum: 1, maximum: 10, description: 'Optional new importance 1-10.' },
           pinned: { type: 'boolean', description: 'true pins it to always-injected, false unpins.' },
           status: {
@@ -4070,6 +4270,11 @@ export function apply(ctx, config) {
             type: 'boolean',
             description: 'true = mark as just re-checked (records verifiedAt now); false = clear the verification.',
           },
+          verifiedCount: {
+            type: 'integer',
+            minimum: 0,
+            description: 'v4.2: reuse-success count for kind=procedure (>= 2 to store/keep as procedure); records lastVerifiedAt now.',
+          },
           inject: {
             type: 'boolean',
             description: 'v3.23: false = searchable but never injected (facts/history); true = restore injection.',
@@ -4079,7 +4284,7 @@ export function apply(ctx, config) {
             description: 'true keeps history: create a new entry with the new text and mark the old one superseded (not injected anymore).',
           },
         },
-        required: ['id', 'text'],
+        required: ['id'],
         additionalProperties: false,
       },
       output: {
@@ -4099,11 +4304,26 @@ export function apply(ctx, config) {
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
         const next = typeof args?.text === 'string' ? args.text.trim() : ''
         if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要 id。')
-        if (next === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要新的 text；要删除请用 memory_remove。')
+        // v4.2：允许 verifiedCount-only 更新（procedure 每复用成功一次只累加证据，不必重发正文）。
+        if (next === '' && !Number.isInteger(args?.verifiedCount)) {
+          throw fail('MEMORY_ARG_MISSING', 'memory_update 需要新的 text；要删除请用 memory_remove。')
+        }
         if (next.length > MAX_TEXT_CHARS) throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${next.length}。${TEXT_TOO_LONG_HINT}`)
         const entry = state.entries.find((item) => item.id === id)
         if (!entry) throw fail('MEMORY_ID_NOT_FOUND', `没有这条记忆：${id}。先用 memory_list 查看。`)
-        const projected = usedChars() - entry.text.length + next.length
+        if (args?.verifiedCount !== undefined && !(Number.isInteger(args.verifiedCount) && args.verifiedCount >= 0)) {
+          throw fail('MEMORY_ARG_INVALID', 'verifiedCount 必须是 ≥0 的整数。')
+        }
+        // v4.2：procedure 的复用门槛对「改成 procedure / 已是 procedure」都生效——不能绕过门槛把普通条目升级成流程。
+        const nextKind = typeof args?.kind === 'string' && args.kind.trim() !== '' ? args.kind.trim() : typeof entry.kind === 'string' ? entry.kind : ''
+        const nextVerified = Number.isInteger(args?.verifiedCount) ? args.verifiedCount : Number.isInteger(entry.verifiedCount) ? entry.verifiedCount : 0
+        if (nextKind === KIND_PROCEDURE && nextVerified < PROCEDURE_MIN_VERIFIED) {
+          throw fail(
+            'MEMORY_PROCEDURE_UNVERIFIED',
+            'procedure 需要 verifiedCount ≥ ' + PROCEDURE_MIN_VERIFIED + '（当前 ' + nextVerified + '）：先真跑成功 ≥2 次再入库/改 kind。',
+          )
+        }
+        const projected = usedChars() - entry.text.length + (next !== '' ? next.length : 0)
         if (projected > maxBytes) {
           throw fail('MEMORY_BUDGET_EXCEEDED', `更新后会到 ${projected} / ${maxBytes} 字符，超预算。请精简或先删掉别的条目。`)
         }
@@ -4129,6 +4349,8 @@ export function apply(ctx, config) {
             ...(Number.isFinite(entry.importance) ? { importance: entry.importance } : {}),
             ...(typeof entry.staleAfter === 'string' ? { staleAfter: entry.staleAfter } : {}),
             ...(typeof entry.validFrom === 'string' ? { validFrom: entry.validFrom } : {}),
+            ...(Number.isInteger(entry.verifiedCount) ? { verifiedCount: entry.verifiedCount } : {}),
+            ...(typeof entry.lastVerifiedAt === 'string' ? { lastVerifiedAt: entry.lastVerifiedAt } : {}),
             addedAt: now,
             updatedAt: now,
           })
@@ -4140,7 +4362,7 @@ export function apply(ctx, config) {
           persist()
           return { entry: publicEntry(replacement), usedChars: usedChars(), superseded: entry.id }
         }
-        entry.text = next
+        if (next !== '') entry.text = next
         if (typeof args?.tag === 'string' && args.tag.trim() !== '') entry.tag = args.tag.trim()
         if (Array.isArray(args?.tags)) {
           const tags = args.tags.filter((tag) => typeof tag === 'string' && tag !== '')
@@ -4192,6 +4414,11 @@ export function apply(ctx, config) {
             }
             entry.invalidAt = rawInvalid
           }
+        }
+        // v4.2：复用成功一次就累加证据（procedure 的「验证过几次」不是用户说记住，而是真跑成功）。
+        if (Number.isInteger(args?.verifiedCount)) {
+          entry.verifiedCount = args.verifiedCount
+          entry.lastVerifiedAt = new Date().toISOString()
         }
         if (args?.verified === true) {
           entry.verifiedBy = 'agent'
@@ -4474,7 +4701,7 @@ export function apply(ctx, config) {
           tag: { type: 'string' },
           tags: { type: 'array', items: { type: 'string' } },
           scope: { type: 'string' },
-          kind: { type: 'string' },
+          kind: { type: 'string', description: 'Merged kind (rule | preference | fact | reference | procedure | note); defaults to the first source kind.' },
           pinned: { type: 'boolean' },
         },
         required: ['ids'],
@@ -4512,6 +4739,15 @@ export function apply(ctx, config) {
         if (mergedText.length > MAX_TEXT_CHARS) {
           throw fail('MEMORY_TEXT_TOO_LONG', `合并后最多 ${MAX_TEXT_CHARS} 字符（当前 ${mergedText.length}）。${TEXT_TOO_LONG_HINT}`)
         }
+        // v4.2：procedure 合并同样要过复用门槛（不能把两条普通记忆「合并成」一条流程）。
+        const mergedKind = typeof args?.kind === 'string' && args.kind.trim() !== '' ? args.kind.trim() : typeof first.kind === 'string' ? first.kind : ''
+        const mergedVerified = Math.max(0, ...sources.map((item) => (Number.isInteger(item.verifiedCount) ? item.verifiedCount : 0)))
+        if (mergedKind === KIND_PROCEDURE && mergedVerified < PROCEDURE_MIN_VERIFIED) {
+          throw fail(
+            'MEMORY_PROCEDURE_UNVERIFIED',
+            '合并成 procedure 需要来源里已有「真跑成功 ≥' + PROCEDURE_MIN_VERIFIED + ' 次」的证据（当前最高 verifiedCount=' + mergedVerified + '）。',
+          )
+        }
         const freed = sources.reduce((sum, entry) => sum + entry.text.length, 0)
         if (usedChars() - freed + mergedText.length > maxBytes) {
           throw fail('MEMORY_BUDGET_EXCEEDED', `合并后超预算（上限 ${maxBytes} 字符）。请先精简或删掉别的条目。`)
@@ -4543,7 +4779,8 @@ export function apply(ctx, config) {
           ...(typeof args?.tag === 'string' && args.tag.trim() !== '' ? { tag: args.tag.trim() } : first.tag ? { tag: first.tag } : {}),
           ...(unionTags.length > 0 ? { tags: unionTags } : {}),
           ...(inheritedScope !== '' ? { scope: inheritedScope } : {}),
-          ...(typeof args?.kind === 'string' && args.kind.trim() !== '' ? { kind: args.kind.trim() } : typeof first.kind === 'string' ? { kind: first.kind } : {}),
+          ...(mergedKind !== '' ? { kind: mergedKind } : {}),
+          ...(mergedKind === KIND_PROCEDURE ? { verifiedCount: mergedVerified, lastVerifiedAt: new Date().toISOString() } : {}),
           ...(unionWorkspaces.length > 0 ? { workspaces: unionWorkspaces } : {}),
           ...(unionPaths.length > 0 ? { paths: unionPaths } : {}),
           ...(unionSources.length > 0 ? { sources: unionSources } : {}),

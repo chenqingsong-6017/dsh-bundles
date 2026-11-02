@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 // 跨仓引用用绝对 file URL（D:/AI 与 D:/AI-date 不同分支，相对路径够不着）；env 可覆盖。
@@ -66,6 +67,32 @@ const tmp = (prefix) => mkdtempSync(path.join(os.tmpdir(), prefix))
   assert.equal(Number(mAlways[1]), probeRules().alwaysChars, '规则预算两处必须一致')
   assert.equal(Number(mMem[1]), probeMemory().used, '记忆字符两处必须一致')
   ok('system-health 与探针同口径（无第二份实现）')
+}
+
+{
+  // v4.2：dsh-obsidian 的 readMemoryEntries 是「与探针同语义的复制实现」（跨仓 import 不现实），
+  // 这份夹具把两边输出钉在一起——否则「两套口径」迟早漂（2026-11-02 独立复核要求补的）。
+  const { readMemoryEntries: readProbeEntries } = await import(PROBES_URL)
+  const { readMemoryEntries: readObsidianEntries } = await import('../../dsh-obsidian/index.js')
+  const dir = tmp('probe-cross-')
+  const memFile = path.join(dir, 'memory.json')
+  writeFileSync(memFile, JSON.stringify({ entries: [{ id: 'j1', text: 'json 旧快照' }] }))
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite')
+  const db = new DatabaseSync(path.join(dir, 'memory.db'))
+  db.exec('CREATE TABLE entries (seq INTEGER NOT NULL, payload TEXT NOT NULL)')
+  const ins = db.prepare('INSERT INTO entries (seq, payload) VALUES (?, ?)')
+  ins.run(1, JSON.stringify({ id: 'd1', text: 'db 条目一' }))
+  ins.run(2, JSON.stringify({ id: 'd2', text: 'db 条目二' }))
+  ins.run(3, '{bad json')
+  db.close()
+  const probeSide = readProbeEntries(memFile)
+  const obsSide = readObsidianEntries(memFile)
+  assert.equal(obsSide.source, 'sqlite', '同目录有 DB 时必须读 DB')
+  assert.equal(probeSide.length, 2, '探针侧坏 payload 跳过')
+  assert.equal(obsSide.entries.length, 2, 'obsidian 侧坏 payload 跳过')
+  assert.deepEqual(obsSide.entries.map((entry) => entry.id), probeSide.map((entry) => entry.id), '两边按 seq 读出的条目必须一致')
+  rmSync(dir, { recursive: true, force: true })
+  ok('dsh-obsidian readMemoryEntries 与 metric-probes 同口径（同一夹具/同一 DB 输出一致）')
 }
 
 console.log('metric-probes: ' + passed + ' 组通过')

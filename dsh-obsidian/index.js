@@ -1,5 +1,5 @@
 /**
- * dsh-obsidian v0.3.2 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
+ * dsh-obsidian v0.4.0 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
  *
  * 为什么需要它：vault 是人的成品层，AI 要查画像/日志/调研结论时只能 glob + read 逐个翻；
  * 库一大就会问「哪张卡讲过 X」「断链断在哪」。这个插件把 vault 扫成一份索引（落在 D 盘），
@@ -12,6 +12,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 
 export const name = 'dsh-obsidian'
@@ -541,6 +542,50 @@ export function parseMemoryPointers(value) {
   return [...found]
 }
 
+/**
+ * 记忆条目读取（单一入口，口径与 _ops/metric-probes.mjs:54-87 一致）：
+ * v4.1 起权威存储是同目录的 SQLite `memory.db`（memory.json 已冻结）；没有 DB / 打不开 → 回退 memory.json。
+ * 返回 { entries, source, file, error? }：entries 为 null 表示两处都读不到（由调用方判空，fail-safe）；
+ * source = 'sqlite' | 'json'，file = 实际读取的文件——诊断用，防止「以为读了 db、其实读了 json」。
+ * 为什么要有它：2026-11-02 前 memoryPointerReport 直读 memory.json，报的是旧快照。
+ */
+export function readMemoryEntries(memoryPath) {
+  const memFile = String(memoryPath ?? '')
+  const dbFile = path.join(path.dirname(memFile), 'memory.db')
+  if (existsSync(dbFile)) {
+    try {
+      const requireModule = createRequire(import.meta.url)
+      const { DatabaseSync } = requireModule('node:sqlite')
+      const database = new DatabaseSync(dbFile, { readOnly: true })
+      try {
+        const rows = database.prepare('SELECT payload FROM entries ORDER BY seq').all()
+        const entries = []
+        for (const row of rows) {
+          try {
+            const parsed = JSON.parse(row.payload)
+            if (parsed !== null && typeof parsed === 'object' && typeof parsed.text === 'string') entries.push(parsed)
+          } catch (error) {
+            // 单条坏 payload 跳过（与插件加载口径一致）
+          }
+        }
+        return { entries, source: 'sqlite', file: dbFile }
+      } finally {
+        database.close()
+      }
+    } catch (error) {
+      // node:sqlite 不可用 / DB 打不开：回退 JSON（fail-safe，读取方自己判空）
+    }
+  }
+  if (!existsSync(memFile)) return { entries: null, source: 'json', file: memFile, error: '记忆文件不存在：' + memFile }
+  try {
+    const parsed = JSON.parse(readFileSync(memFile, 'utf8'))
+    if (!Array.isArray(parsed?.entries)) return { entries: null, source: 'json', file: memFile, error: '记忆文件没有 entries 数组：' + memFile }
+    return { entries: parsed.entries, source: 'json', file: memFile }
+  } catch (error) {
+    return { entries: null, source: 'json', file: memFile, error: errText(error).slice(0, 200) }
+  }
+}
+
 /** 页面契约检查：只做五条能从「找得到/信得过/改得动」倒推出来的规则 */
 export function lintIndex(index, options) {
   const opts = options || {}
@@ -686,15 +731,20 @@ export function apply(ctx, config) {
     return heads
   }
 
-  /** 记忆指针漂移检查：memory.json 里的 vault:// 指针能不能落到真实文件**与真实锚点**（仿 Basic Memory sync_status）
+  /** 记忆指针漂移检查：记忆库里的 vault:// 指针能不能落到真实文件**与真实锚点**（仿 Basic Memory sync_status）
    *  2026-11-02 修：原实现只判文件存在，`#锚点` 那半截被丢掉——「文件在、锚点不在」被当成 OK。
+   *  2026-11-02 v0.4.0 修：数据源改走 readMemoryEntries（memory.db 权威、memory.json 已冻结），
+   *  并加 source / storeFile / entryCount 三个诊断字段——「检查在跑、数字是旧快照」要能从输出上看出来。
    *  broken 用 kind 区分 file-missing / anchor-missing；pointer / memoryIds 保持向后兼容。 */
   function memoryPointerReport() {
-    const report = { file: memoryPath, checked: false, ok: true, total: 0, anchorChecked: 0, anchorSkipped: 0, fileMissing: 0, anchorMissing: 0, broken: [], sample: [] }
+    const report = { file: memoryPath, source: '', storeFile: '', entryCount: 0, checked: false, ok: true, total: 0, anchorChecked: 0, anchorSkipped: 0, fileMissing: 0, anchorMissing: 0, broken: [], sample: [] }
     try {
-      if (!existsSync(memoryPath)) { report.error = '记忆文件不存在：' + memoryPath; return report }
-      const parsed = JSON.parse(readFileSync(memoryPath, 'utf8'))
-      const entries = Array.isArray(parsed?.entries) ? parsed.entries : []
+      const loaded = readMemoryEntries(memoryPath)
+      report.source = loaded.source
+      report.storeFile = loaded.file
+      if (loaded.entries === null) { report.error = loaded.error || ('记忆文件不存在：' + memoryPath); return report }
+      const entries = loaded.entries
+      report.entryCount = entries.length
       const owners = new Map()
       for (const entry of entries) {
         for (const pointer of parseMemoryPointers(entry?.text)) {
@@ -740,12 +790,12 @@ export function apply(ctx, config) {
     return report
   }
 
-  /** 读真实 memory.json，取出所有指针目标（lint 用；读不到就当空集，不阻断） */
+  /** 读记忆库（优先 memory.db、回退 memory.json），取出所有指针目标（lint 用；读不到就当空集，不阻断） */
   function memoryPointerTargets() {
     try {
-      if (!existsSync(memoryPath)) return new Set()
-      const parsed = JSON.parse(readFileSync(memoryPath, 'utf8'))
-      const entries = Array.isArray(parsed?.entries) ? parsed.entries : []
+      const loaded = readMemoryEntries(memoryPath)
+      if (loaded.entries === null) return new Set()
+      const entries = loaded.entries
       const set = new Set()
       for (const entry of entries) {
         for (const pointer of parseMemoryPointers(entry?.text)) {

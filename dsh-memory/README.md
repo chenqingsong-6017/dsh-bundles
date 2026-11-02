@@ -7,7 +7,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
 - **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
-- **版本 / 引擎**：v4.1.0（2026-11-02）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+- **版本 / 引擎**：v4.2.0（2026-11-02）。v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
 ## 工具
 
@@ -15,9 +15,9 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 |---|---|
 | `memory_list` | 列出记忆（id / 标签 / scope / kind / 是否失效 / 使用次数 / 文本），显示存储占用、**本轮注入字符数**与**实际注入的文本块** |
 | `memory_search` | BM25 检索（IDF + 长度归一 + 标签加权 + **别名加权 ×2.5 + 同义扩展**，v3.5），命中条目自增使用计数；**query 里出现 `m\d+` 时按 id 直取**（v2.7） |
-| `memory_add` | 追加一条（≤600 字符），可带 `scope / kind / tags / aliases`；完全相同文本自动去重；**与在库条目相似度 ≥0.62 时提示邻居**（v2.7） |
-| `memory_update` | 改文本 / 标签 / scope / kind / pinned；`supersede: true` 时新值生效、旧条目留档不再注入 |
-| `memory_merge` | 多条合并成一条原子事实，被合并的留档失效 |
+| `memory_add` | 追加一条（≤600 字符），可带 `scope / kind / tags / aliases`；完全相同文本自动去重；**与在库条目相似度 ≥0.62 时提示邻居**（v2.7）；**v4.2：能从 AGENTS.md/.dsh/rules 推出的不记**（返回 `skipped` + 规则源，`force:true` 逃生）；`kind=procedure` 需 `verifiedCount ≥ 2` |
+| `memory_update` | 改文本 / 标签 / scope / kind / pinned；`supersede: true` 时新值生效、旧条目留档不再注入；**v4.2：可只传 `verifiedCount` 累加复用证据**（procedure 专用） |
+| `memory_merge` | 多条合并成一条原子事实，被合并的留档失效；**v4.2：合并成 procedure 需来源已有 `verifiedCount ≥ 2` 证据** |
 | `memory_audit` | 只读审计（给模型）：重复候选（bigram 相似度）、过期候选（从未使用且 >N 天）、使用排行、scope 分布、预算 |
 | `memory_review` | 记忆概览（给人看，v2.8）：已过期 / 未证实 / 从未引用 / 硬规则四段 + scope 分布 + 容量，写入 `review-latest.md` |
 | `memory_remove` | 删某条（物理删除；要留历史用 `memory_update` 的 supersede） |
@@ -49,6 +49,37 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 3. **超预算拒绝写入**，不自动淘汰：上限 12000 字符（可配 `maxBytes`），超了就让 agent 先看 `memory_list` 再 `memory_remove`，避免悄悄丢用户信息。
 4. **存储后端（v4.1）**：默认 SQLite 单文件 `memory.db`（WAL，只写脏行），`storage: json` 保留为回滚开关；迁移、备份、回滚见下文「存储后端（v4.1）」「迁移与回滚」。不写会话日志、不新增事件类型。
 
+## v4.2（2026-11-02）：集百家所长 —— 四个写入侧长板
+
+四项都是**写策略/语义**增强，检索打分（BM25 + 三因子 + 中文分词 + 遗忘曲线）一行未动；14 个工具名不变、参数集只增不减。唯一的契约**放宽**：`memory_update` 的 `text` 在只更新 `verifiedCount` 时可省略（`required` 由 `['id','text']` → `['id']`）；`memory_add` 跳过写入时返回 `entry` 缺省 + 诊断字段。
+
+### 5.1 skip 可推导信息（Anthropic A4 / write-path filtering）
+- **`memory_add` 写入前**先判：这条是否与 `AGENTS.md` / `.dsh/rules/*.md` / 全局 `~/.dsh/AGENTS.md` 的某一行**近重复**（bigram Jaccard ≥0.86，或原文被该行包含）。
+- 命中 → **不写库**，返回 `{ skipped: true, deriveSource, deriveReason, deriveSimilarity }`，不报错；规则本来每轮已被 path-rules 注入，再记一遍只占预算。
+- 逃生口：`force: true`（确属新事实）/ 配置 `deriveGate: 'off'`。
+- **诚实边界**：① 只扫规则源，不扫全仓代码/git 历史——全仓扫描的 IO 成本与误杀率都不可接受；② 门只作用于**新增**（`memory_add`）；`memory_update` / `memory_merge` 是显式维护操作，不受该门约束（已知旁路，要拦需另加门）；③「压缩改写后的判据」相似度通常低于门槛，会正常入库（那是判据，不是第二份正文）；④ 插件重载后到下一次提示装配前 `lastKnownCwd` 为空，该窗口只扫全局 AGENTS.md。
+
+### 5.2 kind=reference（Anthropic 四类笔记之一）
+- 语义：外部信息**去哪找**（issue 跟踪 / 仪表盘 / 文档站）。
+- 重要度基线 5（note=2、fact=4、preference=6、rule=8）；复核期 180 天（位置会变，到期标「⏰待重验」）。
+- 注入行带 `↗` 前缀（索引行也有），一眼区分「事实」与「去哪找」。
+
+### 5.3 预算见顶主动精简（Anthropic A2）
+- `maxBytes` 满且自动归档腾不出空间时，`MEMORY_BUDGET_EXCEEDED` 不再只说「超预算」，而是给出**具体条目**：
+  - ① 合并建议：两两相似度 ≥0.62 的条目对（点 id、相似度、合计字符数 → 建议 `memory_merge`）；
+  - ② drop 建议：已过复核期的 stale 条目、从未被检索且 >7 天未更新的条目（点 id、原因、字符数 → 建议 `memory_remove`）；
+  - ③ 没有候选时明确说「只能 memory_update 精简或调大 maxBytes」，不假装有办法。
+- 只读计算（上限扫最近 120 条做 O(n²) 相似度），不改库；真正的合并/删除仍由显式工具执行。
+
+### 5.4 kind=procedure（Google ADK Procedural / Voyager）
+- 语义：**验证过的工作流**（可复现的步骤/命令序列）。
+- 入库门槛：`verifiedCount ≥ 2`——「真跑成功 ≥2 次」才算，不是「用户说记住」。未达门槛抛 `MEMORY_PROCEDURE_UNVERIFIED` 并给下一步做法。**注意：复用证据由调用方自报**（宿主没有通用的「复用成功」信号），插件做的是门槛 + 留痕（`verifiedCount/lastVerifiedAt`），不是自动观测。
+- 落库字段：`verifiedCount` + `lastVerifiedAt`（ISO 时间）；之后每复用成功一次用 `memory_update {id, verifiedCount: N+1}` 累加（v4.2 起可只传该字段）。
+- 重要度基线 7；注入行带 `⚙` 前缀；导出卡片同样带 `verifiedCount/lastVerifiedAt`。
+- 普通条目不能无证据升级成 procedure（update/merge 同样过门槛）。
+
+> 依据：Anthropic write-path filtering / 四类笔记、Anthropic「索引硬预算超了报错强制精简」、Google ADK 四层记忆的 Procedural、Voyager 的 skill 入库规则；调研见工作区 `_research/memory-synthesis-2026-11-02.md`、`_research/memory-classic-ideas.md`。
+
 ## 配置
 
 ```yaml
@@ -63,6 +94,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
         maxInjectChars: 2500                # 每轮注入预算（字符），成本封顶
         captureCandidates: true             # 用户消息自动沉淀到候选池（v2.2）
         captureRuleFiles: false             # 规则文件沉淀（v3.26，默认 true；规则已在 AGENTS/rules 里时建议关）
+        deriveGate: 'skip'                  # v4.2：写入前跳过「能从规则源推出」的内容（off = 关闭该过滤）
 ```
 
 ## 存储后端（v4.1）

@@ -59,7 +59,7 @@ D:\AI\dsh-data\obsidian\
 config:
   vaultDir: D:\AI-date\obsidian\vault
   storeDir: D:\AI\dsh-data\obsidian
-  memoryPath: D:\AI\dsh-data\memory\memory.json   # 指针漂移检查的数据源
+  memoryPath: D:\AI\dsh-data\memory\memory.json   # 指针漂移检查入口（同目录有 memory.db 时优先读 db）
   buildOnStart: true                               # 启动时顺带建一次索引（只读扫库，失败不影响启动）
   writeEnabled: true                               # false = 回到纯只读模式
   writeAllowlist:                                  # 只有这些前缀可写
@@ -74,7 +74,9 @@ config:
 细节见 vault://10-Life/13-Life-Plan.md
 ```
 
-`obsidian_status` 会扫 `memory.json` 里所有 `vault://` 指针，报 `total` 与 `broken`（断掉的指针 + 对应记忆 id）。这是仿 Basic Memory 的 `sync_status`：索引落后要能被看见，而不是等人踩空。
+`obsidian_status` 会扫记忆库里所有 `vault://` 指针，报 `total` 与 `broken`（断掉的指针 + 对应记忆 id）。这是仿 Basic Memory 的 `sync_status`：索引落后要能被看见，而不是等人踩空。
+
+**数据源（v0.4.0）**：优先读同目录的 `memory.db`（SQLite，v4.1 起的权威存储；`memory.json` 已冻结），没有 db / 打不开才回退 `memory.json`。报告里的 `source`（`sqlite` / `json`）、`storeFile`、`entryCount` 三个诊断字段直接说明这份数字从哪来——防止「检查在跑、数字是旧快照」。
 
 ### 断链分 kind（2026-11-02 起）
 
@@ -147,9 +149,22 @@ config:
 | 新增用例能失败（负向对照） | ✅ 把锚点判定改成 `if (false)` → 用例红；把结论头退回字面量 `**一句话**` → 用例红；还原后全绿 |
 | 真机调用 | ⚠️ 未做（本任务不重启、不改运行进程）；`obsidian_status`/`obsidian_lint` 的真机输出仍看进程里加载的那版，零重启通道见 AGENTS.md |
 
+## 验证记录（2026-11-02，v0.4.0 记忆指针改读 memory.db）
+
+| 项 | 结果 |
+|---|---|
+| 证伪（改前先跑旧代码） | ✅ 旧实现直读 `memory.json`（已冻结）：`memoryPointers` 没有 `source` 字段，数字来自旧快照 |
+| 单测 `_selftest/tests/obsidian.test.mjs` | ✅ 16 项通过（新增 2 组：memory.db 优先 / 无 db 回退 json） |
+| 新增用例能失败 | ✅ 断言 `source==='sqlite'`、`total`=db 去重数、`broken=0`；夹具的 memory.json 只留 1 条断指针，误读 json 必然红 |
+| 真机（零重启：`_ops/apply-check.mjs --reload` → 等 6 秒 → 调 `obsidian_status`） | ✅ `memoryPointers.source='sqlite'` / `storeFile=…\memory.db` / `entryCount=110` / **total=67**、broken 0 |
+| 独立脚本比对（`node:sqlite` 直查 `SELECT payload FROM entries ORDER BY seq`，同一指针正则去重） | ✅ entries=110、坏 payload=0、去重指针 **67**，与工具返回的 total 逐位一致 |
+| `node --check index.js` + `node _selftest/gate/check.mjs`（在 dsh-bundles 下） | ✅ 语法门 18 入口 / 结构门 20 manifest / 测试门全量 34 个测试通过（35.1s） |
+
 ## 已知边界（诚实清单）
 
 - **写只进白名单**：这是设计，不是遗漏。要让 AI 直接改正文，得先改白名单配置并想清冲突策略。
+- **`readMemoryEntries` 是复制实现**：与 `_ops/metric-probes.mjs` 同语义、不是共享代码（跨仓 import 不现实）。两边口径由 `_selftest/tests/metric-probes.test.mjs` 的同夹具测试钉住；改一边必须同步另一边。
+- **`memoryPointers.file` 仍是 `memory.json` 路径**：向后兼容字段；真实读取来源看 `source` / `storeFile`。
 - **冲突检测靠调用方传 expectedHash**：不传就只保证「不覆盖已有文件」，不保证「你看到的是最新版」。
 - **解析是 YAML-lite**：只支持标量 / 行内列表 / 缩进列表；嵌套属性（Obsidian 不支持）不处理。
 - **链接解析按 basename 取第一个**：vault 里同名笔记会有歧义，`brokenLinks` 只统计「解析不到」，不报歧义。

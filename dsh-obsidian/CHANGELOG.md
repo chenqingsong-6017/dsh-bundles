@@ -2,6 +2,16 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.4.0 — 2026-11-02
+
+### Changed
+- `memoryPointers` 数据源改为 `readMemoryEntries`（与 `_ops/metric-probes.mjs:54-87` 同口径）：优先读记忆目录下的 `memory.db`（`node:sqlite` 只读、`SELECT payload FROM entries ORDER BY seq`、单条坏 payload 跳过），无 db / 打不开才回退 `memory.json.entries`——v4.1 后 memory.json 已冻结，直读会报旧数字。
+- `memoryPointerReport()` 新增诊断字段 `source`（`sqlite` | `json`）/ `storeFile` / `entryCount`；`total`（去重后的指针数）/ `checked` / `ok` / `fileMissing` / `anchorMissing` / `broken` / `sample` 与锚点校验语义不变。`memoryPointerTargets()`（lint 用）同源。
+
+### 验证
+- 单测新增两组（临时目录，不碰真实数据）：memory.json 无指针 + memory.db 有指针 → `source='sqlite'`、`total` = db 去重指针数、坏 payload 跳过；只有 memory.json → `source='json'` 回退。
+- 真机：`node _ops/apply-check.mjs --reload` 触发一次 profile 重组后调 `obsidian_status`，`memoryPointers.source='sqlite'`，`total` 与独立脚本从 `memory.db` 数出的指针数一致。
+
 ## v0.3.2 — 2026-11-02
 
 ### Added
