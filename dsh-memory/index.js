@@ -27,6 +27,8 @@
 import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { createHash } from 'node:crypto'
+import { createRequire } from 'node:module'
 
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
@@ -36,6 +38,17 @@ export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 // 实测后果是「记忆加不进去」（7892/8000 只剩 108 字符）。注入预算才是真正影响 token 成本的那层，存储层放宽。
 const DEFAULT_MAX_BYTES = 12000
 const BACKUP_KEEP = 10
+// v4.1（P2）：存储后端。'sqlite' = 单文件 memory.db（node:sqlite，内置 SQLite，零依赖）；
+// 'json' = 旧 memory.json 全量写（保留为**回滚开关**：配置 storage: json 即回到旧行为，数据不丢）。
+const STORE_BACKENDS = new Set(['sqlite', 'json'])
+const DB_FILE = 'memory.db'
+const DB_SCHEMA_VERSION = 1
+const DB_MIGRATION_LOCK = 'memory.db.migrating'
+// 中文/符号词表由应用层 tokenize 生成后空格分隔喂给 FTS5；tokenchars 保住 dsh-memory / index.js / v4.0.1 不被拆碎。
+// 绝不能让 FTS5 默认分词器直接吃中文原文：连续中文会被当成一个巨大 token（蓝图 §4 / GitHub 调研实证）。
+const FTS_TOKENIZE = "unicode61 tokenchars '-_.'"
+// v4.1：检索路径开关。'index' = FTS5 候选集 + 统计表（默认）；'scan' = 旧的全量遍历（P2.2 差分不过/出问题时的回退开关）。
+const RETRIEVAL_MODES = new Set(['index', 'scan'])
 const DEFAULT_MAX_INJECT_CHARS = 1200
 const MAX_TEXT_CHARS = 600
 // v4.0.1：单条正文超长时给**可操作**的出路，而不是只抛一句「太长」。
@@ -459,6 +472,135 @@ function storeLocation(overrideDir) {
         : path.join(os.homedir(), '.dsh', 'dsh-memory')
   return { dir: base, file: path.join(base, 'memory.json') }
 }
+/* ───────── v4.1（P2）：存储快照读取（诊断/基准/测试用，只读） ─────────
+ * 单一入口：有 memory.db 读 SQLite，没有就按旧 JSON 口径读 memory.json + archive.json。
+ * 只读保证：不建表、不迁移、不写任何文件。基准脚本 _ops/memory-bench.mjs 用它保持与真机同源。 */
+let MODULE_SQLITE_API
+function moduleSqliteApi() {
+  if (MODULE_SQLITE_API !== undefined) return MODULE_SQLITE_API
+  try {
+    MODULE_SQLITE_API = createRequire(import.meta.url)('node:sqlite')
+  } catch (error) {
+    MODULE_SQLITE_API = null
+  }
+  return MODULE_SQLITE_API
+}
+
+/** 快照也要读别名旁路（插件加载后会把旁路合并进条目；快照不合并就会与真机口径不同）。 */
+function mergeAliasesFromSidecar(entries, dir) {
+  let sidecar = {}
+  try {
+    const parsed = JSON.parse(readFileSync(path.join(dir, 'aliases.json'), 'utf8'))
+    if (parsed !== null && typeof parsed === 'object' && parsed.aliases !== null && typeof parsed.aliases === 'object') sidecar = parsed.aliases
+  } catch (error) {
+    // 没有旁路文件从空开始
+  }
+  for (const entry of entries) {
+    const list = sidecar[entry.id]
+    if (!Array.isArray(list) || list.length === 0) continue
+    if (Array.isArray(entry.aliases) && entry.aliases.length > 0) continue
+    entry.aliases = list
+  }
+  return entries
+}
+
+export function readStoreSnapshot(storeDirOverride) {
+  const location = storeLocation(storeDirOverride)
+  const dbPath = path.join(location.dir, DB_FILE)
+  if (existsSync(dbPath)) {
+    const api = moduleSqliteApi()
+    if (api === null) throw fail('MEMORY_SQLITE_UNAVAILABLE', 'node:sqlite 不可用，读不了 memory.db：' + dbPath)
+    const database = new api.DatabaseSync(dbPath)
+    try {
+      const meta = new Map()
+      try {
+        for (const row of database.prepare('SELECT key, value FROM meta').all()) meta.set(row.key, row.value)
+      } catch (error) {
+        // 空库/未初始化：按默认值
+      }
+      let rows = []
+      try {
+        rows = database.prepare('SELECT payload FROM entries ORDER BY seq').all()
+      } catch (error) {
+        rows = []
+      }
+      const entries = []
+      for (const row of rows) {
+        let parsed = null
+        try {
+          parsed = JSON.parse(row.payload)
+        } catch (error) {
+          parsed = null
+        }
+        if (parsed === null || typeof parsed !== 'object' || typeof parsed.id !== 'string' || typeof parsed.text !== 'string') continue
+        entries.push(normalizeEntry(parsed))
+      }
+      const nextIdRaw = Number(meta.get('next_id') ?? 1)
+      const versionRaw = Number(meta.get('data_version') ?? SCHEMA_VERSION)
+      mergeAliasesFromSidecar(entries, location.dir)
+      return {
+        backend: 'sqlite',
+        dir: location.dir,
+        storeFile: dbPath,
+        version: versionRaw > 0 ? versionRaw : SCHEMA_VERSION,
+        nextId: nextIdRaw > 0 ? nextIdRaw : 1,
+        entries,
+      }
+    } finally {
+      try {
+        database.close()
+      } catch (error) {}
+    }
+  }
+  let parsed = null
+  try {
+    parsed = JSON.parse(readFileSync(location.file, 'utf8'))
+  } catch (error) {
+    parsed = null
+  }
+  const active = Array.isArray(parsed?.entries) ? parsed.entries : []
+  const archived = []
+  try {
+    const archivedRaw = JSON.parse(readFileSync(path.join(location.dir, 'archive.json'), 'utf8'))
+    const list = Array.isArray(archivedRaw) ? archivedRaw : Array.isArray(archivedRaw?.entries) ? archivedRaw.entries : []
+    const now = new Date().toISOString()
+    for (const raw of list) {
+      if (raw === null || typeof raw !== 'object' || typeof raw.id !== 'string' || typeof raw.text !== 'string') continue
+      const entry = normalizeEntry(raw)
+      archived.push(
+        isArchivedEntry(entry)
+          ? entry
+          : { ...entry, status: 'deprecated', archivedAt: entry.archivedAt ?? now, archiveReason: entry.archiveReason ?? 'migrated: archive.json' },
+      )
+    }
+  } catch (error) {
+    // 归档缺失/损坏按空处理（与 loadArchive 同口径）
+  }
+  const activeIds = new Set()
+  const entries = []
+  for (const raw of active) {
+    if (raw === null || typeof raw !== 'object') continue
+    const entry = normalizeEntry(raw)
+    activeIds.add(entry.id)
+    entries.push(entry)
+  }
+  for (const entry of archived) if (!activeIds.has(entry.id)) entries.push(entry)
+  const maxIdNumber = entries.reduce((max, entry) => {
+    const match = /^m?(\d+)$/.exec(String(entry.id))
+    return match ? Math.max(max, Number(match[1])) : max
+  }, 0)
+  const storedNextId = Number.isInteger(parsed?.nextId) && parsed.nextId > 0 ? parsed.nextId : 0
+  const version = Number.isInteger(parsed?.version) && parsed.version > 0 ? parsed.version : 1
+  mergeAliasesFromSidecar(entries, location.dir)
+  return {
+    backend: 'json',
+    dir: location.dir,
+    storeFile: location.file,
+    version,
+    nextId: Math.max(storedNextId, maxIdNumber + 1),
+    entries,
+  }
+}
 
 // v3.20：补 archivedAt / archiveReason —— v3.19 的自动归档会写它们，但 normalizeEntry 不认识，
 // 结果「load→persist」一轮就把归档时间和原因洗掉（归档历史只剩 status=deprecated 一个标记）。
@@ -527,6 +669,22 @@ export function migrateState(input, target = SCHEMA_VERSION) {
   if (from === target) return { state: input, from, to: from, changed: false }
   const entries = Array.isArray(input?.entries) ? input.entries.map((entry) => normalizeEntry(entry)) : []
   return { state: { ...input, version: target, entries }, from, to: target, changed: true }
+}
+/** 键排序的稳定 JSON（P2 迁移回读深比对用：只比内容，不比键序）。 */
+export function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    const parts = []
+    for (const item of value) parts.push(canonicalJson(item))
+    return '[' + parts.join(',') + ']'
+  }
+  if (value !== null && typeof value === 'object') {
+    const keys = Object.keys(value)
+    keys.sort()
+    const parts = []
+    for (const key of keys) parts.push(JSON.stringify(key) + ':' + canonicalJson(value[key]))
+    return '{' + parts.join(',') + '}'
+  }
+  return JSON.stringify(value)
 }
 
 /** v4.0：实体标签清洗——去重、截断、限条数。纯字符串，不建实体表。 */
@@ -1125,15 +1283,37 @@ const BM25_ALIAS_WEIGHT = 2.5
 /** 同义词扩展的权重：低于原词，避免扩展词把噪声顶上来。 */
 const EXPANSION_WEIGHT = 0.2
 
-function bm25Doc(entry) {
+/* v4.1（P2.2 前置）：bm25Doc 结果按条目对象缓存。
+ * 为什么：benchmark 实测 10000 条时「完整搜索」319ms，其中约 90% 是每轮重新 tokenize + 重建词表 Map；
+ * df/idf/长度归一这些**公式**一行不动，只是把这部分重复劳动缓存起来。
+ * 失效口径：用 text/tag/tags/aliases/entities 拼出签名，签名变了就重算（WeakMap 跟随条目对象生命周期）。
+ * 注意：返回的 terms Map 由缓存共享，调用方（scoreEntries / 排序 / 注入渲染）都只读。 */
+const BM25_DOC_CACHE = new WeakMap()
+function bm25DocSignature(entry) {
   const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
   const aliasText = Array.isArray(entry.aliases) ? entry.aliases.join(' ') : ''
-  // v4.0：实体标签也进检索词表——它是最便宜的关系信号（不建表、不抽 LLM，但能让人名/项目名召回）。
   const entityText = Array.isArray(entry.entities) ? entry.entities.join(' ') : ''
-  const terms = tokenize(`${entry.text} ${tagText} ${aliasText} ${entityText}`)
+  return String(entry.text ?? '') + '\u0000' + tagText + '\u0000' + aliasText + '\u0000' + entityText
+}
+function buildBm25Doc(entry, signature) {
+  const parts = signature.split('\u0000')
+  const text = parts[0] ?? ''
+  const tagText = parts[1] ?? ''
+  const aliasText = parts[2] ?? ''
+  const entityText = parts[3] ?? ''
+  const terms = tokenize(`${text} ${tagText} ${aliasText} ${entityText}`)
   let length = 0
   for (const count of terms.values()) length += count
   return { entry, terms, length, tagText: tagText.toLowerCase(), aliasTerms: new Set(tokenize(aliasText).keys()) }
+}
+function bm25Doc(entry) {
+  if (entry === null || typeof entry !== 'object') return buildBm25Doc(entry, '')
+  const signature = bm25DocSignature(entry)
+  const cached = BM25_DOC_CACHE.get(entry)
+  if (cached !== undefined && cached.signature === signature) return cached.doc
+  const doc = buildBm25Doc(entry, signature)
+  BM25_DOC_CACHE.set(entry, { signature, doc })
+  return doc
 }
 
 /**
@@ -1364,6 +1544,34 @@ export function gateDecision({ coverage, matchedUnits, matchedDf, unitCount, agr
   return { pass: relaxed, relaxed }
 }
 
+/* v4.1（P2.2 前置）：覆盖率层的条目词表同样缓存（口径与 relevanceCoverage 原实现完全一致：text + tag，不含 aliases）。 */
+const CONTENT_DOC_CACHE = new WeakMap()
+function contentDocSignature(entry) {
+  const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
+  return String(entry.text ?? '') + '\u0000' + tagText
+}
+function buildContentDoc(entry, signature) {
+  const parts = signature.split('\u0000')
+  const text = parts[0] ?? ''
+  const tagText = parts[1] ?? ''
+  const terms = new Map()
+  let length = 0
+  for (const unit of contentUnitsOf(`${text} ${tagText}`)) {
+    terms.set(unit, (terms.get(unit) ?? 0) + 1)
+    length += 1
+  }
+  return { entry, terms, length }
+}
+function contentDoc(entry) {
+  if (entry === null || typeof entry !== 'object') return buildContentDoc(entry, '')
+  const signature = contentDocSignature(entry)
+  const cached = CONTENT_DOC_CACHE.get(entry)
+  if (cached !== undefined && cached.signature === signature) return cached.doc
+  const doc = buildContentDoc(entry, signature)
+  CONTENT_DOC_CACHE.set(entry, { signature, doc })
+  return doc
+}
+
 export function relevanceCoverage(entries, query) {
   const list = Array.isArray(entries) ? entries : []
   const clauses = queryClauses(query)
@@ -1378,16 +1586,7 @@ export function relevanceCoverage(entries, query) {
     }
     return { ...best, byId: merged }
   }
-  const docs = list.map((entry) => {
-    const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
-    const terms = new Map()
-    let length = 0
-    for (const unit of contentUnitsOf(`${entry.text ?? ''} ${tagText}`)) {
-      terms.set(unit, (terms.get(unit) ?? 0) + 1)
-      length += 1
-    }
-    return { entry, terms, length }
-  })
+  const docs = list.map((entry) => contentDoc(entry))
   const queryUnits = [...new Set(contentUnitsOf(query))]
   if (docs.length === 0 || queryUnits.length === 0) return { coverage: 0, topId: null, matchedUnits: [], matchedDf: [], docMatched: new Map() }
   let totalLength = 0
@@ -1784,6 +1983,736 @@ export function apply(ctx, config) {
     }
   }
 
+  // ================= v4.1（P2）：SQLite 存储后端 =================
+  // 设计（完整方案见 _reports/dsh-memory-p2-sqlite-plan-2026-11-02.md）：
+  //   1) SQLite 只做**持久化**：entries 表存 payload（全字段 JSON）+ seq（写入顺序，排序/注入口径依赖它）
+  //      + tokens/units（检索词表，由应用层 tokenize/contentUnitsOf 生成，供 FTS5 与 df 重建）；工具层代码不变。
+  //   2) memory.json / archive.json 保留不动；首次以 storage: sqlite 启动时自动迁移（先备份、再回读 deepEqual，失败拒绝启动）。
+  //   3) 回滚开关：config.storage = json（旧 JSON 后端代码完整保留）。
+  const requireModule = createRequire(import.meta.url)
+  // 代码默认仍是 json（向后兼容：旧数据目录/旧测试/回滚场景零改动）；生产由插件自带 cordis.patch.yml 显式设 storage: sqlite。
+  const backend = STORE_BACKENDS.has(config?.storage) ? config.storage : 'json'
+  const retrievalMode = RETRIEVAL_MODES.has(config?.retrieval) ? config.retrieval : 'index'
+  const dbFile = path.join(storeDir, DB_FILE)
+  let db = null
+  let dbApi = null
+  const dbMetaCache = new Map()
+  /** 索引镜像：id -> { tokens, units, sortLen, unitLen }（增量维护 df 与自愈重建用；10k 条约 3-5MB）。 */
+  const indexMirror = new Map()
+  /** id -> 写入顺序 seq（SQLite 主键顺序；加载时按「生效在前、归档在后」重排，与 JSON 后端 memory.json+archive.json 的读取顺序一致）。 */
+  const seqOf = new Map()
+  let indexHealthy = false
+  let persistedPayloads = new Map()
+  let dbWriteSeq = '0'
+  let lastDbSignature = ''
+
+  function loadSqliteApi() {
+    if (dbApi !== null) return dbApi
+    try {
+      dbApi = requireModule('node:sqlite')
+      return dbApi
+    } catch (error) {
+      return null
+    }
+  }
+
+  const sqliteUnavailable = () =>
+    fail(
+      'MEMORY_SQLITE_UNAVAILABLE',
+      '运行时不支持 node:sqlite（需要 Node >= 23.4；本机 DSH 内置 Node 24 满足）。为不让两套后端行为漂移，拒绝启动。' +
+        '回滚方式：cordis.patch.yml 的 dsh-memory.config 里加 storage: json（旧 JSON 后端仍保留，数据不丢）。',
+    )
+
+  const dbQuote = (value) => "'" + String(value).replace(/'/g, "''") + "'"
+
+  function createDbSchema(target) {
+    target.exec('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+    target.exec("CREATE TABLE IF NOT EXISTS entries (id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL, seq INTEGER NOT NULL, tokens TEXT NOT NULL, units TEXT NOT NULL, sort_len INTEGER NOT NULL, unit_len INTEGER NOT NULL)")
+    target.exec('CREATE INDEX IF NOT EXISTS entries_seq ON entries(seq)')
+    target.exec('CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(id UNINDEXED, tokens, tokenize = "' + FTS_TOKENIZE + '")')
+    target.exec('CREATE VIRTUAL TABLE IF NOT EXISTS entries_unit_fts USING fts5(id UNINDEXED, units, tokenize = "' + FTS_TOKENIZE + '")')
+    target.exec('CREATE TABLE IF NOT EXISTS term_df (term TEXT PRIMARY KEY, df INTEGER NOT NULL)')
+    target.exec('CREATE TABLE IF NOT EXISTS unit_df (unit TEXT PRIMARY KEY, df INTEGER NOT NULL)')
+  }
+
+  function metaGetOn(target, key) {
+    try {
+      const row = target.prepare('SELECT value FROM meta WHERE key = ?').get(key)
+      return row === undefined ? null : row.value
+    } catch (error) {
+      return null
+    }
+  }
+  function metaSetOn(target, key, value) {
+    target.prepare('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, String(value))
+  }
+  const metaGet = (key) => {
+    if (dbMetaCache.has(key)) return dbMetaCache.get(key)
+    const value = db === null ? null : metaGetOn(db, key)
+    dbMetaCache.set(key, value)
+    return value
+  }
+  const metaSet = (key, value) => {
+    dbMetaCache.set(key, String(value))
+    metaSetOn(db, key, value)
+  }
+
+  /** 检索词表口径：与 bm25Doc 完全一致（text + tag/tags + aliases + entities）。 */
+  function indexTermsOf(entry) {
+    const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
+    const aliasText = Array.isArray(entry.aliases) ? entry.aliases.join(' ') : ''
+    const entityText = Array.isArray(entry.entities) ? entry.entities.join(' ') : ''
+    return tokenize(String(entry.text ?? '') + ' ' + tagText + ' ' + aliasText + ' ' + entityText)
+  }
+  /** 覆盖率层词表口径：与 contentDoc 完全一致（text + tag/tags，不含 aliases/entities）。 */
+  function indexUnitsOf(entry) {
+    const tagText = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags.join(' ') : entry.tag ?? ''
+    const counts = new Map()
+    for (const unit of contentUnitsOf(String(entry.text ?? '') + ' ' + tagText)) counts.set(unit, (counts.get(unit) ?? 0) + 1)
+    return counts
+  }
+  function countsLength(counts) {
+    let total = 0
+    for (const value of counts.values()) total += value
+    return total
+  }
+  function countsToText(counts) {
+    const terms = []
+    for (const term of counts.keys()) terms.push(term)
+    terms.sort()
+    return terms.join(' ')
+  }
+
+  /** 增量维护 df / FTS / 统计计数；oldMirror 为改前镜像（新增传 undefined）。必须在事务内调用。 */
+  function applyIndexEntry(entry, oldMirror) {
+    const id = entry.id
+    const terms = indexTermsOf(entry)
+    const units = indexUnitsOf(entry)
+    const tokensText = countsToText(terms)
+    const unitsText = countsToText(units)
+    const sortLen = countsLength(terms)
+    const unitLen = countsLength(units)
+    const deltas = new Map()
+    if (oldMirror !== undefined) {
+      for (const term of oldMirror.tokens.split(' ')) if (term !== '') deltas.set(term, (deltas.get(term) ?? 0) - 1)
+      for (const unit of oldMirror.units.split(' ')) if (unit !== '') deltas.set('u:' + unit, (deltas.get('u:' + unit) ?? 0) - 1)
+    } else {
+      metaSet('sort_doc_count', Number(metaGet('sort_doc_count') ?? 0) + 1)
+      metaSet('unit_doc_count', Number(metaGet('unit_doc_count') ?? 0) + 1)
+    }
+    for (const term of tokensText.split(' ')) if (term !== '') deltas.set(term, (deltas.get(term) ?? 0) + 1)
+    for (const unit of unitsText.split(' ')) if (unit !== '') deltas.set('u:' + unit, (deltas.get('u:' + unit) ?? 0) + 1)
+    for (const [key, delta] of deltas) {
+      if (delta === 0) continue
+      const isUnit = key.startsWith('u:')
+      const term = isUnit ? key.slice(2) : key
+      const table = isUnit ? 'unit_df' : 'term_df'
+      const column = isUnit ? 'unit' : 'term'
+      db.prepare('INSERT INTO ' + table + '(' + column + ', df) VALUES(?, MAX(0, ?)) ON CONFLICT(' + column + ') DO UPDATE SET df = MAX(0, df + ?)').run(term, delta, delta)
+    }
+    db.prepare('DELETE FROM entries_fts WHERE id = ?').run(id)
+    db.prepare('INSERT INTO entries_fts(id, tokens) VALUES(?, ?)').run(id, tokensText)
+    db.prepare('DELETE FROM entries_unit_fts WHERE id = ?').run(id)
+    db.prepare('INSERT INTO entries_unit_fts(id, units) VALUES(?, ?)').run(id, unitsText)
+    const oldSortLen = oldMirror === undefined ? 0 : oldMirror.sortLen
+    const oldUnitLen = oldMirror === undefined ? 0 : oldMirror.unitLen
+    metaSet('sort_len_sum', Number(metaGet('sort_len_sum') ?? 0) - oldSortLen + sortLen)
+    metaSet('unit_len_sum', Number(metaGet('unit_len_sum') ?? 0) - oldUnitLen + unitLen)
+    indexMirror.set(id, { tokens: tokensText, units: unitsText, sortLen, unitLen })
+  }
+
+  function removeIndexEntry(id) {
+    const oldMirror = indexMirror.get(id)
+    db.prepare('DELETE FROM entries_fts WHERE id = ?').run(id)
+    db.prepare('DELETE FROM entries_unit_fts WHERE id = ?').run(id)
+    if (oldMirror === undefined) return
+    const deltas = new Map()
+    for (const term of oldMirror.tokens.split(' ')) if (term !== '') deltas.set(term, (deltas.get(term) ?? 0) - 1)
+    for (const unit of oldMirror.units.split(' ')) if (unit !== '') deltas.set('u:' + unit, (deltas.get('u:' + unit) ?? 0) - 1)
+    for (const [key, delta] of deltas) {
+      const isUnit = key.startsWith('u:')
+      const term = isUnit ? key.slice(2) : key
+      const table = isUnit ? 'unit_df' : 'term_df'
+      const column = isUnit ? 'unit' : 'term'
+      db.prepare('UPDATE ' + table + ' SET df = MAX(0, df + ?) WHERE ' + column + ' = ?').run(delta, term)
+    }
+    metaSet('sort_len_sum', Number(metaGet('sort_len_sum') ?? 0) - oldMirror.sortLen)
+    metaSet('unit_len_sum', Number(metaGet('unit_len_sum') ?? 0) - oldMirror.unitLen)
+    metaSet('sort_doc_count', Number(metaGet('sort_doc_count') ?? 0) - 1)
+    metaSet('unit_doc_count', Number(metaGet('unit_doc_count') ?? 0) - 1)
+    indexMirror.delete(id)
+  }
+
+  /** 全量重建 FTS + df（迁移/自愈/差分测试用）。*/
+  function rebuildIndex() {
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      db.exec('DELETE FROM entries_fts')
+      db.exec('DELETE FROM entries_unit_fts')
+      db.exec('DELETE FROM term_df')
+      db.exec('DELETE FROM unit_df')
+      indexMirror.clear()
+      const rows = db.prepare('SELECT id, payload FROM entries ORDER BY seq').all()
+      const termCounts = new Map()
+      const unitCounts = new Map()
+      let sortLenSum = 0
+      let unitLenSum = 0
+      for (const row of rows) {
+        let entry = null
+        try { entry = JSON.parse(row.payload) } catch (error) { entry = null }
+        if (entry === null || entry === undefined) continue
+        const terms = indexTermsOf(entry)
+        const units = indexUnitsOf(entry)
+        const tokensText = countsToText(terms)
+        const unitsText = countsToText(units)
+        const sortLen = countsLength(terms)
+        const unitLen = countsLength(units)
+        for (const term of terms.keys()) termCounts.set(term, (termCounts.get(term) ?? 0) + 1)
+        for (const unit of units.keys()) unitCounts.set(unit, (unitCounts.get(unit) ?? 0) + 1)
+        db.prepare('INSERT INTO entries_fts(id, tokens) VALUES(?, ?)').run(row.id, tokensText)
+        db.prepare('INSERT INTO entries_unit_fts(id, units) VALUES(?, ?)').run(row.id, unitsText)
+        indexMirror.set(row.id, { tokens: tokensText, units: unitsText, sortLen, unitLen })
+        sortLenSum += sortLen
+        unitLenSum += unitLen
+      }
+      for (const [term, count] of termCounts) db.prepare('INSERT INTO term_df(term, df) VALUES(?, ?)').run(term, count)
+      for (const [unit, count] of unitCounts) db.prepare('INSERT INTO unit_df(unit, df) VALUES(?, ?)').run(unit, count)
+      metaSet('sort_doc_count', rows.length)
+      metaSet('unit_doc_count', rows.length)
+      metaSet('sort_len_sum', sortLenSum)
+      metaSet('unit_len_sum', unitLenSum)
+      db.exec('COMMIT')
+      indexHealthy = true
+    } catch (error) {
+      try { db.exec('ROLLBACK') } catch (inner) {}
+      indexHealthy = false
+      throw error
+    }
+  }
+
+  function pruneBackupsSqlite() {
+    try {
+      const prefix = DB_FILE + '.bak-'
+      const dailyOnly = /[.]bak-\d{8}$/
+      const names = readdirSync(storeDir).filter((name) => name.startsWith(prefix) && dailyOnly.test(name))
+      if (names.length <= BACKUP_KEEP) return
+      const listed = names.map((name) => {
+        try { return { name, mtime: statSync(path.join(storeDir, name)).mtimeMs } } catch (error) { return { name, mtime: 0 } }
+      })
+      listed.sort((a, b) => b.mtime - a.mtime)
+      for (const item of listed.slice(BACKUP_KEEP)) {
+        try { unlinkSync(path.join(storeDir, item.name)) } catch (error) {}
+      }
+    } catch (error) {}
+  }
+
+  function ensureDailyBackupSqlite() {
+    if (db === null) return
+    try {
+      const target = dbFile + '.bak-' + backupDay()
+      if (existsSync(target)) return
+      db.exec('VACUUM INTO ' + dbQuote(target))
+      pruneBackupsSqlite()
+    } catch (error) {
+      // 备份失败不阻断写入（与 JSON 后端同口径）
+    }
+  }
+
+  /** 迁移前备份 JSON 三件套 + sha256 清单。返回备份目录。 */
+  function backupJsonBeforeMigration() {
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+    const backupDir = path.join(storeDir, 'backups', 'pre-sqlite-' + stamp)
+    mkdirSync(backupDir, { recursive: true })
+    const manifest = { createdAt: new Date().toISOString(), source: storeFile, files: [] }
+    for (const name of ['memory.json', 'archive.json', 'aliases.json', 'candidates.json']) {
+      const from = path.join(storeDir, name)
+      if (!existsSync(from)) continue
+      const to = path.join(backupDir, name)
+      copyFileSync(from, to)
+      const bytes = readFileSync(to)
+      manifest.files.push({ name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') })
+    }
+    writeFileSync(path.join(backupDir, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8')
+    return backupDir
+  }
+
+  /** 迁移/加载时把别名旁路文件合并进条目（旁路只补缺失；与 applyAliases 同口径）。 */
+  function mergeAliasesSidecar(entries) {
+    let sidecar = {}
+    try {
+      const parsed = JSON.parse(readFileSync(aliasesFile, 'utf8'))
+      if (parsed !== null && typeof parsed === 'object' && parsed.aliases !== null && typeof parsed.aliases === 'object') sidecar = parsed.aliases
+    } catch (error) {
+      // 没有旁路文件从空开始
+    }
+    for (const entry of entries) {
+      const fromSidecar = sidecar[entry.id]
+      if (!Array.isArray(fromSidecar) || fromSidecar.length === 0) continue
+      if (Array.isArray(entry.aliases) && entry.aliases.length > 0) continue
+      entry.aliases = fromSidecar
+    }
+    return entries
+  }
+
+  function readJsonStoreForMigration() {
+    let parsed = null
+    try {
+      parsed = JSON.parse(readFileSync(storeFile, 'utf8'))
+    } catch (error) {
+      throw fail('MEMORY_MIGRATION_FAILED', '迁移失败：memory.json 读取/解析失败（' + (error?.message ?? '') + '）。原文件未动；可用 storage: json 继续用旧后端。')
+    }
+    if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) {
+      throw fail('MEMORY_MIGRATION_FAILED', '迁移失败：memory.json 形状不是 {entries: []}。原文件未动；可用 storage: json 继续用旧后端。')
+    }
+    const active = []
+    for (const raw of parsed.entries) {
+      if (raw === null || typeof raw !== 'object' || typeof raw.id !== 'string' || typeof raw.text !== 'string') continue
+      active.push(normalizeEntry(raw))
+    }
+    const archived = []
+    try {
+      const archivedRaw = JSON.parse(readFileSync(archiveFile, 'utf8'))
+      const list = Array.isArray(archivedRaw) ? archivedRaw : Array.isArray(archivedRaw?.entries) ? archivedRaw.entries : []
+      const now = new Date().toISOString()
+      for (const raw of list) {
+        if (raw === null || typeof raw !== 'object' || typeof raw.id !== 'string' || typeof raw.text !== 'string') continue
+        const entry = normalizeEntry(raw)
+        archived.push(
+          isArchivedEntry(entry)
+            ? entry
+            : { ...entry, status: 'deprecated', archivedAt: entry.archivedAt ?? now, archiveReason: entry.archiveReason ?? 'migrated: archive.json' },
+        )
+      }
+    } catch (error) {
+      // 归档文件缺失/损坏按空处理（与旧 loadArchive 的 fail-safe 同口径）
+    }
+    const activeIds = new Set(active.map((entry) => entry.id))
+    const entries = [...active, ...archived.filter((entry) => !activeIds.has(entry.id))]
+    const maxIdNumber = entries.reduce((max, entry) => {
+      const match = /^m?(\d+)$/.exec(String(entry.id))
+      return match ? Math.max(max, Number(match[1])) : max
+    }, 0)
+    const storedNextId = Number.isInteger(parsed.nextId) && parsed.nextId > 0 ? parsed.nextId : 0
+    const version = Number.isInteger(parsed.version) && parsed.version > 0 ? parsed.version : 1
+    if (version > SCHEMA_VERSION) throw schemaTooNewError(version, SCHEMA_VERSION)
+    mergeAliasesSidecar(entries)
+    return { version, nextId: Math.max(storedNextId, maxIdNumber + 1), entries }
+  }
+
+  /** JSON → SQLite 一次性迁移：备份 → 写临时 DB → 回读深比对 → 原子改名；失败删临时文件并拒绝启动。 */
+  function migrateJsonToSqlite(api) {
+    const lockFile = path.join(storeDir, DB_MIGRATION_LOCK)
+    if (existsSync(lockFile)) {
+      throw fail('MEMORY_MIGRATION_LOCKED', '检测到未完成的 SQLite 迁移锁（' + lockFile + '）。若确认上次迁移已中断，删除该锁文件后重试。')
+    }
+    try {
+      writeFileSync(lockFile, String(process.pid), { flag: 'wx' })
+    } catch (error) {
+      throw fail('MEMORY_MIGRATION_LOCKED', '检测到未完成的 SQLite 迁移锁（' + lockFile + '）。若确认上次迁移已中断，删除该锁文件后重试。')
+    }
+    const tmpFile = dbFile + '.migrating-' + process.pid
+    try {
+      const source = readJsonStoreForMigration()
+      const backupDir = backupJsonBeforeMigration()
+      let migrationDb = null
+      try {
+        try { if (existsSync(tmpFile)) unlinkSync(tmpFile) } catch (error) {}
+        migrationDb = new api.DatabaseSync(tmpFile)
+        migrationDb.exec('PRAGMA journal_mode = WAL')
+        createDbSchema(migrationDb)
+        migrationDb.exec('BEGIN IMMEDIATE')
+        try {
+          const insert = migrationDb.prepare('INSERT INTO entries(id, payload, updated_at, seq, tokens, units, sort_len, unit_len) VALUES(?,?,?,?,?,?,?,?)')
+          let seq = 0
+          for (const entry of source.entries) {
+            const terms = indexTermsOf(entry)
+            const units = indexUnitsOf(entry)
+            insert.run(entry.id, JSON.stringify(entry), String(entry.updatedAt ?? ''), seq, countsToText(terms), countsToText(units), countsLength(terms), countsLength(units))
+            seq += 1
+          }
+          metaSetOn(migrationDb, 'schema_version', DB_SCHEMA_VERSION)
+          metaSetOn(migrationDb, 'data_version', source.version)
+          metaSetOn(migrationDb, 'next_id', source.nextId)
+          metaSetOn(migrationDb, 'next_seq', source.entries.length)
+          metaSetOn(migrationDb, 'write_seq', 1)
+          metaSetOn(migrationDb, 'migrated_from', 'json')
+          metaSetOn(migrationDb, 'migrated_at', new Date().toISOString())
+          migrationDb.exec('COMMIT')
+        } catch (error) {
+          try { migrationDb.exec('ROLLBACK') } catch (inner) {}
+          throw error
+        }
+        // 回读深比对：DB 里每条 entry 必须与源逐字段一致（内容不动）。
+        const readBack = migrationDb.prepare('SELECT payload FROM entries ORDER BY seq').all()
+        const parsedBack = []
+        for (const row of readBack) parsedBack.push(JSON.parse(row.payload))
+        const sourceCanonical = canonicalJson(source.entries)
+        const backCanonical = canonicalJson(parsedBack)
+        if (sourceCanonical !== backCanonical) {
+          throw fail('MEMORY_MIGRATION_FAILED', '迁移回读比对不一致（源 ' + source.entries.length + ' 条 vs DB ' + parsedBack.length + ' 条）：已删除临时数据库，原 JSON 未动。')
+        }
+      } finally {
+        try { if (migrationDb !== null) migrationDb.close() } catch (error) {}
+      }
+      try { unlinkSync(dbFile) } catch (error) {}
+      renameSync(tmpFile, dbFile)
+      return backupDir
+    } catch (error) {
+      try { if (existsSync(tmpFile)) unlinkSync(tmpFile) } catch (inner) {}
+      if (error?.code === 'MEMORY_MIGRATION_FAILED' || error?.code === 'MEMORY_MIGRATION_LOCKED') throw error
+      throw fail('MEMORY_MIGRATION_FAILED', '迁移失败：' + (error?.message ?? 'unknown') + '。原 JSON 未动；可用 storage: json 继续用旧后端。')
+    } finally {
+      try { unlinkSync(lockFile) } catch (error) {}
+    }
+  }
+
+  function createEmptySqlite(api) {
+    const emptyDb = new api.DatabaseSync(dbFile)
+    try {
+      emptyDb.exec('PRAGMA journal_mode = WAL')
+      createDbSchema(emptyDb)
+      metaSetOn(emptyDb, 'schema_version', DB_SCHEMA_VERSION)
+      metaSetOn(emptyDb, 'data_version', SCHEMA_VERSION)
+      metaSetOn(emptyDb, 'next_id', 1)
+      metaSetOn(emptyDb, 'next_seq', 0)
+      metaSetOn(emptyDb, 'write_seq', 1)
+    } finally {
+      try { emptyDb.close() } catch (error) {}
+    }
+  }
+
+  function loadSqliteState() {
+    const api = loadSqliteApi()
+    if (api === null) throw sqliteUnavailable()
+    mkdirSync(storeDir, { recursive: true })
+    if (!existsSync(dbFile)) {
+      if (existsSync(storeFile)) migrateJsonToSqlite(api)
+      else createEmptySqlite(api)
+    }
+    // 打开 + PRAGMA + quick_check 全在一次 try 里：SQLite 是惰性打开的，坏文件往往到第一条语句才暴露。
+    try {
+      db = new api.DatabaseSync(dbFile)
+      db.exec('PRAGMA journal_mode = WAL')
+      db.exec('PRAGMA busy_timeout = 2000')
+      db.exec('PRAGMA synchronous = NORMAL')
+      const quick = db.prepare('PRAGMA quick_check').all()
+      const first = quick.length > 0 ? Object.values(quick[0])[0] : 'ok'
+      if (first !== 'ok') throw new Error('quick_check: ' + String(first))
+    } catch (error) {
+      try { if (db !== null) db.close() } catch (inner) {}
+      db = null
+      storeHealth = 'corrupt'
+      corruptCopy = dbFile
+      return
+    }
+    if (db.prepare('SELECT name FROM sqlite_master WHERE type = ? AND name = ?').get('table', 'meta') === undefined) createDbSchema(db)
+    const dbSchema = Number(metaGet('schema_version') ?? 0)
+    if (dbSchema === 0) {
+      metaSet('schema_version', DB_SCHEMA_VERSION)
+      dbSchemaCacheReset()
+    }
+    if (dbSchema > DB_SCHEMA_VERSION) {
+      const refusal = new Error('dsh-memory 拒绝启动：SQLite 存储 schema ' + dbSchema + ' 高于插件支持的 ' + DB_SCHEMA_VERSION + '。请升级插件或从备份恢复；为避免旧逻辑覆盖新数据，本次拒绝加载。')
+      refusal.code = 'MEMORY_SCHEMA_TOO_NEW'
+      throw refusal
+    }
+    const dataVersion = Number(metaGet('data_version') ?? 0) || 1
+    if (dataVersion > SCHEMA_VERSION) throw schemaTooNewError(dataVersion, SCHEMA_VERSION)
+    const rawRows = db.prepare('SELECT id, payload, tokens, units, sort_len, unit_len, seq FROM entries').all()
+    seqOf.clear()
+    const parsedRows = []
+    for (const row of rawRows) {
+      let parsed = null
+      try { parsed = JSON.parse(row.payload) } catch (error) { parsed = null }
+      if (parsed === null || typeof parsed !== 'object' || typeof parsed.id !== 'string' || typeof parsed.text !== 'string') continue
+      const entry = normalizeEntry(parsed)
+      parsedRows.push({ entry, seq: Number(row.seq ?? 0), row })
+      seqOf.set(entry.id, Number(row.seq ?? 0))
+    }
+    // 顺序对齐 JSON 后端：memory.json 里的生效条目在前，archive.json 里的归档条目在后（各自保持写入顺序）。
+    parsedRows.sort((a, b) => {
+      const archivedA = isArchivedEntry(a.entry) ? 1 : 0
+      const archivedB = isArchivedEntry(b.entry) ? 1 : 0
+      if (archivedA !== archivedB) return archivedA - archivedB
+      return a.seq - b.seq
+    })
+    const rows = parsedRows.map((item) => item.row)
+    const entries = parsedRows.map((item) => item.entry)
+    const maxIdNumber = entries.reduce((max, entry) => {
+      const match = /^m?(\d+)$/.exec(String(entry.id))
+      return match ? Math.max(max, Number(match[1])) : max
+    }, 0)
+    state = {
+      nextId: Math.max(Number(metaGet('next_id') ?? 1) || 0, maxIdNumber + 1),
+      version: dataVersion,
+      entries,
+    }
+    persistedPayloads = new Map()
+    for (const entry of entries) persistedPayloads.set(entry.id, JSON.stringify(entry))
+    indexMirror.clear()
+    for (const row of rows) {
+      if (row.id === undefined) continue
+      indexMirror.set(row.id, { tokens: String(row.tokens ?? ''), units: String(row.units ?? ''), sortLen: Number(row.sort_len ?? 0), unitLen: Number(row.unit_len ?? 0) })
+    }
+    dbWriteSeq = String(metaGet('write_seq') ?? '0')
+    lastDbSignature = dbWriteSeq
+    ensureSqliteIndex()
+  }
+
+  /** 索引自检：FTS/统计表与条目数不一致就重建（迁移中断、外部改库、旧库缺别名都能自愈）。 */
+  function ensureSqliteIndex() {
+    if (db === null) return
+    try {
+      const rowCount = Number(db.prepare('SELECT count(*) AS n FROM entries').get().n)
+      const ftsRow = db.prepare('SELECT count(*) AS n FROM entries_fts').get()
+      const ftsCount = ftsRow === undefined ? 0 : Number(ftsRow.n)
+      const statCount = Number(metaGet('sort_doc_count') ?? 0)
+      if (ftsCount !== rowCount || statCount !== rowCount || indexMirror.size !== rowCount) rebuildIndex()
+      else indexHealthy = true
+    } catch (error) {
+      indexHealthy = false
+    }
+  }
+
+  /** 别名旁路在加载后合入内存：若与 DB payload 不一致，立刻写回（索引随 persist 增量更新）。 */
+  function syncSqliteAliases() {
+    if (db === null) return
+    let changed = false
+    for (const entry of state.entries) {
+      if (persistedPayloads.get(entry.id) !== JSON.stringify(entry)) {
+        changed = true
+        break
+      }
+    }
+    if (!changed) return
+    try {
+      persistSqlite()
+    } catch (error) {
+      // 写失败留给下一次写入重试，不阻断启动
+    }
+  }
+
+  /** 别的进程写过就刷新内存态（等价于 JSON 后端的 mergeWithDisk，靠 meta.write_seq 判断）。 */
+  function refreshSqliteState() {
+    if (db === null) return
+    // 这里必须绕开 metaGet 缓存：write_seq/next_id 是别的进程刚写的，缓存里是旧值。
+    const seq = String(metaGetOn(db, 'write_seq') ?? '0')
+    if (seq === lastDbSignature) return
+    const rows = db.prepare('SELECT id, payload, tokens, units, sort_len, unit_len, seq FROM entries').all()
+    const byId = new Map()
+    for (const row of rows) {
+      let parsed = null
+      try { parsed = JSON.parse(row.payload) } catch (error) { parsed = null }
+      if (parsed === null || typeof parsed !== 'object' || typeof parsed.id !== 'string') continue
+      seqOf.set(row.id, Number(row.seq ?? 0))
+      byId.set(row.id, { entry: normalizeEntry(parsed), tokens: String(row.tokens ?? ''), units: String(row.units ?? ''), sortLen: Number(row.sort_len ?? 0), unitLen: Number(row.unit_len ?? 0) })
+    }
+    const next = []
+    const seen = new Set()
+    for (const entry of state.entries) {
+      const disk = byId.get(entry.id)
+      if (disk === undefined) {
+        if (persistedPayloads.has(entry.id)) continue
+        next.push(entry)
+        seen.add(entry.id)
+        continue
+      }
+      seen.add(entry.id)
+      const mine = Date.parse(entry.updatedAt ?? '') || 0
+      const theirs = Date.parse(disk.entry.updatedAt ?? '') || 0
+      const winner = mine >= theirs ? entry : disk.entry
+      next.push(winner)
+      if (winner === disk.entry) persistedPayloads.set(entry.id, JSON.stringify(disk.entry))
+      if (winner === disk.entry) indexMirror.set(entry.id, { tokens: disk.tokens, units: disk.units, sortLen: disk.sortLen, unitLen: disk.unitLen })
+    }
+    for (const [id, disk] of byId) {
+      if (seen.has(id)) continue
+      next.push(disk.entry)
+      persistedPayloads.set(id, JSON.stringify(disk.entry))
+      indexMirror.set(id, { tokens: disk.tokens, units: disk.units, sortLen: disk.sortLen, unitLen: disk.unitLen })
+    }
+    // 与加载顺序同口径：生效在前、归档在后；组内按 seq。
+    next.sort((a, b) => {
+      const archivedA = isArchivedEntry(a) ? 1 : 0
+      const archivedB = isArchivedEntry(b) ? 1 : 0
+      if (archivedA !== archivedB) return archivedA - archivedB
+      return (seqOf.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (seqOf.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+    })
+    state.entries = next
+    const maxIdNumber = state.entries.reduce((max, entry) => {
+      const match = /^m?(\d+)$/.exec(String(entry.id))
+      return match ? Math.max(max, Number(match[1])) : max
+    }, 0)
+    state.nextId = Math.max(Number(metaGetOn(db, 'next_id') ?? state.nextId), maxIdNumber + 1)
+    state.version = Math.max(state.version, Number(metaGetOn(db, 'data_version') ?? state.version))
+    dbMetaCache.set('next_id', String(state.nextId))
+    dbMetaCache.set('write_seq', seq)
+    dbMetaCache.set('data_version', String(state.version))
+    lastDbSignature = seq
+  }
+
+  function persistSqlite() {
+    if (storeHealth === 'corrupt') return false
+    if (db === null) return false
+    try {
+      ensureDailyBackupSqlite()
+      refreshSqliteState()
+      const payloads = new Map()
+      for (const entry of state.entries) payloads.set(entry.id, JSON.stringify(entry))
+      const upserts = []
+      for (const [id, payload] of payloads) if (persistedPayloads.get(id) !== payload) upserts.push([id, payload])
+      const deletes = []
+      for (const id of persistedPayloads.keys()) if (!payloads.has(id)) deletes.push(id)
+      db.exec('BEGIN IMMEDIATE')
+      try {
+        const insert = db.prepare('INSERT INTO entries(id, payload, updated_at, seq, tokens, units, sort_len, unit_len) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, tokens = excluded.tokens, units = excluded.units, sort_len = excluded.sort_len, unit_len = excluded.unit_len')
+        let nextSeq = Number(metaGet('next_seq') ?? state.entries.length)
+        for (const [id, payload] of upserts) {
+          const entry = state.entries.find((item) => item.id === id)
+          if (entry === undefined) continue
+          const oldMirror = indexMirror.get(id)
+          const terms = indexTermsOf(entry)
+          const units = indexUnitsOf(entry)
+          const tokensText = countsToText(terms)
+          const unitsText = countsToText(units)
+          const sortLen = countsLength(terms)
+          const unitLen = countsLength(units)
+          const seqRow = db.prepare('SELECT seq FROM entries WHERE id = ?').get(id)
+          const seq = seqRow === undefined ? nextSeq++ : Number(seqRow.seq)
+          insert.run(id, payload, String(entry.updatedAt ?? ''), seq, tokensText, unitsText, sortLen, unitLen)
+          seqOf.set(id, seq)
+          applyIndexEntry(entry, oldMirror)
+          persistedPayloads.set(id, payload)
+        }
+        for (const id of deletes) {
+          db.prepare('DELETE FROM entries WHERE id = ?').run(id)
+          removeIndexEntry(id)
+          seqOf.delete(id)
+          persistedPayloads.delete(id)
+        }
+        metaSet('next_seq', nextSeq)
+        metaSet('next_id', state.nextId)
+        metaSet('data_version', state.version)
+        const writeSeq = Number(metaGet('write_seq') ?? 0) + 1
+        metaSet('write_seq', writeSeq)
+        db.exec('COMMIT')
+        lastDbSignature = String(writeSeq)
+      } catch (error) {
+        try { db.exec('ROLLBACK') } catch (inner) {}
+        throw error
+      }
+      syncAliases()
+      recordHistoryDiff()
+      return true
+    } catch (error) {
+      if (error instanceof Error && (error.message.startsWith('SQLite 存储写入失败') || error.message.includes('SQLITE_BUSY'))) throw error
+      storeHealth = 'readonly'
+      throw fail('MEMORY_STORE_WRITE_FAILED', 'SQLite 存储写入失败（' + (error?.message ?? 'unknown') + '）。本次写入没有生效，别当成已保存；可用 storage: json 回滚后重试。')
+    }
+  }
+
+  function dbSchemaCacheReset() {
+    dbMetaCache.clear()
+  }
+
+  // ---------- v4.1（P2.2）：FTS5 候选集 + 统计 ----------
+  // 为什么不是「FTS5 的 bm25」：排序公式（BM25 K1/B + tag×2 + alias×2.5 + 扩展×0.2 + STALE_PENALTY）在应用层，
+  // 换成 FTS5 内置 bm25 = 换公式（红线 1）。所以 FTS5 只做两件事：候选集召回 + df 查表；分数仍按原公式算。
+  function ftsCandidateIds(terms) {
+    if (db === null) return null
+    const phrases = []
+    for (const term of terms) {
+      const clean = String(term ?? '')
+      if (clean === '') continue
+      phrases.push('"' + clean.replace(/"/g, '""') + '"')
+    }
+    if (phrases.length === 0) return null
+    try {
+      const rows = db.prepare('SELECT id FROM entries_fts WHERE tokens MATCH ?').all(phrases.join(' OR '))
+      const ids = new Set()
+      for (const row of rows) ids.add(row.id)
+      return ids
+    } catch (error) {
+      indexHealthy = false
+      return null
+    }
+  }
+
+  function indexDf(term) {
+    try {
+      const row = db.prepare('SELECT df FROM term_df WHERE term = ?').get(term)
+      return row === undefined ? 0 : Number(row.df)
+    } catch (error) {
+      indexHealthy = false
+      return 0
+    }
+  }
+
+  /** memory_search 语料的统计量 = 全量 df/计数 − invalidAt 已失效条目的贡献（与 scoreEntries 收到的 docs 集合逐位对齐）。 */
+  function searchCorpusStats() {
+    const invalidDocs = []
+    for (const entry of state.entries) if (isInvalidEntry(entry)) invalidDocs.push(bm25Doc(entry))
+    const totalCount = Number(metaGet('sort_doc_count') ?? 0)
+    const totalLen = Number(metaGet('sort_len_sum') ?? 0)
+    let invalidLen = 0
+    for (const doc of invalidDocs) invalidLen += doc.length
+    const docCount = Math.max(0, totalCount - invalidDocs.length)
+    const avgLen = docCount > 0 ? (totalLen - invalidLen) / docCount : 1
+    const dfCache = new Map()
+    return {
+      docCount,
+      avgLen,
+      df(term) {
+        const cached = dfCache.get(term)
+        if (cached !== undefined) return cached
+        let value = indexDf(term)
+        for (const doc of invalidDocs) if (doc.terms.has(term)) value -= 1
+        const result = Math.max(0, value)
+        dfCache.set(term, result)
+        return result
+      },
+    }
+  }
+
+  /** 与 scoreEntries 公式逐位相同的候选打分（只对 FTS5 候选集算；差分测试要求与全量扫描 top-k/score 逐位一致）。 */
+  function scoreEntriesIndexed(searchable, query) {
+    if (db === null || !indexHealthy) return null
+    const queryTerms = tokenize(query)
+    const expansion = expandQuery(query)
+    if (queryTerms.size === 0 && expansion.size === 0) {
+      const zeros = []
+      for (const entry of searchable) zeros.push({ entry, score: 0 })
+      return zeros
+    }
+    const weights = new Map()
+    for (const term of queryTerms.keys()) weights.set(term, 1)
+    for (const [term, weight] of expansion) if (!weights.has(term)) weights.set(term, weight)
+    const candidateIds = ftsCandidateIds([...weights.keys()])
+    if (candidateIds === null) return null
+    const searchableById = new Map()
+    for (const entry of searchable) searchableById.set(entry.id, entry)
+    const stats = searchCorpusStats()
+    const today = localDateOf()
+    const scored = []
+    for (const id of candidateIds) {
+      const entry = searchableById.get(id)
+      if (entry === undefined) continue
+      const doc = bm25Doc(entry)
+      let score = 0
+      for (const [term, weight] of weights) {
+        const frequency = doc.terms.get(term) ?? 0
+        if (frequency === 0) continue
+        const hit = stats.df(term)
+        const idf = Math.log(1 + (stats.docCount - hit + 0.5) / (hit + 0.5))
+        const tagBoost = doc.tagText.includes(term) ? BM25_TAG_WEIGHT : 1
+        const aliasBoost = doc.aliasTerms.has(term) ? BM25_ALIAS_WEIGHT : 1
+        score += weight * tagBoost * aliasBoost * idf * ((frequency * (BM25_K1 + 1)) / (frequency + BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / stats.avgLen)))
+      }
+      if (isStaleEntry(entry, today)) score *= STALE_PENALTY
+      if (score > 0.0001) scored.push({ entry, score })
+    }
+    return scored
+  }
   const requireWritable = () => {
     if (storeHealth !== 'corrupt') return
     throw fail('MEMORY_STORE_CORRUPT', 
@@ -1934,6 +2863,8 @@ export function apply(ctx, config) {
 
   /** v3.20：把归档文件里的条目并回内存态（主库同 id 的条目优先，归档只补缺）。 */
   function loadArchive() {
+    // v4.1：SQLite 后端主表里已含归档条目（archived 语义由 status/supersededBy/invalidAt 判定），无需再并一次。
+    if (backend === 'sqlite') return
     const archived = readArchiveEntries()
     if (archived.length === 0) return
     const seen = new Set(state.entries.map((entry) => entry.id))
@@ -2080,6 +3011,11 @@ export function apply(ctx, config) {
    * 否则两个进程各自按自己的 nextId 发号，会分到同一个 id（实测 A、B 都是 m1）。
    */
   function refreshBeforeWrite() {
+    // v4.1：SQLite 后端靠 WAL + write_seq 合并，不用 JSON 的锁文件/mergeWithDisk。
+    if (backend === 'sqlite') {
+      if (db !== null) refreshSqliteState()
+      return
+    }
     const release = acquireLock()
     try {
       mergeWithDisk()
@@ -2138,6 +3074,7 @@ export function apply(ctx, config) {
   }
 
   function persist() {
+    if (backend === 'sqlite') return persistSqlite()
     if (storeHealth === 'corrupt') return false
     ensureDailyBackup()
     // v3.10（B02）：跨进程互斥 + 写前合并。见 acquireLock / mergeWithDisk 的注释。
@@ -2208,6 +3145,7 @@ export function apply(ctx, config) {
   }
 
   function load() {
+    if (backend === 'sqlite') return loadSqliteState()
     let raw = ''
     try {
       raw = readFileSync(storeFile, 'utf8')
@@ -2281,6 +3219,10 @@ export function apply(ctx, config) {
   resetHistoryBaseline()
   loadAliases()
   applyAliases()
+  if (backend === 'sqlite' && db !== null) {
+    ensureSqliteIndex()
+    syncSqliteAliases()
+  }
   loadCandidates()
 
   // v2.9：候选池 TTL——过期未确认的自动标记 expired（保留记录，不删）。
@@ -2675,7 +3617,17 @@ export function apply(ctx, config) {
         const idHits = [...new Set(query.match(/m\d+/g) ?? [])]
           .map((id) => searchable.find((entry) => entry.id === id))
           .filter((entry) => entry !== undefined)
-        const scored = scoreEntries(searchable, query)
+        // v4.1（P2.2）：默认走 FTS5 候选集 + df 统计（公式不变）；索引不可用/差分不过时回退全量扫描。
+        let scoredRaw = null
+        if (backend === 'sqlite' && retrievalMode === 'index') {
+          try {
+            scoredRaw = scoreEntriesIndexed(searchable, query)
+          } catch (error) {
+            scoredRaw = null
+          }
+        }
+        if (scoredRaw === null) scoredRaw = scoreEntries(searchable, query)
+        const scored = scoredRaw
           .filter((item) => item.score > 0.0001 && !idHits.some((entry) => entry.id === item.entry.id))
           .sort(
             (a, b) =>
@@ -2685,7 +3637,10 @@ export function apply(ctx, config) {
         if (idHits.length > 0) scored.unshift(...idHits.map((entry) => ({ entry, score: 1e6 })))
         const top = scored.slice(0, limit)
         countUsage(top.map((item) => item.entry.id))
-        flushUsage()
+        // v4.1（P2.2）：用量计数只是记账，不再「每次搜索都整库落盘」——
+        // 10k 条时那一次 persist（JSON.stringify 全量 + 读回合并）会把单次搜索从 <20ms 拖到 100ms+。
+        // 与注入路径同口径：距上次落盘 > 60s 才 flush；中间的任何写操作也会顺带把用量写回。
+        if (usageDirty && Date.now() - lastUsageFlush > 60000) flushUsage()
         // v3.15：搜索侧补「证据充分性」信号（学 arXiv 2610.22668：相关 ≠ 充分证据）。
         // 之前只滤 score>0.0001，问「MySQL 索引优化」也会吐 8 条 —— 有结果不等于有答案。
         // 不砍结果（砍了会把「库里没有」误报成「有但不相关」），只给结论加一个可判读的信号。
@@ -4310,13 +5265,15 @@ export function apply(ctx, config) {
 
         let storeExists = false
         let storeBytes = 0
+        // v4.1：SQLite 后端下「存储文件」是 memory.db；memory.json 只作迁移源/回滚备份保留。
+        const statusStoreFile = backend === 'sqlite' ? dbFile : storeFile
         try {
-          storeExists = existsSync(storeFile)
-          if (storeExists) storeBytes = statSync(storeFile).size
+          storeExists = existsSync(statusStoreFile)
+          if (storeExists) storeBytes = statSync(statusStoreFile).size
         } catch (error) {
           note('MEMORY_STORE_UNREADABLE', '读不到记忆库文件：' + (error?.message ?? 'unknown'))
         }
-        if (storeExists) {
+        if (storeExists && backend !== 'sqlite') {
           try {
             const parsed = JSON.parse(readFileSync(storeFile, 'utf8'))
             if (parsed === null || typeof parsed !== 'object' || !Array.isArray(parsed.entries)) {
@@ -4337,7 +5294,7 @@ export function apply(ctx, config) {
           unavailableReason: problems.join('；'),
           ...(ready ? {} : { code: code || 'MEMORY_STORE_UNREADABLE' }),
           storeDir,
-          storeFile,
+          storeFile: statusStoreFile,
           storeExists,
           storeBytes,
           storeWritable: writable.ok,

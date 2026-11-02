@@ -1,3 +1,43 @@
+# CHANGELOG
+
+本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
+格式：Keep a Changelog；版本号跟 `package.json`。
+
+## v4.1.0 — 2026-11-02
+
+标题：「换底座、不换公式」——存储从 JSON 整库重写换成 SQLite 单文件（P2.1），检索从全量遍历换成 FTS5 候选集 + df 统计（P2.2）；打分公式一行没改、14 工具 schema 逐位不变、两条回滚路。依据 `_reports/memory-storage-bench-2026-11-02.json`：10000 条时 JSON 全量读 65.4ms / 写 32.1ms，先破百的是检索遍历（5000 条 171.3ms、10000 条 319.4ms，瓶颈是每轮重新分词）——所以先换存储是「为增长留余量」，检索热路径才用候选集解决。
+
+### 存储（P2.1）
+- 新增 SQLite 后端：`storeDir/memory.db` 单文件（`node:sqlite` 内置模块，零依赖），`journal_mode=WAL` + `busy_timeout=2000` + `synchronous=NORMAL`；`meta` 表存 `data_version` / `next_id` / `schema_version` / `write_seq`，`entries` 表存全字段 `payload` + 写入顺序 `seq` + 检索词表。
+- 首次以 `storage: 'sqlite'` 启动自动迁移（无需手工命令）：迁移锁 → JSON 四件套备份到 `backups/pre-sqlite-<ts>/`（manifest 带 sha256）→ 临时库单事务写入 → **回读 canonicalJson 逐字段比对** → 通过才原子改名；失败删临时库并拒绝启动，原 JSON 不动。
+- `memory.json` / `archive.json` 在 SQLite 后端下只读保留（迁移源 + 回滚备份），不再被写；`aliases.json` 仍随每次落盘同步（防丢副本，条目里也存一份）；`candidates.json` / `history.jsonl` / `review-latest.md` 位置与行为不变。
+- 写路径只提交脏行（payload 变更 + 删除），不再整库 stringify/rename；多进程靠 WAL + `meta.write_seq` 合并（双实例写入不丢条、id 不冲突）。
+- 用量计数（`usedCount` / `lastUsedAt`）仍即时进内存，但最多延迟 60s 落盘（旧实现每次 `memory_search` 都整库写，10k 条时是 30–60ms 写放大）；崩溃最多丢最近 60s 的使用计数，不影响正文。
+- 加载/刷新顺序与旧后端对齐：生效在前、归档在后，组内按 `seq`。独立差分曾发现「重载后归档条目位置不同」，已修。
+- SQLite 后端不再走旧 `persist()` 在 Windows 上被吞的 fsync 路径（只读句柄报 EPERM）；刷盘交给 WAL + `synchronous=NORMAL`，旧 JSON 后端保留原样。
+- 每日备份改为 `VACUUM INTO memory.db.bak-YYYYMMDD`（自包含快照，含 WAL 数据），`BACKUP_KEEP=10` 口径不变；DB `quick_check` 失败进入 corrupt 只读保护态，不覆盖/不删除原文件。
+- `schemaTooNewError` 扩展到 SQLite：`meta.schema_version` 高于插件支持时抛 `MEMORY_SCHEMA_TOO_NEW` 拒绝启动，旧逻辑绝不覆盖新数据。
+- 回滚：`config.storage = 'json'` 切回 v4.0.1 的 JSON 后端（代码完整保留）；配套 `_ops/memory-rollback-sqlite.mjs`（`--dry-run` / `--apply`）把 DB 导出成旧后端可读的 JSON，只读 DB、不删库。
+
+### 检索（P2.2）
+- 新增 `retrieval: 'index'`（生产默认）：两张 FTS5 表只做**候选集召回 + df 统计**，打分仍用原 `scoreEntries` 公式（BM25 K1/B + tag×2 + alias×2.5 + 同义扩展 + 过期惩罚）——公式一行未改，排序逐位一致由差分测试把关。
+- token/unit 列全部由应用层 `tokenize()` / `contentUnitsOf()` 生成后空格分隔入库；FTS5 分词器只挂 `unicode61 tokenchars '-_.'`，**绝不让默认分词器直接吃中文原文**（连续中文会被当成一个巨大 token）。
+- `term_df` / `unit_df` 增量维护；启动自检发现 FTS 行数/统计量与 `entries` 不一致就整表重建（索引是可重建的派生数据）。
+- 回退：`retrieval: 'scan'` 回退 v4.0.1 的全量遍历；`storage: 'json'` 时自动走全量遍历。
+- 性能（交付报告 §4.2，合成 10k 条真实词表长尾）：单次 `memory_search` 旧 181.1ms → 新 **21ms 中位 / 29ms p95**；最坏情况（低熵重复语料、候选接近全库）50ms。真库 110 条时新路径含工具层约 18ms（旧约 2ms）——小库固定开销，收益在 5000+ 条才显现。
+- 接口零变化：14 个工具的参数/返回 schema 逐位一致（`node _ops/memory-tool-schema.mjs --compare _reports/memory-tool-schema-before.json` 通过）；`memory_status.storeFile` 在 SQLite 后端指向 `memory.db`。
+
+### 测试与文档
+- 新增 `_selftest/tests/memory-sqlite.test.mjs`（9 组断言 / 源码内 42 条 `assert` 通过）：迁移备份与 manifest sha256、`memory.json` 不动、回读逐字段一致、注入块逐字节一致；14 条查询在 json / sqlite-index / sqlite-scan 三后端 top-k 与 score 逐位一致；11 个工具调用（add/update/remove/restore/merge/audit/history/review/export/candidates/status）全通；重载落盘；FTS/df 清空后自愈；schemaTooNew；`storage: json` 回滚开关；损坏 DB 保护；双实例并发写不丢条。
+- 旧套件 `_selftest/tests/memory.test.mjs` 131 项仍全过（JSON 后端仍是代码默认值，向后兼容）；`node --check index.js` 通过。
+- **真机（2026-11-02 22:54 本地，零重启）**：重载后首次以 `sqlite` 启动完成迁移（真库 110 条耗时 115ms，`memory.db` 221 KB）；`memory_status` 返回 `ready=true`、`storeFile` 指向 `…\memory.db`、`entries=110`（88 生效 + 22 归档）、`usedChars=7848/12000`、`schemaVersion=2`；生成 `backups/pre-sqlite-20261102145425/`（manifest 带 sha256）与当日 `memory.db.bak-20261102`；迁移后 `memory.json` 的 sha256 与迁移前 manifest 一致。14 工具真机各调一遍通过（临时条目已清干净，终态回到 110/88/7848）。
+- **独立差分**（另一执行者独立编写脚本 `_ops/memory-diff-search.mjs`，旧 v4.0.1 冻结副本 vs 新插件，真库只读副本）：225 条查询 ×（limit=5 判据层 + limit=20 全量层）+ 列表 + 注入 + 写路径 + 重载 + live DB 只读补充差分，**1372/1372 项检查逐位一致 / 不一致 0**（脚本对插件 sha256 归因）；真库 4 个 JSON 的 sha256 前后不变。报告 `_reports/memory-diff-search-2026-11-02.json`（交付报告 `_reports/dsh-memory-p2-delivery-2026-11-02.md`）。
+- **验证门**：`npm run check` 通过（测试门全量 33 个测试，含新增 `memory-sqlite.test.mjs` 9 组）。
+- 文档：README 新增「存储后端（v4.1）」「迁移与回滚」两节，并更新顶部数据位置/版本、工具表（补全 14 个）、机制与配置示例；`memory-OPS.md` 补 SQLite 备份/回滚/健康检查；`package.json` 版本 4.0.1 → 4.1.0、`engines.node` → `>=23.4.0`。
+
+### 备注
+- 生效方式：插件是 pnpm link 安装，需重载 bundle（或重启 DSH）后新代码才进进程；本机数据目录的首次迁移发生在重载之后。
+- 升级前不用手工备份：自动迁移自带 `backups/pre-sqlite-*`；想多一层保障可先复制 `memory.json`。
 
 ## v4.0.0 — 2026-11-01
 
@@ -22,10 +62,6 @@
 - 单测：**131 项通过**（新增 v4.0 五组：纯函数 / 冲突四条路径 / invalidAt 不注入不检索 / audit 触发线 / 导出回读）。
 - `node --check index.js` 通过；`npm run check` 三道门见验证记录。
 - **生效需重启 DSH**（插件 index.js 只在启动时求值）。
-# CHANGELOG
-
-本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
-格式：Keep a Changelog；版本号跟 `package.json`。
 
 ## v3.27.0 — 2026-10-31
 

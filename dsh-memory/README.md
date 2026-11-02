@@ -5,8 +5,9 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 学的是谁：Hermes Agent 的 `MEMORY.md` / `USER.md`，Claude Code 的用户级 `CLAUDE.md`。DSH 官方没有对应能力，这是补齐的最大一块。
 
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
-- **数据位置**：`D:\AI\dsh-data\memory\memory.json`（bundle patch 的 `storeDir`，不落 C 盘）
+- **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
+- **版本 / 引擎**：v4.1.0（2026-11-02）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
 ## 工具
 
@@ -20,7 +21,12 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 | `memory_audit` | 只读审计（给模型）：重复候选（bigram 相似度）、过期候选（从未使用且 >N 天）、使用排行、scope 分布、预算 |
 | `memory_review` | 记忆概览（给人看，v2.8）：已过期 / 未证实 / 从未引用 / 硬规则四段 + scope 分布 + 容量，写入 `review-latest.md` |
 | `memory_remove` | 删某条（物理删除；要留历史用 `memory_update` 的 supersede） |
-| `memory_status` | 只读诊断（v4.2）：**现算** `ready`（损坏保护 / 只读降级 / 主库可解析 / 数据目录真的可写），给出 `unavailableReason` + `code`、库路径与字节数、条目数与预算占用 |
+| `memory_restore` | 把归档条目恢复为生效（只接受预算保护挤掉的、未被取代的条目）；库满时拒绝 |
+| `memory_history` | 只读 append-only 变更日志 `history.jsonl`（add / update / remove，含时间戳与被删正文），可按 id / event 过滤 |
+| `memory_purge` | 物理删除**归档**条目，必须 `confirm: true`；生效记忆不动，支持 `ids` / `olderThanDays` |
+| `memory_export` | 把每条记忆导出成 Obsidian 兼容 Markdown 卡（YAML frontmatter + 正文），导出后回读校验 `verified` |
+| `memory_candidates` | 影子候选池：`list` / `accept` / `reject` / `clear`（规则抓取，零模型调用，不自动入库） |
+| `memory_status` | 只读诊断（v4.0.x）：**现算** `ready`（损坏保护 / 只读降级 / 主库可解析 / 数据目录真的可写），给出 `unavailableReason` + `code`、库路径与字节数、条目数与预算占用；v4.1 起 `storeFile` 在 SQLite 后端指向 `memory.db` |
 
 ## 机制
 
@@ -40,8 +46,8 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
    - 实测：25 条 / 3320 正文字符时，全量注入 3488 字符 → 分层后 1387 字符（**省 60%**）。`maxInjectChars` 约束的是正文行，头部/索引/页脚另有约 150–200 字符固定开销。
 
 2. **不做会话内冻结快照**（和 Hermes 不同）：Hermes 冻结是为了缓存稳定，但 DSH 本来就每步重新装配 context，记忆又只在显式增删改时变化，频率极低。牺牲这点缓存换"刚记住的下一步就生效"，更符合实际用法。
-3. **超预算拒绝写入**，不自动淘汰：上限 4000 字符（可配 `maxBytes`），超了就让 agent 先看 `memory_list` 再 `memory_remove`，避免悄悄丢用户信息。
-4. **纯文本 JSON 存储**，原子写（临时文件 + rename），不写会话日志、不新增事件类型。
+3. **超预算拒绝写入**，不自动淘汰：上限 12000 字符（可配 `maxBytes`），超了就让 agent 先看 `memory_list` 再 `memory_remove`，避免悄悄丢用户信息。
+4. **存储后端（v4.1）**：默认 SQLite 单文件 `memory.db`（WAL，只写脏行），`storage: json` 保留为回滚开关；迁移、备份、回滚见下文「存储后端（v4.1）」「迁移与回滚」。不写会话日志、不新增事件类型。
 
 ## 配置
 
@@ -51,11 +57,128 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
       name: '@local/dsh-memory'
       config:
         storeDir: 'D:\AI\dsh-data\memory'   # 数据放哪
-        maxBytes: 8000                      # 存储预算（字符），超了拒绝写入
-        maxInjectChars: 1200                # 每轮注入预算（字符），成本封顶
+        storage: 'sqlite'                   # v4.1：sqlite（单文件 memory.db）/ json（回滚旧 JSON 后端）
+        retrieval: 'index'                  # v4.1：index（FTS5 候选集 + df 统计）/ scan（回退全量遍历）
+        maxBytes: 12000                     # 存储预算（字符），超了拒绝写入
+        maxInjectChars: 2500                # 每轮注入预算（字符），成本封顶
         captureCandidates: true             # 用户消息自动沉淀到候选池（v2.2）
         captureRuleFiles: false             # 规则文件沉淀（v3.26，默认 true；规则已在 AGENTS/rules 里时建议关）
 ```
+
+## 存储后端（v4.1）
+
+v4.1 把持久化层从「整库 JSON 重写」换成 **SQLite 单文件**（`node:sqlite` 内置模块，零第三方依赖），JSON 后端完整保留为回滚开关。14 个工具的参数与返回 schema 未变。
+
+### 两种后端
+
+| `storage` | 数据落点 | 说明 |
+|---|---|---|
+| `sqlite` | `storeDir/memory.db`（另有 `-wal` / `-shm`） | 生产配置（插件自带 `cordis.patch.yml`）；条目按「全字段 JSON payload + 写入顺序 `seq` + 检索词表」入库 |
+| `json` | `storeDir/memory.json` + `archive.json` | v4.0.1 及更早的实现完整保留，行为不变；回滚用 |
+
+- 代码默认值仍是 `json`（旧数据目录 / 旧测试 / 回滚场景零改动）；生产以 bundle patch 的 `storage: 'sqlite'` 为准。
+- SQLite 后端下 `memory.json` / `archive.json` **原样保留、不再写入**（迁移源 + 回滚备份）；`aliases.json` 仍随每次落盘同步（防丢副本，条目里也存一份）；`candidates.json` / `history.jsonl` / `review-latest.md` 位置与行为不变。
+
+### 行为变化（v4.1）
+
+- 用量计数（`usedCount` / `lastUsedAt`）仍即时进内存，但**最多延迟 60s 落盘**（旧实现每次 `memory_search` 都整库写，10k 条时是 30–60ms 写放大）。进程崩溃最多丢最近 60s 的使用计数，不影响记忆正文。
+- 加载/刷新顺序与旧后端对齐：**生效在前、归档在后**，组内按写入顺序（`seq`）——独立差分曾发现「重载后归档条目位置不同」，已修。
+- SQLite 后端不再走旧 `persist()` 在 Windows 上被吞的 fsync 路径（只读句柄报 EPERM）；刷盘交给 SQLite WAL + `synchronous=NORMAL`。旧 JSON 后端保留原样。
+
+### 怎么确认当前后端
+
+- `memory_status.storeFile`：以 `memory.db` 结尾 = SQLite；以 `memory.json` 结尾 = JSON。
+- `memory_status` 的 `storeBytes` 是当前后端文件的字节数；`ready` / `health` / `storeWritable` 口径不变。
+- 配置已是 `sqlite` 但 `memory.db` 还不存在 = 还没迁移；下次加载会自动迁移（见下节）。
+
+### 备份
+
+- 迁移前（一次性）：`storeDir/backups/pre-sqlite-<YYYYMMDDHHmmss>/`，内含 `memory.json` / `archive.json` / `aliases.json` / `candidates.json` 与 `manifest.json`（字节数 + sha256）。
+- 日常（自动）：每天第一次写入前 `VACUUM INTO storeDir/memory.db.bak-YYYYMMDD`（WAL 数据已合并的自包含快照），保留最近 10 份，超出按 mtime 清理。
+- 手动：在数据目录执行 `Copy-Item memory.db.bak-YYYYMMDD memory.db.bak-manual-<日期>`。**WAL 模式下不要只拷 `memory.db`**——同目录还有 `memory.db-wal` / `memory.db-shm`，只拷主文件可能缺最近提交；`.bak-*` 才是完整快照。
+
+### FTS5 候选检索（P2.2）
+
+`retrieval: 'index'`（生产默认）时检索分两步：
+
+1. **候选集 + 统计**：两张 FTS5 表（`entries_fts` 排序词表 / `entries_unit_fts` 覆盖率单元表）召回候选 id，`term_df` / `unit_df` 提供 df 统计；
+2. **应用层打分**：仍走原来的 `scoreEntries` 公式（BM25 K1/B + tag×2 + alias×2.5 + 同义扩展 + 过期惩罚），一行未改。
+
+**为什么分词必须在应用层**：FTS5 默认分词器（unicode61）会把连续中文当成一个超长 token，中文查询基本命中不了。所以 token 列全部由插件现有 `tokenize()` / `contentUnitsOf()` 生成、空格分隔后入库；FTS5 分词器只挂 `unicode61 tokenchars '-_.'`，保住 `dsh-memory` / `index.js` / `v4.0.1` 这类词不被拆碎。**绝不让默认分词器直接吃中文原文。**
+
+- 索引是派生数据：启动自检发现 FTS 行数 / 统计量与 `entries` 不一致就整表重建；写路径增量维护 df。
+- 回退：`retrieval: 'scan'` → 回到 v4.0.1 的全量遍历（打分与结果逐位一致，单测差分把关）。
+
+### 性能判据（为什么换底座）
+
+| 体量 | JSON 全量读 | JSON 全量写 | 旧全量遍历（冷 / 热） |
+|---|---|---|---|
+| 10000 条 | 65.4 ms | 32.1 ms | 308.5 / 319.5 ms |
+
+- 数字来自 `_ops/memory-storage-bench.mjs`（只读、可复跑，N=7 中位），原始数组与 p95/max 见 `_reports/memory-storage-bench-2026-11-02.json`。
+- 结论不是「JSON 慢」：到 1 万条，JSON 全量读写都没破 100ms；**先破百的是检索遍历**（5000 条首次分词 171.3ms），瓶颈是每轮重新分词（分词缓存上限 4000 段）。所以 P2.1 只换存储（为增长留余量），P2.2 用 FTS5 把「全量遍历」变成「候选集」。
+- 基准时点真库 87 条，旧路径每步都在 5ms 内（同一份 JSON 的 `realBaseline`）——P2 是给 5000+ 条准备的余量，不是当前体量的救火。
+
+换完后的复测（同一套合成 10k 语料，真实词表长尾；来源 `_reports/dsh-memory-p2-delivery-2026-11-02.md` §4.2）：
+
+| 场景 | v4.0.1（JSON + 全量扫描） | v4.1（SQLite + FTS5 候选） |
+|---|---|---|
+| 10k 条单次 `memory_search` | 181.1 ms | 21 ms 中位 / 29 ms p95 |
+| 最坏情况（低熵重复语料，候选接近全库） | 181 ms | 50 ms |
+
+- 真库 110 条时新路径单次约 18ms（含工具层 / harness 开销），旧路径约 2ms——小库有固定开销，收益在 5000+ 条（候选集缩小遍历）才显现；别拿小库的 18ms 判断「变慢了」。
+
+## 迁移与回滚
+
+### 自动迁移（JSON → SQLite）
+
+`storage: 'sqlite'` 且 `storeDir/memory.db` 不存在时，下次加载自动迁移：
+
+1. 抢迁移锁 `memory.db.migrating`（写 pid；并发启动只允许一个迁移者，锁残留会报 `MEMORY_MIGRATION_LOCKED`）；
+2. 备份 JSON 四件套到 `storeDir/backups/pre-sqlite-<ts>/`（manifest 带 sha256）；
+3. 在临时库 `memory.db.migrating-<pid>` 建表并单事务写入全部条目（含归档；别名旁路并入条目）；
+4. **回读逐字段比对**：DB 读出的条目与源数据做 canonical JSON 比对，不一致就删临时库并拒绝启动，原 JSON 不动；
+5. 通过后原子改名成 `memory.db`、删锁；索引在启动自检里补齐或重建。
+
+- `memory.db` 已存在则不再导入（幂等）；`memory.json` 不再被写。
+- `memory.db` 与 `memory.json` 都不存在：建空库。
+- 迁移失败是 fail-loud：插件拒绝启动并在错误里指明「可用 storage: json 继续用旧后端」，不会拿半个库顶上。
+
+迁移后的判据：`memory_status.ready === true`、`storeFile` 以 `memory.db` 结尾、`entries/active/usedChars` 与迁移前一致。单测另断言「迁移后 `memory.json` 逐字节不变」「`memory_list` 注入块逐字节不变」。
+
+### 回滚到 JSON 后端
+
+保留 DB、导出后切开关：
+
+```powershell
+# 在工作区根 D:\AI-date\dsh-date\dsh-创建 执行；默认读 D:\AI\dsh-data\memory，换目录加 --store-dir <路径>
+node _ops\memory-rollback-sqlite.mjs --dry-run   # 预览：总条数 = 生效 + 归档、nextId、别名数
+node _ops\memory-rollback-sqlite.mjs --apply     # 导出 memory.json / archive.json / aliases.json（先备份现有 JSON 到 backups\pre-rollback-<ts>\）
+```
+
+然后把 `cordis.patch.yml` 的 `storage` 改成 `'json'`，重载插件；`memory.db` 保留不删（取证 / 再迁移用）。脚本只读 DB、绝不删库；导出后回读核对条目数，不一致退出码 1。
+
+### 从迁移前备份恢复
+
+用于「迁移失败后不想继续」或「DB 坏了」：
+
+1. 把 `storage` 改成 `'json'` 并重载插件（避免启动时再碰 DB）；
+2. `storeDir/backups/pre-sqlite-<ts>/` 里的 JSON 复制回 `storeDir`（覆盖前先手动备份现有文件）；
+3. `memory_status.storeFile` 确认指回 `memory.json`，用 `memory_list(includeArchived: true)` 核对条数；
+4. `memory.db` 改名留证（例如 `memory.db.corrupt-<日期>`），确认无用后再按删除三查清理。
+
+> 注意：`_tools/restore-memory-backup.ps1` 只认 `memory.json.bak-*`，`_tools/memory-doctor.mjs` 只读 `memory.json`——两者都是 JSON 时代的工具。SQLite 后端下的健康检查与判据以 `memory_status` 为准（详见 [memory-OPS.md](memory-OPS.md)）。
+
+### 本机迁移验证（2026-11-02，真机）
+
+| 项 | 结果 |
+|---|---|
+| 迁移 | 重载后首次以 `storage: sqlite` 启动自动完成（真库 110 条耗时 115ms，`memory.db` 221 KB）；生成 `backups/pre-sqlite-20261102145425/`（4 个 JSON + manifest 含 sha256）与当日 `memory.db.bak-20261102` |
+| 后端确认 | `memory_status`：`ready=true`、`storeFile=D:\AI\dsh-data\memory\memory.db`、`health=ok`、`schemaVersion=2` |
+| 数据量 | `entries=110`（88 生效 + 22 归档），`usedChars=7848/12000`；`memory.json` 的 sha256 与迁移前 manifest 一致（迁移后未被改写） |
+| 检索抽样 | `memory_search('记忆库满了怎么清理')` → matched=27、coverage=0.553、confidence=ok；`memory_list` 注入块 1549 字符 |
+| 独立差分 | 旧 v4.0.1 vs v4.1：225 条查询 ×（limit=5 判据层 + limit=20 全量层）+ 列表/注入/写路径/重载 + live DB 只读补充差分，**1372/1372 项检查逐位一致 / 不一致 0**（脚本带插件 sha256 归因；`_reports/memory-diff-search-2026-11-02.json`） |
+| 单测 / 契约 / 门 | `memory.test.mjs` 131 项、`memory-sqlite.test.mjs` 9 组通过；14 工具 schema 与 v4.0.1（git HEAD）逐位一致；`npm run check` 33 个测试全过 |
 
 ## 验证记录（2026-10-25，本机 desktop profile）
 
