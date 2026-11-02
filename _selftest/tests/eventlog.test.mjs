@@ -172,10 +172,12 @@ const host = (dir, extra) => {
   ok('自动捕获：取错误正文首行（不是只落错误类名 / 不带调用栈）')
 
   // minLevel 过滤
-  const quiet = host(mkdtempSync(path.join(os.tmpdir(), 'dsh-eventlog-q-')), { minLevel: 'error' })
+  const quietDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-eventlog-q-'))
+  const quiet = host(quietDir, { minLevel: 'error' })
   const low = await quiet.defs.get('log_write').execute({ message: 'info 不该落盘', level: 'info' })
   assert.equal(low.ok, false, '低于 minLevel 不写')
   rmSync(dir, { recursive: true, force: true })
+  rmSync(quietDir, { recursive: true, force: true })
   ok('minLevel：低级别不落盘')
 }
 

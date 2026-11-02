@@ -69,7 +69,7 @@ const ok = (label) => { passed += 1; console.log('  ✓ ' + label) }
 // CLI 层 fail-safe（postmortem 0002）：空会话目录不得写 0 基线——0 样本会被误读成「错误率 0%」。
 {
   const { spawnSync } = await import('node:child_process')
-  const { mkdtempSync, mkdirSync, existsSync } = await import('node:fs')
+  const { mkdtempSync, mkdirSync, existsSync, rmSync } = await import('node:fs')
   const os = await import('node:os')
   const path = await import('node:path')
   const { fileURLToPath } = await import('node:url')
@@ -89,6 +89,7 @@ const ok = (label) => { passed += 1; console.log('  ✓ ' + label) }
   assert.match(out, /拒绝写空基线/)
   assert.equal(existsSync(path.join(outDir, 'tool-error-rate-baseline.json')), false, '空基线不得落盘')
   ok('空会话目录 → 拒绝写 0 基线')
+  rmSync(dir, { recursive: true, force: true })
 }
 {
   const before = { calls: 1000, errors: 50, repeat: { repeatErrorShare: 0.5 } }

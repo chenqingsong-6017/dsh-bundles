@@ -36,6 +36,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { sweepAllTestDirs } from '../tests/_tmp-dirs.mjs'
 
 // DSH_BUNDLES_DIR 给 gate-hollow 测试造临时假目录用；不设时仍是本机默认路径。
 const BUNDLES_DIR_ENV = process.env.DSH_BUNDLES_DIR
@@ -197,6 +198,10 @@ for (const bundle of bundles) {
   }
 }
 if (localeChecked > 0) lines.push('结构门：检查 ' + localeChecked + ' 个 locale 文件')
+
+// 测试门前先扫掉上次运行遗留的测试临时目录（gate 串行跑测试，此刻扫到的都是旧账）。
+// 2026-11-02：memory 测试曾 5 小时积 153 个目录；统一兜底后不管哪个测试文件漏，这里补扫。
+sweepAllTestDirs()
 
 // ---- 阶段 3：测试门（全量） ----
 // 测试文件名惯例是去掉 `dsh-` 前缀（audit.test.mjs 对应 dsh-audit），
