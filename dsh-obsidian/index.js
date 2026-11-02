@@ -1,5 +1,5 @@
 /**
- * dsh-obsidian v0.3.0 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
+ * dsh-obsidian v0.3.2 —— Obsidian 库索引（P1 只读）+ 受控写（P2：白名单 / 默认不覆盖 / 冲突即放弃）。
  *
  * 为什么需要它：vault 是人的成品层，AI 要查画像/日志/调研结论时只能 glob + read 逐个翻；
  * 库一大就会问「哪张卡讲过 X」「断链断在哪」。这个插件把 vault 扫成一份索引（落在 D 盘），
@@ -251,6 +251,8 @@ export function buildIndex(vaultDir, now = Date.now(), listing) {
       size: file.size,
       links: extractLinks(parsed.body).map((link) => ({ embed: link.embed, target: normalizeTarget(link.target) })),
       text: compact(parsed.body),
+      // 结论头在索引期算一次（剥掉 fenced code）；超大文件读不到正文 = null，lint 不拿它判定
+      oneLiner: file.size > MAX_NOTE_BYTES ? null : hasOneLiner(stripFencedCode(parsed.body)),
     }
     notes.push(entry)
     byPath.set(entry.path.toLowerCase(), entry.path)
@@ -388,6 +390,106 @@ function normalizeHeading(value) {
     .trim()
 }
 
+/* ------------------------------------------------------------------
+ * 锚点（heading slug）与「一句话」结论头：两条都是「同一种写法有多种变体」的问题。
+ *
+ * 借鉴卡 · github-slugger 2.0.0（ISC，https://github.com/Flet/github-slugger）
+ *   机制：slug = 小写 → 按固定字符集去标点/符号/控制符（保留 _ 与 -）→ 空格逐个转 -。
+ *   我们自实现（不引运行时依赖，插件是零依赖单文件），规则对齐它；期望值用它的实测输出写进
+ *   _selftest/tests/obsidian.test.mjs，测试运行时**不依赖** tmp 目录里的 clone。
+ *
+ * 借鉴卡 · obsidian-linter（MIT，https://github.com/platers/obsidian-linter）
+ *   机制：用 mdast 按**结构**判定 strong/emphasis（src/utils/mdast.ts:59 MDAstTypes、:661
+ *   makeEmphasisOrBoldConsistent），而不是匹配某一种字面写法；同义的 **x** 与 __x__ 因此一视同仁。
+ *   我们只借这个判断思路（「结论头是结构，不是字面量」），用一条正则覆盖 `*`/`_` 包裹与 `>` 引用前缀，
+ *   不引 mdast/unified：为一个 8 字标记引一棵语法树不划算，且插件要能在任意 DSH 进程里零依赖跑。
+ * ------------------------------------------------------------------ */
+
+/** GitHub 风格 heading 锚点；与 github-slugger 2.0.0 实测一致（含「连续空格转 --，不塌缩」）。 */
+export function slugifyHeading(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\p{C}\p{P}\p{S}]/gu, (char) => (char === '_' || char === '-' ? char : ''))
+    .replace(/ /g, '-')
+}
+
+/** 标题的前导片段 slug（在标点 / 空白 / 连字符处断开）。
+ *  'skill-forge 的接线位置' → ['skill', 'skill-forge']；'先查官方有没有，再自研' → ['先查官方有没有']。
+ *  用途：区分「整词前缀」与「裸 startsWith」——skill 在前导片段里，skill-fo / forge 不在。 */
+function prefixSlugs(text) {
+  const clean = String(text ?? '').replace(/\s+#+\s*$/, '').trim()
+  if (clean === '') return []
+  const boundary = /[\s，,、;；:：/／|·…\-（）()【】\[\]]/
+  const out = []
+  for (let i = 0; i < clean.length; i += 1) {
+    if (!boundary.test(clean[i])) continue
+    const prefix = slugifyHeading(clean.slice(0, i))
+    if (prefix !== '' && !out.includes(prefix)) out.push(prefix)
+  }
+  return out
+}
+
+/** 正文标题清单（跳过 fenced code；frontmatter 由调用方先剥）。number = 标题前导节号（如 3.2 / 2 / 10）。 */
+export function headingAnchors(body) {
+  const out = []
+  let inFence = false
+  for (const line of String(body ?? '').split(/\r?\n/)) {
+    if (/^\s*(```|~~~)/.test(line)) { inFence = !inFence; continue }
+    if (inFence) continue
+    const match = /^(#{1,6})\s+(.+?)\s*$/.exec(line)
+    if (!match) continue
+    const raw = match[2].replace(/\s+#+\s*$/, '').trim()
+    if (raw === '') continue
+    const numeric = /^(\d+(?:\.\d+)*)\.?(?=\s|$)/.exec(raw)
+    out.push({ level: match[1].length, text: raw, slug: slugifyHeading(raw), number: numeric ? numeric[1] : '', prefixes: prefixSlugs(raw) })
+  }
+  return out
+}
+
+/** 锚点能不能落到某个标题上。三条规则（顺序即优先级）：
+ *  ① slug 全等——GitHub / Obsidian 的标准写法（标题里带逗号也能对上：slug 会去掉标点）；
+ *  ② 数字节号——锚点形如 2 / 3.2，命中标题前导节号（库里 `#2`、`#3.2` 就是这一条）；
+ *  ③ 前导片段——锚点是标题在标点/空白/连字符处断开后的**前导片段**的 slug（skill-forge 之于
+ *     skill-forge 的接线位置；先查官方有没有 之于 先查官方有没有，再自研）。
+ *     与裸 startsWith 的区别：skill-fo 不算（半截词）、forge 不算（不在前导片段里）、记忆清理 不算
+ *     （它不是「3.2 记忆清理红线」的前导片段——前导片段从标题第一个字开始）。
+ *  为什么不用严格 GitHub 规则：2026-11-02 实测真实 25 条指针，严格规则只过 4 条、误报 21 条；
+ *  ②③ 是我们的指针约定（见 README「记忆指针约定」），不是 GitHub 的语义，所以分开实现并写进测试。 */
+export function matchHeadingAnchor(anchor, headings) {
+  const raw = String(anchor ?? '').trim()
+  if (raw === '') return { ok: false, by: '' }
+  const needle = raw.toLowerCase()
+  const needleSlug = slugifyHeading(raw)
+  const list = Array.isArray(headings) ? headings : []
+  // ① 用「锚点 slug」比「标题 slug」：锚点里带逗号/标点也能对上（GitHub 链接里锚点本来就是 slug 化后的）
+  for (const head of list) if (head.slug !== '' && head.slug === needleSlug) return { ok: true, by: 'slug' }
+  const numeric = /^\d+(?:\.\d+)*$/.test(needle)
+  if (numeric) {
+    for (const head of list) if (head.number !== '' && head.number === needle) return { ok: true, by: 'section-number' }
+  }
+  if (needleSlug.length >= 2) {
+    for (const head of list) {
+      const prefixes = Array.isArray(head.prefixes) ? head.prefixes : prefixSlugs(head.text)
+      if (prefixes.some((prefix) => prefix === needleSlug)) return { ok: true, by: 'slug-prefix' }
+    }
+  }
+  return { ok: false, by: '' }
+}
+
+/** 去掉 fenced code 块：代码块里的示例文本不算结论头。 */
+function stripFencedCode(body) {
+  return String(body ?? '').replace(/^\s*(```|~~~)[^\n]*\n[\s\S]*?^\s*(```|~~~)[^\n]*$/gm, '')
+}
+
+/** 「一句话」结论头：按**结构**判，不认字面量 `**一句话**`。
+ *  过：`> 一句话：…` / `> **一句话**：…` / `> __一句话__：…` / `> **一句话**: …`；
+ *  不过：标题 `## 5. 一句话结论`、正文里提到「一句话，」这类（标记后面必须紧跟冒号）。 */
+const ONE_LINER_RE = /(?:^|[\s>])[*_]{0,2}一句话[*_]{0,2}[：:]/
+export function hasOneLiner(value) {
+  return ONE_LINER_RE.test(String(value ?? ''))
+}
+
 /** 定位 section 区间：标题行之后到下一个同级或更高级标题之前 */
 export function sectionRange(body, section) {
   const bare = normalizeHeading(section)
@@ -459,7 +561,11 @@ export function lintIndex(index, options) {
     }
     if (isIndex && type !== '' && type !== 'index') issues.push({ level: 'warn', code: 'index_named_content', path: rel, detail: '文件名是 _index.md，但 type=' + type + '（内容页占了导航名）' })
     if (!isIndex && type === 'index' && rel.includes('/')) issues.push({ level: 'warn', code: 'content_named_index', path: rel, detail: 'type=index，但文件名不是 _index.md（根级导航页如 Home.md 豁免）' })
-    if (!isIndex && type !== 'index' && type !== 'journal' && !String(entry.text ?? '').includes('**一句话**')) issues.push({ level: 'warn', code: 'missing_one_liner', path: rel, detail: '正文缺「一句话」结论头（journal 免检：日志是过程记录）' })
+    // 结论头：认结构不认字面量（`> 一句话：` 与 `> **一句话**：`、`__` 加粗、半角冒号都算过）
+    // oneLiner=false 由索引期算出（已剥 fenced code）；旧索引没有该字段时退回扁平文本判断
+    const oneLinerFlag = entry.oneLiner
+    const hasConclusion = oneLinerFlag === true || (oneLinerFlag === undefined && hasOneLiner(entry.text))
+    if (!isIndex && type !== 'index' && type !== 'journal' && !hasConclusion) issues.push({ level: 'warn', code: 'missing_one_liner', path: rel, detail: '正文缺「一句话」结论头（接受 `> 一句话：` / `> **一句话**：` 等写法；journal 免检：日志是过程记录）' })
     const id = String(entry.id ?? '').trim()
     if (id !== '') {
       if (idSeen.has(id)) issues.push({ level: 'error', code: 'duplicate_id', path: rel, detail: 'id 重复（先出现于 ' + idSeen.get(id) + '）：' + id })
@@ -492,6 +598,8 @@ export function apply(ctx, config) {
     ? config.writeAllowlist.map(String)
     : DEFAULT_WRITE_ALLOWLIST
   let lastError = ''
+  /** 指针锚点校验的标题缓存：一次 status 调用里同一文件只读一次 */
+  const headingCache = new Map()
 
   const note = (error) => { lastError = errText(error).slice(0, 240) }
   const indexFile = () => path.join(storeDir, INDEX_FILE)
@@ -562,9 +670,27 @@ export function apply(ctx, config) {
     }
   }
 
-  /** 记忆指针漂移检查：memory.json 里的 vault:// 指针还能不能落到真实文件（仿 Basic Memory sync_status） */
+  /** 文件 -> 标题清单（锚点校验用）。读不到正文 / 超 MAX_NOTE_BYTES 返回 null：这次不判锚点，
+   *  宁可漏判也不要把「读失败」说成「锚点缺失」（fail-safe）。 */
+  function headingsOfNote(abs) {
+    if (headingCache.has(abs)) return headingCache.get(abs)
+    let heads = null
+    try {
+      const info = statSync(abs)
+      if (info.size <= MAX_NOTE_BYTES) heads = headingAnchors(parseFrontmatter(readFileSync(abs, 'utf8')).body)
+    } catch (error) {
+      note(error)
+      heads = null
+    }
+    headingCache.set(abs, heads)
+    return heads
+  }
+
+  /** 记忆指针漂移检查：memory.json 里的 vault:// 指针能不能落到真实文件**与真实锚点**（仿 Basic Memory sync_status）
+   *  2026-11-02 修：原实现只判文件存在，`#锚点` 那半截被丢掉——「文件在、锚点不在」被当成 OK。
+   *  broken 用 kind 区分 file-missing / anchor-missing；pointer / memoryIds 保持向后兼容。 */
   function memoryPointerReport() {
-    const report = { file: memoryPath, checked: false, ok: true, total: 0, broken: [], sample: [] }
+    const report = { file: memoryPath, checked: false, ok: true, total: 0, anchorChecked: 0, anchorSkipped: 0, fileMissing: 0, anchorMissing: 0, broken: [], sample: [] }
     try {
       if (!existsSync(memoryPath)) { report.error = '记忆文件不存在：' + memoryPath; return report }
       const parsed = JSON.parse(readFileSync(memoryPath, 'utf8'))
@@ -579,13 +705,31 @@ export function apply(ctx, config) {
       report.checked = true
       report.total = owners.size
       for (const [pointer, ids] of owners) {
-        const clean = String(pointer).split('#')[0]
+        const ownerIds = ids.slice(0, 5)
+        const raw = String(pointer)
+        const hashAt = raw.indexOf('#')
+        const clean = hashAt === -1 ? raw : raw.slice(0, hashAt)
+        const anchor = hashAt === -1 ? '' : raw.slice(hashAt + 1)
         const abs = safeResolve(vaultDir, normalizeVaultPath(clean))
-        if (abs !== null && existsSync(abs)) {
-          if (report.sample.length < 5) report.sample.push(pointer)
-        } else {
-          report.broken.push({ pointer, memoryIds: ids.slice(0, 5) })
+        if (abs === null || !existsSync(abs)) {
+          report.fileMissing += 1
+          report.broken.push({ pointer, memoryIds: ownerIds, kind: 'file-missing' })
+          continue
         }
+        if (anchor !== '') {
+          const heads = headingsOfNote(abs)
+          if (heads === null) {
+            report.anchorSkipped += 1
+          } else {
+            report.anchorChecked += 1
+            if (!matchHeadingAnchor(anchor, heads).ok) {
+              report.anchorMissing += 1
+              report.broken.push({ pointer, memoryIds: ownerIds, kind: 'anchor-missing' })
+              continue
+            }
+          }
+        }
+        if (report.sample.length < 5) report.sample.push(pointer)
       }
       report.ok = report.broken.length === 0
     } catch (error) {
@@ -664,7 +808,13 @@ export function apply(ctx, config) {
             } else {
               const broken = Array.isArray(pointer.broken) ? pointer.broken : []
               line += '；记忆指针 ' + pointer.total + ' 条（断 ' + broken.length + '）'
-              if (broken.length > 0) line += '：' + broken.slice(0, 3).map((item) => String(item?.pointer ?? '')).join(' / ')
+              if (broken.length > 0) {
+                // 断链要能看出是「文件没了」还是「文件在、锚点没了」——不然人不知道该去建卡还是改指针
+                line += '：' + broken.slice(0, 3).map((item) => {
+                  const kind = item?.kind === 'anchor-missing' ? '（锚点缺失）' : item?.kind === 'file-missing' ? '（文件缺失）' : ''
+                  return String(item?.pointer ?? '') + kind
+                }).join(' / ')
+              }
             }
           }
           return [text(line)]

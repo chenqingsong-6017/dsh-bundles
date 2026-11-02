@@ -38,7 +38,7 @@ vault 是人的成品层（画像 / 3观 / 日志 / 调研索引）。没有索�
 | 必填字段缺失 | `missing_field` | 缺 `type` / `domain` / `status`，机器分不了类 |
 | 内容页占导航名 | `index_named_content` | `_index.md` 却装结论，人和 AI 都会误判 |
 | type=index 却叫别的名 | `content_named_index` | 子目录导航页必须叫 `_index.md`（根级 `Home.md` / `AGENTS.md` 豁免） |
-| 缺结论头 | `missing_one_liner` | H1 后必须有「一句话」，否则读入口就要爬全文（`journal` 免检） |
+| 缺结论头 | `missing_one_liner` | H1 后必须有「一句话」，否则读入口就要爬全文（`journal` 免检）；`> 一句话：` / `> **一句话**：` / `> __一句话__：` / 半角冒号都算过，代码块里的不算 |
 | id 重复 | `duplicate_id` | 改名不断链的前提是 id 唯一 |
 | 指针指向非 active | `pointer_to_inactive` | 指向草稿 = 指向「未定」，会误导引用 |
 
@@ -76,6 +76,31 @@ config:
 
 `obsidian_status` 会扫 `memory.json` 里所有 `vault://` 指针，报 `total` 与 `broken`（断掉的指针 + 对应记忆 id）。这是仿 Basic Memory 的 `sync_status`：索引落后要能被看见，而不是等人踩空。
 
+### 断链分 kind（2026-11-02 起）
+
+`broken[]` 每条是 `{ pointer, memoryIds, kind }`，`kind` 只有两种：
+
+| kind | 含义 | 该干什么 |
+|---|---|---|
+| `file-missing` | 指针里的文件路径落到真实文件失败 | 建卡，或删/改这条记忆 |
+| `anchor-missing` | 文件在，但 `#锚点` 在该文件里找不到对应标题 | 改指针锚点（多数是标题改过名） |
+
+报告里另有 `anchorChecked`（实际校验了锚点的条数）、`anchorSkipped`（读不到正文 / 超 512KB 没校验）、`fileMissing` / `anchorMissing` 两个计数；`pointer` 与 `memoryIds` 字段保持不变（向后兼容）。
+
+### 锚点怎么算「对上了」
+
+指针里的 `#锚点` 有三种合法写法，按顺序匹配（`matchHeadingAnchor`，纯函数、测试覆盖）：
+
+1. **slug 全等**：锚点按 GitHub slug 规则（小写 / 去标点符号 / 空格→`-`）等于某个标题的 slug。`#硬规则`、`#更新插件的执行链`、带逗号的 `#先查官方有没有，再自研` 都走这条。
+2. **数字节号**：锚点形如 `2` / `3.2` / `10`，命中标题前导节号。真实库里 `#2`、`#3.2`、`#4.1` 等 20 条走这条。
+3. **前导片段**：锚点是标题在标点 / 空白 / 连字符处断开后的前导片段。`skill-forge` 之于「skill-forge 的接线位置」、`先查官方有没有` 之于「先查官方有没有，再自研」。
+
+**与裸 `startsWith` 的区别**（这条必须写清，否则第 3 步会变成万能放行）：锚点必须从标题**第一个字**开始，且必须断在标点 / 空白 / 连字符处。`skill-fo`（半截词）、`forge`（不在前导）、`记忆清理`（不是「3.2 记忆清理红线」的前导）都不算命中。
+
+**为什么不用严格 GitHub 规则**：2026-11-02 实测真实 `memory.json` 的 25 条唯一指针，严格 GitHub 整标题 slug 规则只过 4 条、误报 21 条——库里 20 条用数字节号、1 条用英文短锚，那是**我们的指针约定**，不是 GitHub 的语义。所以 ②③ 单列、写进测试，并在代码注释里点名「这不是 GitHub 行为」。
+
+**解析的已知边界**：`parseMemoryPointers` 的指针 token 在标点处结束，所以 `#先查官方有没有，再自研` 实际解析成 `#先查官方有没有`——它仍靠第 3 条命中，行为正确；`obsidian_status` 里显示的是截断后的锚点。
+
 ## 与 dsh-memory 的分工
 
 - `memory.json` = AI 的权威记忆（每轮注入，有字符预算）。
@@ -107,6 +132,20 @@ config:
 | `node --check index.js` | 通过 |
 | 单测 `_selftest/tests/obsidian.test.mjs` | 12 项通过（新增断言并入现有分组） |
 | `obsidian_note` render（2026-11-02 18:13 修） | 未回退；单测仍断言 render 含正文 / frontmatter / 出链 |
+
+## 验证记录（2026-11-02，任务1-3：锚点校验 / 一句话误报 / m73）
+
+| 项 | 结果 |
+|---|---|
+| 证伪（改前先跑旧代码） | ✅ 旧实现把「文件在、锚点不存在」的指针列进 `sample`（当 OK）：`#根本没有这个锚点` 未被报出；旧 lint 对 `> 一句话：` 卡报 `missing_one_liner` |
+| 真实 vault lint | ✅ 28 篇 / **0 错误 0 警告**（改前 5 条误报，全是 `> 一句话：` 被当成缺结论头） |
+| 真实 memory.json 指针 | ✅ 88 条记忆 / **25 条唯一指针 / 24 条带锚点 / broken 0**（改前只判文件存在，锚点不校验） |
+| strict GitHub slug 实测 | 25 条只过 4 条、误报 21 条 → 因此加「数字节号」「前导片段」两条兼容规则（见上节） |
+| m73 修正 | `vault://30-Build/plugin-dev-runbook.md#2` → `#先查官方有没有，再自研`；逐条 sha256 核对：88 条里**只有 m73 变了** |
+| `node --check index.js` | 通过 |
+| 单测 `_selftest/tests/obsidian.test.mjs` | 14 项通过（新增 2 组：锚点校验、一句话同义写法） |
+| 新增用例能失败（负向对照） | ✅ 把锚点判定改成 `if (false)` → 用例红；把结论头退回字面量 `**一句话**` → 用例红；还原后全绿 |
+| 真机调用 | ⚠️ 未做（本任务不重启、不改运行进程）；`obsidian_status`/`obsidian_lint` 的真机输出仍看进程里加载的那版，零重启通道见 AGENTS.md |
 
 ## 已知边界（诚实清单）
 

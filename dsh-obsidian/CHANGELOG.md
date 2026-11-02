@@ -2,6 +2,25 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.3.2 — 2026-11-02
+
+### Added
+- 记忆指针锚点校验：带 `#锚点` 的 `vault://` 指针现在同时校验「文件存在」与「锚点存在」；`broken[]` 用 `kind` 区分 `file-missing` / `anchor-missing`（`pointer` / `memoryIds` 向后兼容）。新增 `anchorChecked` / `anchorSkipped` / `fileMissing` / `anchorMissing` 计数，render 直接标出断在哪一半。
+- 纯函数导出：`slugifyHeading`（对齐 github-slugger 2.0.0 的实测输出）/ `headingAnchors` / `matchHeadingAnchor` / `hasOneLiner`。
+- 锚点三条匹配规则：① slug 全等 ② 数字节号 = 标题前导节号 ③ 标题前导片段（在标点/空白/连字符处断开，区别于裸 `startsWith`）。
+
+### Fixed
+- `missing_one_liner` 误报：真实库 5 张卡用 `> 一句话：`（非加粗）被当成缺结论头。改为按结构判定——`> 一句话：` / `> **一句话**：` / `> __一句话__：` / 半角冒号都算过，代码块里的不算，真缺仍报。
+
+### Changed
+- 索引 `notes[]` 新增 `oneLiner`（索引期算一次，已剥 fenced code；超大文件为 `null` = 不判定）。旧索引没有该字段时退回扁平文本判断，不会误报。
+
+### 验证
+- 真实 vault lint：28 篇 / 0 错误 0 警告（改前 5 条误报）。
+- 真实 `memory.json`：88 条 / 25 条唯一指针 / 24 条带锚点 / broken 0。
+- strict GitHub slug 实测只过 4/25 → 21 条误报，是加 ②③ 两条兼容规则的直接依据。
+- 负向对照（用例能失败）：关掉锚点判定 → 用例红；结论头退回字面量匹配 → 用例红。
+
 ## v0.3.0 — 2026-11-01
 
 ### Added

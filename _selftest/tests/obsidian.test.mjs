@@ -7,10 +7,13 @@ import {
   applySection,
   buildIndex,
   extractLinks,
+  hasOneLiner,
+  headingAnchors,
   isWriteAllowed,
   lintIndex,
   listVault,
   makeSnippet,
+  matchHeadingAnchor,
   normalizeTarget,
   normalizeVaultPath,
   parseFrontmatter,
@@ -19,6 +22,7 @@ import {
   scoreNote,
   sectionRange,
   sha256,
+  slugifyHeading,
   splitFrontmatter,
 } from "../../dsh-obsidian/index.js"
 
@@ -252,7 +256,8 @@ put('.git/config', '')
   const h = host(vault, store, { memoryPath: memFile })
   const write = h.defs.get("obsidian_write")
 
-  const created = await write.execute({ path: "00-Inbox/ai-drafts/ok", content: '---\nreview: pending\n---\n# 草稿\n' })
+  // 2026-11-02：文档带 `## 一句话` 标题，好让下面 m3 的 `#一句话` 锚点真的存在（锚点校验上线后才有意义）
+  const created = await write.execute({ path: "00-Inbox/ai-drafts/ok", content: '---\nreview: pending\n---\n# 草稿\n\n## 一句话\n\n> 一句话：草稿。\n' })
   assert.equal(created.ok, true)
   assert.equal(created.created, true)
   assert.equal(created.path, '00-Inbox/ai-drafts/ok.md')
@@ -322,6 +327,126 @@ put('.git/config', '')
   ok("工具：write 新建/拒覆盖/追加/section 替换/白名单/模板/越界/冲突 + status 指针漂移 + render 断链可见")
 }
 
+// ---- 任务1 锚点校验：带 #锚点 的指针必须同时校验「文件存在」和「锚点存在」（2026-11-02） ----
+{
+  const root3 = mkdtempSync(path.join(os.tmpdir(), 'dsh-obsidian-anchor-'))
+  const v3 = path.join(root3, 'vault')
+  const store3 = path.join(root3, 'store')
+  const put3 = (rel, body) => {
+    const abs = path.join(v3, rel)
+    mkdirSync(path.dirname(abs), { recursive: true })
+    writeFileSync(abs, body, 'utf8')
+  }
+  put3('30-Build/plugin-dev-runbook.md', [
+    '---', 'type: runbook', 'domain: build', 'status: active', '---',
+    '# 插件开发 runbook', '',
+    '## 更新插件的执行链', '',
+    '> 一句话：执行链。', '',
+    '## 2. 环境版本（怎么现查）', '',
+    '## 3.2 记忆清理红线', '',
+    '## skill-forge 的接线位置', '',
+    '## 先查官方有没有，再自研', '',
+  ].join('\n'))
+  put3('10-Life/values.md', ['---', 'type: values', 'domain: life', 'status: active', '---', '# 价值观', '', '## 硬规则', '', '## 取舍标准', ''].join('\n'))
+
+  // slug 规则 = github-slugger 2.0.0（ISC）的实测输出，这里只固化期望值，运行时不依赖它
+  assert.equal(slugifyHeading('硬规则'), '硬规则')
+  assert.equal(slugifyHeading('3.2 记忆清理红线'), '32-记忆清理红线', '数字节号的点被去掉、空格转连字符')
+  assert.equal(slugifyHeading('skill-forge 的接线位置'), 'skill-forge-的接线位置')
+  assert.equal(slugifyHeading('安装 / 卸载台账流程'), '安装--卸载台账流程', '与 github-slugger 一致：不塌缩连续连字符')
+  assert.equal(slugifyHeading('C++ & Rust'), 'c--rust')
+  assert.equal(slugifyHeading('What is love?'), 'what-is-love')
+  assert.equal(slugifyHeading('Release v1.0.0'), 'release-v100')
+  assert.equal(slugifyHeading('   '), '', '空标题 slug 为空')
+
+  const heads = headingAnchors(readFileSync(path.join(v3, '30-Build/plugin-dev-runbook.md'), 'utf8'))
+  assert.deepEqual(heads.map((h) => h.text), ['插件开发 runbook', '更新插件的执行链', '2. 环境版本（怎么现查）', '3.2 记忆清理红线', 'skill-forge 的接线位置', '先查官方有没有，再自研'], '只认正文标题，frontmatter 不算')
+  assert.equal(heads[3].number, '3.2')
+  assert.equal(heads[2].number, '2', '数字节号取标题前导节号，去掉尾随点')
+  assert.equal(heads[1].number, '')
+
+  // 三条匹配规则：① slug 全等 ② 数字节号 = 标题前导节号 ③ 短锚 = slug 的整词前缀
+  assert.deepEqual(matchHeadingAnchor('更新插件的执行链', heads), { ok: true, by: 'slug' }, 'slug 全等')
+  const valuesHeads = headingAnchors(readFileSync(path.join(v3, '10-Life/values.md'), 'utf8'))
+  assert.deepEqual(matchHeadingAnchor('硬规则', valuesHeads), { ok: true, by: 'slug' }, '中文标题 slug = 原文')
+  assert.deepEqual(matchHeadingAnchor('3.2', heads), { ok: true, by: 'section-number' })
+  assert.deepEqual(matchHeadingAnchor('2', heads), { ok: true, by: 'section-number' })
+  assert.deepEqual(matchHeadingAnchor('skill-forge', heads), { ok: true, by: 'slug-prefix' })
+  assert.deepEqual(matchHeadingAnchor('skill', heads), { ok: true, by: 'slug-prefix' }, '整词前缀：skill 是 skill-forge 的第一整词')
+  assert.deepEqual(matchHeadingAnchor('skill-fo', heads), { ok: false, by: '' }, '半个词不算（区别于裸 startsWith）')
+  assert.deepEqual(matchHeadingAnchor('skill-forge-的接线', heads), { ok: false, by: '' }, '半个词结尾不算')
+  assert.deepEqual(matchHeadingAnchor('9.9', heads), { ok: false, by: '' }, '库里没有 9.9 这节')
+  assert.deepEqual(matchHeadingAnchor('记忆清理', heads), { ok: false, by: '' }, '中文短锚不做「任意位置包含」')
+  // 中文标题带逗号（真实库里就有一条：先查官方有没有，再自研）：整标题能对上，前导片段也能对上
+  assert.deepEqual(matchHeadingAnchor('先查官方有没有，再自研', heads), { ok: true, by: 'slug' }, '整标题（含逗号）按 slug 全等')
+  assert.deepEqual(matchHeadingAnchor('先查官方有没有', heads), { ok: true, by: 'slug-prefix' }, '指针解析在「，」处断开，剩下的前导片段仍要能对上')
+  assert.deepEqual(matchHeadingAnchor('官方有没有', heads), { ok: false, by: '' }, '不是前导片段（半截）')
+  assert.deepEqual(matchHeadingAnchor('先查官', heads), { ok: false, by: '' }, '半个词（未在标点处断开）不算')
+  assert.deepEqual(matchHeadingAnchor('', heads), { ok: false, by: '' })
+
+  const mem3 = path.join(root3, 'memory.json')
+  writeFileSync(mem3, JSON.stringify({ entries: [
+    { id: 'm1', text: '指针 vault://30-Build/plugin-dev-runbook.md#2' },
+    { id: 'm2', text: '指针 vault://10-Life/values.md#硬规则' },
+    { id: 'm3', text: '指针 vault://30-Build/plugin-dev-runbook.md#skill-forge' },
+    { id: 'm4', text: '指针 vault://10-Life/nope.md#硬规则' },
+    { id: 'm5', text: '指针 vault://10-Life/values.md#没有这个锚点' },
+    { id: 'm6', text: '指针 vault://10-Life/values.md#3.2' },
+    { id: 'm7', text: '指针 vault://30-Build/plugin-dev-runbook.md#先查官方有没有，再自研' },
+  ] }), 'utf8')
+  const h3 = host(v3, store3, { memoryPath: mem3 })
+  assert.equal((await h3.defs.get('obsidian_index').execute({})).ok, true, '先建索引，status 才有缓存可读')
+  const st3 = await h3.defs.get('obsidian_status').execute({})
+  const ptr3 = st3.memoryPointers
+  assert.equal(ptr3.checked, true)
+  assert.equal(ptr3.total, 7, 'm7 带「，」的指针解析后在逗号处断开，仍是同一个文件+锚点')
+  assert.equal(ptr3.broken.length, 3, 'm4 文件缺失 / m5 锚点缺失 / m6 数字节号在本文件不存在')
+  const byPtr = new Map(ptr3.broken.map((item) => [item.pointer, item]))
+  assert.equal(byPtr.get('10-Life/nope.md#硬规则').kind, 'file-missing', '文件缺失照旧报（不回归）')
+  assert.equal(byPtr.get('10-Life/values.md#没有这个锚点').kind, 'anchor-missing', '文件在、锚点不在 必须报')
+  assert.equal(byPtr.get('10-Life/values.md#3.2').kind, 'anchor-missing', '节号在别的文件存在，本文件不存在也要报')
+  assert.deepEqual(byPtr.get('10-Life/values.md#没有这个锚点').memoryIds, ['m5'], '向后兼容字段保留')
+  assert.equal(ptr3.anchorChecked, 6, 'm1/m2/m3/m5/m6/m7 共 6 条带锚点')
+  assert.ok(!ptr3.broken.some((item) => item.pointer.includes('先查官方有没有')), '带逗号的真实写法要能解析，不能误报')
+  const rendered3 = h3.defs.get('obsidian_status').output.render({}, st3).map((part) => part.text).join('')
+  assert.ok(rendered3.includes('没有这个锚点'), 'render 要点名锚点缺失的指针')
+  assert.ok(rendered3.includes('锚点缺失'), 'render 要标出问题是锚点，不是文件')
+  rmSync(root3, { recursive: true, force: true })
+  ok('锚点校验：slug 全等 / 数字节号 / 整词前缀 / 文件缺失与锚点缺失分 kind 报出')
+}
+
+// ---- 任务2 lint 误报：`> 一句话：` 与 `> **一句话**：` 都要算过（2026-11-02） ----
+{
+  const root4 = mkdtempSync(path.join(os.tmpdir(), 'dsh-obsidian-oneliner-'))
+  const v4 = path.join(root4, 'vault')
+  const put4 = (rel, body) => {
+    const abs = path.join(v4, rel)
+    mkdirSync(path.dirname(abs), { recursive: true })
+    writeFileSync(abs, body, 'utf8')
+  }
+  const fm4 = ['---', 'type: note', 'domain: build', 'status: active', '---'].join('\n')
+  put4('a/plain.md', fm4 + '\n# 朴素\n\n> 一句话：朴素写法要过。\n')
+  put4('a/bold.md', fm4 + '\n# 加粗\n\n> **一句话**：加粗写法要过。\n')
+  put4('a/underscore.md', fm4 + '\n# 下划线\n\n> __一句话__：下划线加粗也要过。\n')
+  put4('a/halfwidth.md', fm4 + '\n# 半角冒号\n\n> **一句话**: 半角冒号也要过。\n')
+  put4('a/none.md', fm4 + '\n# 没结论头\n\n正文直接开始，没有结论头。\n')
+  put4('a/heading-only.md', fm4 + '\n# 只有标题\n\n## 5. 一句话结论\n\n正文不写结论头。\n')
+  put4('a/prose.md', fm4 + '\n# 正文提到\n\n这里提到一句话，但不是结论头。\n')
+  put4('a/code.md', fm4 + '\n# 代码块里的不算\n\n```text\n一句话：这是代码块里的示例\n```\n\n正文没有结论头。\n')
+  const rep4 = lintIndex(buildIndex(v4), {})
+  const warned4 = rep4.issues.filter((issue) => issue.code === 'missing_one_liner').map((issue) => issue.path).sort()
+  assert.deepEqual(warned4, ['a/code.md', 'a/heading-only.md', 'a/none.md', 'a/prose.md'], '四种同义写法都要过；真缺结论头（含代码块里出现）仍要报')
+  assert.equal(rep4.errorCount, 0)
+  assert.equal(hasOneLiner('> 一句话：x'), true)
+  assert.equal(hasOneLiner('> **一句话**：x'), true)
+  assert.equal(hasOneLiner('> __一句话__：x'), true)
+  assert.equal(hasOneLiner('> **一句话**: x'), true)
+  assert.equal(hasOneLiner('## 5. 一句话结论'), false)
+  assert.equal(hasOneLiner('这里提到一句话，但不是结论头'), false)
+  assert.equal(hasOneLiner(''), false)
+  rmSync(root4, { recursive: true, force: true })
+  ok('一句话结论头：`> 一句话：` / `> **…**：` / `> __…__：` / 半角冒号都算过，真缺仍报')
+}
 // ---- 页面契约检查（lint） ----
 {
   const root2 = mkdtempSync(path.join(os.tmpdir(), "dsh-obsidian-lint-"))
