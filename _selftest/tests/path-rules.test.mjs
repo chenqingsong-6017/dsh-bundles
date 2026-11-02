@@ -475,6 +475,59 @@ try {
     assert.equal(out.layers.length, 3)
     ok('enabled 开关生效，maxChars / maxAlwaysChars 从 config 读')
   }
+
+  // ---- 14) 2026-11-02 升级：#16 大小写 / #17 cwd 外绝对路径 / #18 always 认不出 / #19 跳过文件可见 ----
+  {
+    // #16：Windows 大小写双方归一，不能再「规则写了却永不激活」
+    const caseRule = mkRule(path.join(homeDir, 'rules', 'case.md'), 'user',
+      '---\npaths:\n  - "D:/AI/Dsh-Bundles/**"\n---\n大小写规则。')
+    assert.equal(mod.ruleMatches(caseRule, 'D:/AI/dsh-bundles/dsh-memory/index.js'), true, 'Windows 大小写不影响命中')
+    assert.equal(mod.ruleMatches(caseRule, 'src/a.js'), false)
+
+    // #18：认不出的 always 值必须留 warnings，不能静默降级
+    const badBoolPath = path.join(homeDir, 'rules', 'bad-bool.md')
+    writeFileSync(badBoolPath, '---\npaths:\n  - "*.js"\nalways: yes.\n---\n认不出的布尔值。', 'utf8')
+    const badBool = mkRule(badBoolPath, 'user',
+      '---\npaths:\n  - "*.js"\nalways: yes.\n---\n认不出的布尔值。')
+    assert.equal(badBool.always, false)
+    assert.ok(badBool.warnings.some((warning) => warning.includes('无法识别')), 'always 值认不出必须留 warnings')
+
+    // #17：cwd 外文件的绝对路径也要能命中绝对 glob；#19：超限规则文件不能静默消失
+    const projectDir = path.join(rootTmp, 'proj-abs')
+    const rulesDir = path.join(projectDir, '.dsh', 'rules')
+    mkdirSync(rulesDir, { recursive: true })
+    writeFileSync(path.join(rulesDir, 'abs.md'), '---\npaths:\n  - "D:/AI/dsh-bundles/**"\n---\n外部目录规则。', 'utf8')
+    writeFileSync(path.join(rulesDir, 'too-big.md'), '---\npaths:\n  - "*.tmp"\n---\n' + 'x'.repeat(40 * 1024), 'utf8')
+
+    const mock = makeMockContext()
+    const contexts = []
+    const live = []
+    mock.ctx.get = (name) => (name === 'workingDirectory' ? { get: () => projectDir } : undefined)
+    mock.ctx.systemPrompt = { context(definition) { contexts.push(definition); return () => {} } }
+    mock.ctx.on = (name, handler) => { live.push({ name, handler }); return () => {} }
+    mod.apply(mock.ctx, { maxChars: 3000 })
+    const session = { id: 'abs-session' }
+    const renderNow = () => contexts[0].text({ agent: { session } })
+    assert.equal(renderNow(), '')
+    const post = live.find((entry) => entry.name === 'tools/post-execute')
+    await post.handler(
+      { name: 'edit', arguments: { file_path: 'D:/AI/dsh-bundles/dsh-memory/index.js' }, agent: { session } },
+      {},
+      async () => ({ kind: 'accept' }),
+    )
+    assert.match(renderNow(), /外部目录规则/, 'cwd 外绝对路径必须命中绝对 glob（#17）')
+
+    const statusTool = mock.registered.find((tool) => tool.name === 'path_rules_status')
+    const status = await statusTool.execute({}, { agent: { session } })
+    assert.ok(Array.isArray(status.warnings), 'status 必须带 warnings 数组')
+    assert.ok(status.warnings.some((warning) => warning.includes('已跳过')), '超限规则文件必须被点名（#19）')
+    assert.ok(status.warnings.some((warning) => warning.includes('too-big')), '要点到具体文件')
+    assert.ok(status.warnings.some((warning) => warning.includes('无法识别')), 'always 认不出的告警要汇总进 status')
+    const statusRendered = statusTool.output.render({}, status)[0].text
+    assert.ok(statusRendered.includes('规则文件告警'), 'render 要把告警显示出来')
+
+    ok('升级：大小写命中 / cwd 外绝对路径命中 / always 认不出告警 / 超限文件点名')
+  }
 } finally {
   if (originalHome === undefined) delete process.env.DSH_HOME
   else process.env.DSH_HOME = originalHome

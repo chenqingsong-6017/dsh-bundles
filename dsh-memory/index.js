@@ -38,6 +38,16 @@ const DEFAULT_MAX_BYTES = 12000
 const BACKUP_KEEP = 10
 const DEFAULT_MAX_INJECT_CHARS = 1200
 const MAX_TEXT_CHARS = 600
+// v4.0.1：单条正文超长时给**可操作**的出路，而不是只抛一句「太长」。
+// 依据工作区 .dsh/rules/memory-layering.md：长篇正文进 vault 卡，记忆里只留「判据 + 检索钩子 + vault://指针」。
+// 实测（2026-11-01 扫描 #13）：600 字硬门与「超过 200 字就写文档」的约定不同口径，被拒的人不知道下一步该干什么。
+const TEXT_TOO_LONG_HINT =
+  '出路：① 把正文写进 Obsidian vault 卡（D:\\AI-date\\obsidian\\vault\\00-Inbox\\ai-drafts\\，frontmatter 带 id/status/review），' +
+  '记忆里只留一行「判据 + 检索钩子 + vault://相对路径#节号」指针；② 拆成多条更短的事实；③ 用 memory_update 精简。'
+// v4.0.1：存储撞墙时自动归档的年龄门槛。原来是 30 天，与真实使用不匹配——
+// 实测库里 >30 天的条目长期是 0 条，于是 makeRoom 永远找不到候选、正常写入被硬拒（扫描 #11）。
+// 7 天是「已经放了一周、且一次都没被检索命中」的条目：仍可 memory_restore 恢复，归档不删数据。
+const ROOM_MIN_AGE_DAYS = 7
 // v3.9：别名也是存储，不能无限灌（B15）。
 const MAX_ALIASES = 8
 const MAX_ALIAS_CHARS = 60
@@ -70,6 +80,13 @@ const RELEVANCE_SINGLE_WORD_FLOOR_SHORT = 0.40
 const RELEVANCE_SINGLE_WORD_FLOOR_LONG = 0.25
 // v3.19：过期条目的排序惩罚（不是过滤 —— 过期信息仍要能搜到，只是不该排在前面）。
 const STALE_PENALTY = 0.55
+/** 只写日期的字段（staleAfter / invalidAt）→ 本地日历日零点的毫秒时间戳；非法返回 NaN。 */
+function localDayStart(stamp) {
+  const parts = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(stamp))
+  if (parts === null) return NaN
+  return new Date(Number(parts[1]), Number(parts[2]) - 1, Number(parts[3]), 0, 0, 0, 0).getTime()
+}
+/** 待复核判据：staleAfter 走本地日历日字符串比较，与 invalidAt 同一口径（本地日）。 */
 export function isStaleEntry(entry, today = localDateOf()) {
   return typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < today
 }
@@ -91,11 +108,19 @@ export function isArchivedEntry(entry) {
  * v4.0：一条记忆是否「已失效」——invalidAt 到了。
  * 对齐 Graphiti 双时间戳里真正有用的那一半（valid_from/invalid_to），但不引入任何实体/边：
  * 一条事实「从某天起不再成立」照样能表达，旧条目留档不删（可反查历史）。
+ *
+ * v4.0.1 口径统一（扫描 #12）：只写 `YYYY-MM-DD` 时按**本地日历日零点**解释，不再按 `T00:00:00Z`。
+ * 原来两种口径并存：staleAfter 走本地日（localDateOf 字符串比较）、invalidAt 走 UTC 日；
+ * 北京时间 00:00–08:00 期间「当日失效」的条目仍会被注入和检索到（UTC 零点 = 本地 8 点）。
+ * 现在两者都以本地日历为准，语义差异只剩一条、且是刻意的：
+ *   - invalidAt：**当地日期当天零点起**不再成立（"从哪天起失效"）；
+ *   - staleAfter：**到该日期当天为止**仍有效，次日本地零点起才算待重验（"哪天该复核"）。
+ * 测试用「本地 00:30」这种构造钉住，不依赖跑测试的钟点。
  */
 export function isInvalidEntry(entry, now = Date.now()) {
   const raw = typeof entry?.invalidAt === 'string' ? entry.invalidAt.trim() : ''
   if (raw === '') return false
-  const stamp = DATE_ONLY.test(raw) ? Date.parse(raw + 'T00:00:00Z') : Date.parse(raw)
+  const stamp = DATE_ONLY.test(raw) ? localDayStart(raw) : Date.parse(raw)
   return Number.isFinite(stamp) && stamp <= now
 }
 const COMPOSITE_IMPORTANCE_WEIGHT = 0.5
@@ -107,10 +132,14 @@ const CANDIDATE_LIMIT = 50
 const COMPACT_PEEK_CHARS = 14
 const SIMILAR_HINT_FLOOR = 0.62
 const MAX_SIMILAR_HINT = 2
-// v4.0（考虑以后）：写入冲突硬门。相似度 ≥ 此值 + 同 scope + 双方都生效 → 拒绝写入，
+// v4.0（考虑以后）：写入冲突硬门。相似度 ≥ 此值 + **双方 scope 都非空且相同** + 双方都生效 → 拒绝写入，
 // 逼调用方三选一：supersede（推翻旧条）/ allowDuplicate（明确要并存）/ status=draft（先存疑）。
 // 依据 2026-11-01 调研：mem0/Letta/Graphiti 唯一有共识的是「变更留痕 + 冲突要显式处理」，不是加图。
-const CONFLICT_FLOOR = 0.88
+// v4.0.1 修误报（_reports/plugin-falsepositive-scan-2026-11-01.md #10）：
+//   ① 0.88 → 0.92：同结构、结论不同的两条日常汇报实测相似度 0.818，0.88 会把「像但不同」也拒掉；
+//   ② 冲突必须**双方都有 scope**：任一侧没写 scope 就不参与判定。原来「任一侧空 = 不限」等于把
+//      无 scope 的老条目变成万能冲突源，新条目几乎全被拉进判定（实测 6/71 条无 scope）。
+const CONFLICT_FLOOR = 0.92
 // v4.0：实体标签（纯字符串，无实体表、无边、不抽 LLM）。mem0 v3 同款——
 // 当下最便宜，且是将来真要做关系层时唯一现成的锚点。现在不打，几千条之后没法回头补。
 const MAX_ENTITIES = 12
@@ -2832,7 +2861,7 @@ export function apply(ctx, config) {
         const raw = typeof args?.text === 'string' ? args.text.trim() : ''
         if (raw === '') throw fail('MEMORY_ARG_MISSING', 'memory_add 需要 text。')
         if (raw.length > MAX_TEXT_CHARS) {
-          throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${raw.length}。请拆成多条或精简。`)
+          throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${raw.length}。${TEXT_TOO_LONG_HINT}`)
         }
         if (args?.status !== undefined && !MEMORY_STATUS.has(args.status)) {
           throw fail('MEMORY_ARG_INVALID', 'status 只能是 draft | stable | deprecated，收到：' + String(args.status))
@@ -2907,20 +2936,32 @@ export function apply(ctx, config) {
           return { entry: publicEntry(duplicate), deduped: true, usedChars: usedChars(), maxBytes }
         }
         // v3.25（考虑以后）：存储撞墙时先尝试归档，而不是直接拒绝写入。
-        // 只归档「≥30 天没更新、从未被检索命中、非 pinned / 非规则」的条目 —— 可逆（memory_restore 能恢复，history 有记录）。
-        // 归档不出足够空间才报错，并在错误里点名候选，让人看见而不是静默丢。
+        // 只归档「≥ ROOM_MIN_AGE_DAYS 天没更新、从未被检索命中、非 pinned / 非规则」的条目 ——
+        // 可逆（memory_restore 能恢复，history 有记录）。归档不出足够空间才报错，并在错误里点名候选。
+        // v4.0.1：30 天 → 7 天。依据扫描 #11：阈值 30 天时库内 >30 天条目长期 0 条，
+        // makeRoom 永远找不到候选 → 正常写入被硬拒，且「腾地方」这条路径等于不存在。
+        // 7 天既保护刚写进来的记忆不被挤掉，又保证真有候选可归档；错误里的候选名单用同一门槛，
+        // 避免「点名了却归档不了」的两套口径（原候选名单不看年龄，本身就是不一致的）。
         if (usedChars() + raw.length > maxBytes) {
-          const room = makeRoom(raw.length, { reason: 'auto-archive: 为新记忆腾预算', minAgeDays: 30 })
+          const room = makeRoom(raw.length, { reason: 'auto-archive: 为新记忆腾预算', minAgeDays: ROOM_MIN_AGE_DAYS })
           if (!room.ok) {
+            const cutoff = Date.now() - ROOM_MIN_AGE_DAYS * 86400000
             const candidates = activeEntries()
-              .filter((entry) => entry.pinned !== true && (entry.usedCount ?? 0) === 0 && entry.kind !== 'rule' && entry.status !== 'draft')
+              .filter(
+                (entry) =>
+                  entry.pinned !== true &&
+                  (entry.usedCount ?? 0) === 0 &&
+                  entry.kind !== 'rule' &&
+                  entry.status !== 'draft' &&
+                  Date.parse(String(entry.updatedAt ?? entry.addedAt ?? '')) < cutoff,
+              )
               .map((entry) => entry.id)
               .slice(0, 10)
             throw fail('MEMORY_BUDGET_EXCEEDED', 
               `记忆已占用 ${usedChars()} / ${maxBytes} 字符，归档腾地方后仍不够（需 ${raw.length} 字符）。` +
                 (candidates.length > 0
-                  ? `可归档候选（从未用过、非规则）：${candidates.join(' ')}。用 memory_remove 精确删，或 memory_update 精简长条目。`
-                  : '已没有「从未使用过」的可归档条目了，只能 memory_remove 或 memory_update 精简。')
+                  ? `可归档候选（≥${ROOM_MIN_AGE_DAYS} 天未动、从未用过、非规则）：${candidates.join(' ')}。用 memory_remove 精确删，或 memory_update 精简长条目。`
+                  : `已没有「≥${ROOM_MIN_AGE_DAYS} 天未动且从未使用过」的可归档条目了（刚写的、规则、draft、pinned 都不动），只能 memory_remove 或 memory_update 精简。`)
             )
           }
         }
@@ -2959,14 +3000,18 @@ export function apply(ctx, config) {
           .sort((a, b) => b.similarity - a.similarity)
         const similar = neighbours.filter((item) => item.similarity >= SIMILAR_HINT_FLOOR).slice(0, MAX_SIMILAR_HINT)
         // v4.0：写入冲突**硬**检测。调研（mem0/Letta/Graphiti）唯一有共识的一条是「冲突必须显式处理」，
-        // 而不是像旧版那样只提示一句、模型可以当没看见。同 scope（任一侧无 scope 视为不限）+ 高度相似
-        // + 双方都生效 → 直接拒绝，逼出三个明确选项；draft 与 allowDuplicate 是合法逃生口。
-        const scopeOf = (item) => (typeof item?.scope === 'string' ? item.scope : '')
+        // 而不是像旧版那样只提示一句、模型可以当没看见。同 scope + 高度相似 + 双方都生效 → 直接拒绝，
+        // 逼出三个明确选项；draft 与 allowDuplicate 是合法逃生口。
+        // v4.0.1：**双方都必须有 scope** 才参与判定（任一侧空 = 不判定，不是「不限」）。
+        // 否则库里无 scope 的老条目会对所有新写入生效，稍像就拒（扫描 #10）。
+        const scopeOf = (item) => (typeof item?.scope === 'string' ? item.scope.trim().toLowerCase() : '')
         const conflict = neighbours.find(
           (item) =>
             item.similarity >= CONFLICT_FLOOR &&
             item.entry.status !== 'draft' &&
-            (incomingScope === '' || scopeOf(item.entry) === '' || incomingScope === scopeOf(item.entry)),
+            incomingScope !== '' &&
+            scopeOf(item.entry) !== '' &&
+            incomingScope === scopeOf(item.entry),
         )
         // 文本完全一致 + 显式 supersede：把那条当作冲突对象处理（否则 neighbours 会把它过滤掉）。
         const resolvedConflict =
@@ -3100,7 +3145,7 @@ export function apply(ctx, config) {
         const next = typeof args?.text === 'string' ? args.text.trim() : ''
         if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要 id。')
         if (next === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要新的 text；要删除请用 memory_remove。')
-        if (next.length > MAX_TEXT_CHARS) throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符。`)
+        if (next.length > MAX_TEXT_CHARS) throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${next.length}。${TEXT_TOO_LONG_HINT}`)
         const entry = state.entries.find((item) => item.id === id)
         if (!entry) throw fail('MEMORY_ID_NOT_FOUND', `没有这条记忆：${id}。先用 memory_list 查看。`)
         const projected = usedChars() - entry.text.length + next.length
@@ -3510,7 +3555,7 @@ export function apply(ctx, config) {
             ? args.text.trim()
             : sources.map((entry) => entry.text.trim()).join('；')
         if (mergedText.length > MAX_TEXT_CHARS) {
-          throw fail('MEMORY_TEXT_TOO_LONG', `合并后最多 ${MAX_TEXT_CHARS} 字符（当前 ${mergedText.length}），请精简。`)
+          throw fail('MEMORY_TEXT_TOO_LONG', `合并后最多 ${MAX_TEXT_CHARS} 字符（当前 ${mergedText.length}）。${TEXT_TOO_LONG_HINT}`)
         }
         const freed = sources.reduce((sum, entry) => sum + entry.text.length, 0)
         if (usedChars() - freed + mergedText.length > maxBytes) {

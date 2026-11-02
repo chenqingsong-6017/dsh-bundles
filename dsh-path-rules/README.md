@@ -282,3 +282,7 @@ dsh-path-rules/
 | `fitBudget(items, budget)` | 按预算装填一层：整装 / 截断 / 跳过，各自计数 |
 | `composeInjection(entries, options)` | 纯函数拼出注入文本 + 两份预算记账 + 生效清单 |
 | `expandBraces / globToRegExp / ruleMatches / normalizePath` | glob 与路径归一化（v1 原有） |
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：Windows 大小写不敏感匹配、cwd 外绝对路径命中、always 认不出与被跳过规则进 status warnings（#16 #17 #18 #19）。

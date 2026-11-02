@@ -1801,16 +1801,17 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const textA = '这是一条很长的测试记忆内容，用来验证冲突检测是否生效，内容需要足够长'
   const textB = textA + '。'
   assert.ok(sim(textA, textB) >= 0.88, '两条测试文本的相似度必须高到能触发冲突门，实际 ' + sim(textA, textB))
-  const first = await h.defs.get('memory_add').execute({ text: textA, entities: ['抖音', 'dsh-memory'], sources: ['index.js:429'] })
+  // v4.0.1：冲突判定要求双方 scope 都非空且相同，所以这里必须显式带同一个 scope。
+  const first = await h.defs.get('memory_add').execute({ text: textA, scope: 'plugin-dev', entities: ['抖音', 'dsh-memory'], sources: ['index.js:429'] })
   assert.deepEqual(first.entry.entities, ['抖音', 'dsh-memory'], '实体标签要落库')
   assert.deepEqual(first.entry.sources, ['index.js:429'], '来源要落库')
   // 冲突硬门：默认拒绝，并点名三条出路
-  await assert.rejects(() => h.defs.get('memory_add').execute({ text: textB }), /写入冲突/, '高度相似必须被拒')
-  const draft = await h.defs.get('memory_add').execute({ text: textB, status: 'draft' })
+  await assert.rejects(() => h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev' }), /写入冲突/, '高度相似必须被拒')
+  const draft = await h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev', status: 'draft' })
   assert.ok(draft.entry && draft.entry.id !== first.entry.id, 'draft 是合法逃生口')
-  const dup = await h.defs.get('memory_add').execute({ text: textB, allowDuplicate: true })
+  const dup = await h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev', allowDuplicate: true })
   assert.ok(dup.entry && dup.entry.id !== first.entry.id, 'allowDuplicate 是合法逃生口')
-  const sup = await h.defs.get('memory_add').execute({ text: textB, supersede: true })
+  const sup = await h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev', supersede: true })
   const listed = await h.defs.get('memory_list').execute({ includeArchived: true })
   const oldOne = listed.entries.find((entry) => entry.id === first.entry.id)
   assert.equal(oldOne.supersededBy, sup.entry.id, 'supersede 要回写旧条的 supersededBy')

@@ -29,6 +29,8 @@ export const inject = ['tools', 'subprocess']
 const DAY_MS = 24 * 60 * 60 * 1000
 const RANGES = { today: 1, '7d': 7, '30d': 30, all: null }
 const MAX_BODY = 200
+/** 正文被截断时贴在末尾的可操作提示（2026-11-02，报告 #46）：人知道去哪看全文。 */
+export const TRUNCATION_HINT = '…（已截断，详见会话）'
 
 const text = (value) => ({ type: 'text', text: value })
 const num = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
@@ -66,12 +68,43 @@ export function xmlEscape(value) {
     .replace(/'/g, '&apos;')
 }
 
-/** 截断并压成单行（Toast 长度有限，也不希望正文里带换行）。 */
-export function compact(value, max = MAX_BODY) {
+/**
+ * 截断并压成单行（Toast 长度有限，也不希望正文里带换行）。
+ * `truncationHint`：截断后贴在末尾的提示；正文用它告诉人去哪看全文，标题仍用轻盈的「…」。
+ */
+export function compact(value, max = MAX_BODY, truncationHint = '') {
   const flat = String(value ?? '')
     .replace(/\s+/g, ' ')
     .trim()
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat
+  if (flat.length <= max) return flat
+  const head = flat.slice(0, max)
+  return `${head}${truncationHint === '' ? '…' : truncationHint}`
+}
+
+/**
+ * 事件自带的耗时（DSH 当前的 turn/end 只带 reason，没有 durationMs；留着兼容将来版本与第三方事件）。
+ * 取不到返回 null —— 调用方据此走「未知耗时」分支，而不是拿 0 冒充。
+ */
+export function durationFromEvent(event) {
+  const candidates = [event?.data?.durationMs, event?.data?.turn?.durationMs, event?.durationMs]
+  for (const candidate of candidates) {
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) return candidate
+  }
+  return null
+}
+
+/**
+ * 回合真实耗时：事件自带 → turn/start 与 turn/end 的时间差 → unknown。
+ * 返回 `source`，让调用方能把「未知」变成可观测计数，而不是静默按 0 处理（报告 #45）。
+ */
+export function resolveTurnDuration({ event, startedAt }) {
+  const fromEvent = durationFromEvent(event)
+  if (fromEvent !== null) return { durationMs: fromEvent, source: 'event' }
+  const endedAt = typeof event?.time === 'number' && Number.isFinite(event.time) ? event.time : null
+  if (typeof startedAt === 'number' && Number.isFinite(startedAt) && endedAt !== null && endedAt >= startedAt) {
+    return { durationMs: endedAt - startedAt, source: 'turn/start' }
+  }
+  return { durationMs: null, source: 'unknown' }
 }
 
 /** 判断一个回合结束时是否该通知。返回 null 表示不通知。 */
@@ -82,6 +115,9 @@ export function shouldNotify({ reason, durationMs, minDurationMs, notifyOnComple
   if (kind === 'max-tokens') return notifyOnError ? 'max-tokens' : null
   if (kind === 'completed') {
     if (!notifyOnComplete) return null
+    // 2026-11-02（报告 #45）：`durationMs` 缺失时 `undefined >= minDurationMs` 恒为 false → 长任务永远不通知。
+    // 未知耗时走「保守通知」分支：宁可多打扰一次，也不许静默漏报。
+    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs)) return 'complete'
     return durationMs >= minDurationMs ? 'complete' : null
   }
   return null
@@ -89,10 +125,18 @@ export function shouldNotify({ reason, durationMs, minDurationMs, notifyOnComple
 
 /** 各类结局的标题/正文（说人话，不暴露内部实现）。 */
 export function describeOutcome(kind, { durationMs, sessionShort, title }) {
-  const seconds = Math.round(durationMs / 1000)
-  const timeText = seconds >= 60 ? `${Math.round(seconds / 60)} 分钟` : `${seconds} 秒`
+  const knownDuration = typeof durationMs === 'number' && Number.isFinite(durationMs)
+  const seconds = knownDuration ? Math.round(durationMs / 1000) : null
+  const timeText = knownDuration ? (seconds >= 60 ? `${Math.round(seconds / 60)} 分钟` : `${seconds} 秒`) : '耗时未知'
   const where = sessionShort ? ` · 会话 ${sessionShort}` : ''
-  if (kind === 'complete') return { title: '任务完成', body: `「${title || '未命名会话'}」跑完了，用了 ${timeText}${where}` }
+  if (kind === 'complete') {
+    return {
+      title: '任务完成',
+      body: knownDuration
+        ? `「${title || '未命名会话'}」跑完了，用了 ${timeText}${where}`
+        : `「${title || '未命名会话'}」跑完了（耗时未知，没拿到回合开始时间）${where}`,
+    }
+  }
   if (kind === 'error') return { title: '任务出错', body: `「${title || '未命名会话'}」这一轮失败了（${timeText}）${where}` }
   if (kind === 'interrupt') return { title: '任务被中断', body: `「${title || '未命名会话'}」被中断（${timeText}）${where}` }
   if (kind === 'max-tokens') return { title: '达到上限', body: `「${title || '未命名会话'}」撞到 max-tokens 上限${where}` }
@@ -109,7 +153,7 @@ export function describeOutcome(kind, { durationMs, sessionShort, title }) {
  */
 export function buildToastScript(title, body, silent = false) {
   const audio = silent ? '<audio silent="true"/>' : ''
-  const xml = `<toast><visual><binding template="ToastText02"><text id="1">${xmlEscape(compact(title, 80))}</text><text id="2">${xmlEscape(compact(body))}</text></binding></visual>${audio}</toast>`
+  const xml = `<toast><visual><binding template="ToastText02"><text id="1">${xmlEscape(compact(title, 80))}</text><text id="2">${xmlEscape(compact(body, MAX_BODY, TRUNCATION_HINT))}</text></binding></visual>${audio}</toast>`
   return [
     "$ErrorActionPreference = 'Stop'",
     'try {',
@@ -137,7 +181,7 @@ export function buildToastScript(title, body, silent = false) {
  */
 export function buildBalloonScript(title, body) {
   const safeTitle = (compact(title, 80) || 'DSH').replace(/'/g, "''")
-  const safeBody = compact(body).replace(/'/g, "''")
+  const safeBody = compact(body, MAX_BODY, TRUNCATION_HINT).replace(/'/g, "''")
   return [
     "$ErrorActionPreference = 'Stop'",
     'try {',
@@ -177,6 +221,7 @@ export function apply(ctx, config) {
   const turnStartedAt = new Map()
   let sent = 0
   let failed = 0
+  let unknownDurationTurns = 0
   let lastError = ''
   let lastSentAt = ''
   let lastTransport = ''
@@ -283,7 +328,7 @@ export function apply(ctx, config) {
       ts: lastSentAt,
       time: at,
       title: compact(title, 80),
-      body: compact(body),
+      body: compact(body, MAX_BODY, TRUNCATION_HINT),
       kind: typeof meta.kind === 'string' ? meta.kind : 'manual',
       transport,
       ...(typeof meta.session === 'string' && meta.session !== '' ? { session: meta.session } : {}),
@@ -303,14 +348,15 @@ export function apply(ctx, config) {
       try {
         const sessionId = String(session?.header?.id ?? session?.id ?? 'unknown')
         if (event?.type === 'turn/start') {
-          turnStartedAt.set(sessionId, num(event.time) || Date.now())
+          // 记真实时间；拿不到就记 null（后面走「未知耗时」分支），不拿 Date.now() 冒充
+          turnStartedAt.set(sessionId, typeof event.time === 'number' && Number.isFinite(event.time) ? event.time : null)
           return
         }
         if (event?.type !== 'turn/end') return
-        const startedAt = turnStartedAt.get(sessionId)
+        const startedAt = turnStartedAt.has(sessionId) ? turnStartedAt.get(sessionId) : undefined
         turnStartedAt.delete(sessionId)
-        const endedAt = num(event.time) || Date.now()
-        const durationMs = startedAt ? endedAt - startedAt : 0
+        const duration = resolveTurnDuration({ event, startedAt })
+        const durationMs = duration.durationMs
         const kind = shouldNotify({
           reason: event?.data?.reason,
           durationMs,
@@ -320,6 +366,7 @@ export function apply(ctx, config) {
           notifyOnInterrupt,
         })
         if (!kind) return
+        if (kind === 'complete' && duration.source === 'unknown') unknownDurationTurns += 1
         const sessionShort = sessionId.length > 12 ? sessionId.slice(-8) : sessionId
         // SessionHeader 没有 title 字段；用工作目录名当「任务名」更好认
         const cwd = typeof session?.header?.cwd === 'string' ? session.header.cwd : ''
@@ -420,6 +467,7 @@ export function apply(ctx, config) {
             entries: { type: 'integer' },
             sent: { type: 'integer' },
             failed: { type: 'integer' },
+            unknownDurationTurns: { type: 'integer' },
             lastSentAt: { type: 'string' },
             lastTransport: { type: 'string' },
             lastError: { type: 'string' },
@@ -439,6 +487,7 @@ export function apply(ctx, config) {
             'entries',
             'sent',
             'failed',
+            'unknownDurationTurns',
             'lastSentAt',
             'lastTransport',
             'lastError',
@@ -459,7 +508,7 @@ export function apply(ctx, config) {
                 `最近实际通道：${channel}`,
                 `触发：完成(≥${Math.round(num(value?.minDurationMs) / 1000)}s)=${value?.notifyOnComplete ? '开' : '关'} · 失败=${value?.notifyOnError ? '开' : '关'} · 中断=${value?.notifyOnInterrupt ? '开' : '关'}`,
                 `日志：${value?.storeDir ?? '?'}（${value?.files ?? 0} 天 / ${value?.entries ?? 0} 条）`,
-                `本次运行：成功 ${value?.sent ?? 0} / 失败 ${value?.failed ?? 0}`,
+                `本次运行：成功 ${value?.sent ?? 0} / 失败 ${value?.failed ?? 0} · 耗时未知的完成回合 ${value?.unknownDurationTurns ?? 0} 次`,
                 `最近发送：${value?.lastSentAt || '—'}`,
                 value?.lastError ? `最近错误：${value.lastError}` : '最近错误：（无）',
               ].join('\n'),
@@ -505,6 +554,7 @@ export function apply(ctx, config) {
           entries,
           sent,
           failed,
+          unknownDurationTurns,
           lastSentAt,
           lastTransport,
           lastError,

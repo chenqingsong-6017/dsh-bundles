@@ -2363,6 +2363,14 @@ function doStatus(config, store, guard) {
   // 台账统计：读不出来也不影响整理诊断，只多一条提示
   const inventory = inventoryStats(store)
   const notices = []
+  // #37：红线目录改名/迁移后保护会静默失效——这里点名「配了但当前不存在」的项。
+  const missingGuards = guard.filter((dir) => !existsSync(dir))
+  if (missingGuards.length > 0) {
+    notices.push(
+      '红线目录有 ' + missingGuards.length + ' 个当前不存在（改名/迁移后保护可能失效，请复核）：' +
+        missingGuards.slice(0, 5).join(' / ') + (missingGuards.length > 5 ? ' …' : ''),
+    )
+  }
   if (manifests.length === 0) notices.push('还没有整理记录，第一次整理后会在这里出现。')
   if (manifests.length > 20) notices.push(`整理记录已有 ${manifests.length} 份，可按需清理旧记录。`)
   if (inventory.error) notices.push('台账读不出来：' + inventory.error + '检查 ' + path.join(store.dir, 'inventory.json') + ' 后再处理。')

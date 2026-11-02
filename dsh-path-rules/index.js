@@ -140,10 +140,15 @@ const FALSE_WORDS = new Set(['false', 'no', 'off', '0', ''])
 
 /** 把 frontmatter 的布尔值翻成 true/false；认不出来的按 false（老文件不受影响）。 */
 export function parseBoolFlag(value) {
+  return parseBoolFlagResult(value).value
+}
+
+/** 带识别标记的版本：`recognized=false` 时调用方要把原值记进 warnings（静默降级是 #18 的问题）。 */
+export function parseBoolFlagResult(value) {
   const word = String(value).trim().toLowerCase()
-  if (TRUE_WORDS.has(word)) return true
-  if (FALSE_WORDS.has(word)) return false
-  return false
+  if (TRUE_WORDS.has(word)) return { value: true, recognized: true }
+  if (FALSE_WORDS.has(word)) return { value: false, recognized: true }
+  return { value: false, recognized: false }
 }
 
 /**
@@ -151,7 +156,7 @@ export function parseBoolFlag(value) {
  * 返回 { paths: string[], always: boolean, id: string }。
  */
 export function parseFrontmatter(source) {
-  const result = { paths: [], always: false, id: '' }
+  const result = { paths: [], always: false, id: '', warnings: [] }
   let collectingPaths = false
   for (const line of String(source).split(/\r?\n/)) {
     const trimmed = line.trim()
@@ -184,7 +189,11 @@ export function parseFrontmatter(source) {
       continue
     }
     if (key === 'always') {
-      result.always = parseBoolFlag(value)
+      const flag = parseBoolFlagResult(value)
+      result.always = flag.value
+      // #18：`always: true # 注释`、`Always`、`yes.` 这类认不出的值必须留痕，
+      // 否则规则会静默降级成路径层（核心层里永远看不到）。
+      if (!flag.recognized && unquote(value) !== '') result.warnings.push('always 值无法识别「' + unquote(value) + '」，按 false 处理')
       continue
     }
     if (key === 'id') {
@@ -212,7 +221,9 @@ export function parseRule(rawText) {
     body,
     always: meta.always === true,
     id: meta.id,
-    regexps: paths.map((pattern) => expandBraces(pattern).map((expanded) => globToRegExp(expanded))),
+    warnings: meta.warnings,
+    // #16：Windows 路径大小写不敏感，glob 编译前统一小写（ruleMatches 侧同样小写化目标）。
+    regexps: paths.map((pattern) => expandBraces(pattern).map((expanded) => globToRegExp(expanded.toLowerCase()))),
   }
 }
 
@@ -239,15 +250,17 @@ export function createRule(options) {
     chars: parsed.body.length,
     always: parsed.always,
     regexps: parsed.regexps,
+    warnings: Array.isArray(parsed.warnings) ? parsed.warnings : [],
   }
 }
 
-/** 相对路径是否命中某条规则（任一 glob 命中即算）。 */
+/** 相对路径是否命中某条规则（任一 glob 命中即算；Windows 大小写不敏感，两侧都小写比较）。 */
 export function ruleMatches(rule, relativePath) {
   if (rule === null || rule === undefined) return false
   const groups = rule.regexps
   if (!Array.isArray(groups)) return false
-  return groups.some((group) => group.some((regexp) => regexp.test(relativePath)))
+  const target = String(relativePath ?? '').toLowerCase()
+  return groups.some((group) => group.some((regexp) => regexp.test(target)))
 }
 
 /** 把工具参数里的路径转成相对 cwd、分隔符统一为 / 的形式。 */
@@ -570,10 +583,13 @@ export function apply(ctx, config) {
       if (cwd === '') return decision
       const relative = normalizePath(cwd, raw)
       if (relative === '') return decision
+      // #17：cwd 外的文件会被 relative 成 ../../x，命中不了绝对路径 glob。
+      // 相对、绝对两种形态都试一次（两侧小写化，Windows 大小写不敏感）。
+      const absolute = toSlash(path.resolve(cwd, String(raw)))
       const map = activeMap(session)
       for (const rule of scanRules(cwd)) {
         if (rule.always) continue
-        if (!ruleMatches(rule, relative)) continue
+        if (!ruleMatches(rule, relative) && !ruleMatches(rule, absolute)) continue
         map.set(rule.file, rule)
         triggeredEver.set(rule.file, rule)
       }
@@ -631,6 +647,7 @@ export function apply(ctx, config) {
       totalRules: { type: 'integer' },
       maxChars: { type: 'integer' },
       maxAlwaysChars: { type: 'integer' },
+      warnings: { type: 'array', items: { type: 'string' } },
       layers: {
         type: 'array',
         items: {
@@ -691,6 +708,7 @@ export function apply(ctx, config) {
       'pathBudget',
       'activeRules',
       'triggeredRules',
+      'warnings',
     ],
     additionalProperties: false,
   }
@@ -721,6 +739,12 @@ export function apply(ctx, config) {
       if (active.length > LIST_LIMIT) lines.push('… 还有 ' + String(active.length - LIST_LIMIT) + ' 条')
     }
     if (triggered.length > 0) lines.push('本次运行命中过 ' + String(triggered.length) + ' 条路径规则（含同 id 被覆盖的）')
+    const warnings = Array.isArray(value?.warnings) ? value.warnings : []
+    if (warnings.length > 0) {
+      lines.push('⚠ 规则文件告警（' + warnings.length + ' 条）：')
+      for (const warning of warnings.slice(0, LIST_LIMIT)) lines.push('  - ' + warning)
+      if (warnings.length > LIST_LIMIT) lines.push('… 还有 ' + String(warnings.length - LIST_LIMIT) + ' 条')
+    }
     return [text(lines.join('\n'))]
   }
 
@@ -737,6 +761,11 @@ export function apply(ctx, config) {
         const cwd = resolved === '' ? process.cwd() : resolved
         const scanned = scanRules(cwd)
         const composed = composeInjection(collectEntries(session, cwd), { cwd, maxChars, maxAlwaysChars })
+        // #18/#19：认不出的 always 值、读失败或超限被跳过的规则文件——不能静默消失。
+        const warnings = []
+        for (const rule of scanned) {
+          for (const warning of rule.warnings ?? []) warnings.push(toSlash(rule.file) + '：' + warning)
+        }
         const dirs = ruleDirs(cwd).map((entry) => {
           let exists = false
           let rules = 0
@@ -745,7 +774,19 @@ export function apply(ctx, config) {
             exists = true
             for (const name of names) {
               if (!name.toLowerCase().endsWith('.md')) continue
-              if (loadRuleFile(path.join(entry.dir, name), entry.layer) !== null) rules += 1
+              const filePath = path.join(entry.dir, name)
+              let stat = null
+              try {
+                stat = statSync(filePath)
+              } catch (error) {
+                warnings.push(toSlash(filePath) + '：读取失败（' + (error?.message ?? String(error)) + '）')
+                continue
+              }
+              if (stat.size > MAX_RULE_BYTES) {
+                warnings.push(toSlash(filePath) + '：超过 ' + MAX_RULE_BYTES + ' 字节，已跳过')
+                continue
+              }
+              if (loadRuleFile(filePath, entry.layer) !== null) rules += 1
             }
           } catch {
             exists = false
@@ -793,6 +834,7 @@ export function apply(ctx, config) {
           layers,
           alwaysBudget: composed.always,
           pathBudget: composed.path,
+          warnings,
           activeRules,
           triggeredRules: [...triggeredEver.values()].map((rule) => ({
             file: toSlash(rule.file),

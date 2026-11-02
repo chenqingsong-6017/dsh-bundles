@@ -95,15 +95,40 @@ function isInside(parent, child) {
   return c === p || c.startsWith(`${p}/`)
 }
 
-/** 目标匹配：全等 / 唯一后缀 / 目录前缀 / 文件名片段（`path` 传目录或文件名的一部分都能命中） */
-function pathMatches(recordPath, needle) {
-  const r = normalizePath(recordPath)
+/**
+ * 严格目标匹配（restore / forget / diff 专用）：只接受**全等**或**唯一后缀**。
+ * 命中 ≥2 个直接抛 AMBIGUOUS_TARGET 并列出候选路径——宁可让人多传一段路径，
+ * 也不能因为「文件名片段」把多个目标一起恢复/删除（2026-11-01 扫描 #29：
+ * `checkpoint_restore({path:'index'})` 曾会逐个处理所有含 index 的快照，created 的直接删）。
+ * `checkpoint_list` 不用它：只读，看全部无害。
+ */
+function strictTargets(records, needle) {
   const n = normalizePath(needle)
-  if (r === n || r.endsWith(`/${n}`) || n.endsWith(`/${r}`) || r.includes(`/${n}/`)) return true
-  // 文件名片段：用户手打 "hermes-lessons" 也能命中 "hermes-lessons-for-dsh.md"
-  if (n.includes('/')) return false
-  const base = r.slice(r.lastIndexOf('/') + 1)
-  return base.includes(n)
+  const all = [...records.entries()]
+  const exact = all.filter(([, record]) => normalizePath(record.path) === n)
+  if (exact.length > 0) return exact
+  const hits = all.filter(([, record]) => normalizePath(record.path).endsWith(`/${n}`))
+  if (hits.length > 1) {
+    const shown = hits.slice(0, 10).map(([, record]) => `  - ${record.path}`).join('\n')
+    const more = hits.length > 10 ? `\n  … 还有 ${hits.length - 10} 个` : ''
+    throw failure(
+      'AMBIGUOUS_TARGET',
+      `路径 "${needle}" 命中 ${hits.length} 个快照：为免恢复/删除错目标，这里不做模糊匹配。请传更长、唯一的路径（全等或唯一后缀）：\n${shown}${more}`,
+    )
+  }
+  if (hits.length === 1) return hits
+  // 后缀没命中时，再按「路径片段」只做歧义提示：命中 ≥2 个必须拒绝并列候选，
+  // 唯一片段命中才放行（免得用户被迫抄全路径）。这是 #29 修复的兜底：绝不逐个处理多个目标。
+  const fragments = all.filter(([, record]) => normalizePath(record.path).includes(`/${n}`))
+  if (fragments.length > 1) {
+    const shown = fragments.slice(0, 10).map(([, record]) => `  - ${record.path}`).join('\n')
+    const more = fragments.length > 10 ? `\n  … 还有 ${fragments.length - 10} 个` : ''
+    throw failure(
+      'AMBIGUOUS_TARGET',
+      `路径 "${needle}" 命中 ${fragments.length} 个快照：为免恢复/删除错目标，这里不做模糊匹配。请传更长、唯一的路径（全等或唯一后缀）：\n${shown}${more}`,
+    )
+  }
+  return fragments
 }
 
 /** 从一段命令行里提取"看起来是路径"的候选（best-effort） */
@@ -637,7 +662,8 @@ export function apply(ctx, config) {
         properties: {
           path: {
             type: 'string',
-            description: 'Absolute or display path to restore. A unique path suffix is accepted too.',
+            description:
+              'Absolute or display path to restore. Exact match or a unique path suffix; an ambiguous suffix is rejected with the candidate list.',
           },
           all: { type: 'boolean', description: 'Restore/delete every captured target. Requires confirm: true.' },
           confirm: {
@@ -710,7 +736,8 @@ export function apply(ctx, config) {
 
         let targets = [...records.entries()]
         if (!all) {
-          targets = targets.filter(([, record]) => pathMatches(record.path, wanted))
+          // 严格匹配：歧义时 strictTargets 直接抛错并列候选，绝不逐个恢复
+          targets = strictTargets(records, wanted)
           if (targets.length === 0) {
             throw failure('NOT_FOUND', `没有匹配到快照：${wanted}。先用 checkpoint_list 查看可回滚的目标。`)
           }
@@ -762,7 +789,10 @@ export function apply(ctx, config) {
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute or display path (unique suffix accepted, directory prefix matches too).' },
+          path: {
+            type: 'string',
+            description: 'Absolute or display path. Exact match or a unique path suffix; an ambiguous suffix is rejected with the candidate list.',
+          },
           all: { type: 'boolean', description: 'Discard every captured snapshot.' },
         },
         additionalProperties: false,
@@ -790,13 +820,12 @@ export function apply(ctx, config) {
         if (!all && wanted === undefined) {
           throw failure('MISSING_TARGET', 'checkpoint_forget 需要 path（丢弃单个目标），或传 all: true（丢弃全部）。')
         }
+        const matched = all ? [...records.entries()] : strictTargets(records, wanted)
         const forgotten = []
-        for (const [key, record] of [...records.entries()]) {
-          if (all || pathMatches(record.path, wanted)) {
-            records.delete(key)
-            totalBytes -= record.bytes
-            forgotten.push(record.path)
-          }
+        for (const [key, record] of matched) {
+          records.delete(key)
+          totalBytes -= record.bytes
+          forgotten.push(record.path)
         }
         if (forgotten.length > 0) schedulePersist()
         return { forgotten, remaining: records.size }
@@ -945,7 +974,10 @@ export function apply(ctx, config) {
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'Absolute or display path (a unique suffix is accepted).' },
+          path: {
+            type: 'string',
+            description: 'Absolute or display path (exact match or a unique suffix; ambiguous suffixes are rejected).',
+          },
           all: { type: 'boolean', description: 'Diff every captured target.' },
         },
         additionalProperties: false,
@@ -1057,7 +1089,8 @@ export function apply(ctx, config) {
 
         let targets = [...records.entries()]
         if (!all) {
-          targets = targets.filter(([, record]) => pathMatches(record.path, wanted))
+          // 与 restore/forget 同一套严格匹配：歧义时抛错并列候选，不预设要对比哪个
+          targets = strictTargets(records, wanted)
           if (targets.length === 0) {
             throw failure('NOT_FOUND', `没有匹配到快照：${wanted}。先用 checkpoint_list 查看可对比的目标。`)
           }

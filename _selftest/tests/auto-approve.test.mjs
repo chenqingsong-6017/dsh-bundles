@@ -93,6 +93,8 @@ const mod = await import('../../dsh-auto-approve/index.js')
     ['写 .credentials', 'write', { file_path: 'D:\\proj\\.credentials.yaml' }],
     ['命令追加写 .ssh', 'pwsh', { command: 'echo hi >> ~/.ssh/authorized_keys' }],
     ['Copy-Item 写 .ssh', 'pwsh', { command: 'Copy-Item C:\\tmp\\k C:\\Users\\x\\.ssh\\id_rsa' }],
+    // 写动词 + 目标成对判定里的 PowerShell 主路径
+    ['Set-Content 写 .ssh', 'pwsh', { command: 'Set-Content -Path ~/.ssh/config -Value "Host *"' }],
   ]
   for (const [label, toolName, args] of hits) {
     const verdict = mod.decideCall({ toolName, args })
@@ -118,6 +120,10 @@ const mod = await import('../../dsh-auto-approve/index.js')
     // 2026-11-01 线上误报：写一个叫 .credentials-guide.md 的文档被当成写凭据
     ['写凭据说明文档', 'write', { file_path: 'D:\\AI-date\\dsh-date\\dsh-创建\\docs\\.credentials-guide.md' }],
     ['命令里只读凭据', 'pwsh', { command: 'type C:\\Users\\x\\.dsh\\.credentials.yaml' }],
+    // 只在文本里「提到」凭据/ssh，不是写：读提交历史、echo 提示、搜关键词都必须放行
+    ['git log 提到凭据文件', 'bash', { command: 'git log --oneline -- .credentials.yaml' }],
+    ['echo 提到 .credentials', 'bash', { command: "echo 'see .credentials for details'" }],
+    ['Select-String 搜 ssh 关键词', 'pwsh', { command: "Select-String -Pattern 'ssh|credentials' -Path README.md" }],
   ]
   for (const [label, toolName, args] of misses) {
     const verdict = mod.decideCall({ toolName, args })
@@ -148,6 +154,42 @@ const mod = await import('../../dsh-auto-approve/index.js')
   assert.deepEqual(mod.fieldTexts({ command: 'echo', file_path: '' }, mod.BUILTIN_REDLINES[0].fields), ['echo'])
   assert.deepEqual(mod.fieldTexts(null, ['a']), [])
   ok('内置红线只查路径与命令文本：写文档提到 .ssh / rm -rf / 不误伤')
+}
+
+// ---- 4.6) 用户规则没写 fields：不再对整段参数 JSON 匹配（扫描 #4）----
+{
+  const rule = (extra) =>
+    mod.parseRulesConfig(
+      JSON.stringify([{ name: '正文关键词', tool: '^write$', match: 'SECRETWORD', decision: 'deny', ...extra }]),
+      'user',
+    ).rules
+  const docArgs = { file_path: 'D:\\proj\\docs\\security.md', content: '这段正文提到 SECRETWORD 只是文档内容' }
+
+  assert.equal(
+    mod.decideCall({ toolName: 'write', args: docArgs, userRules: rule({}) }).decision,
+    'none',
+    '未写 fields 时默认只看路径/命令字段，不扫正文',
+  )
+  assert.equal(
+    mod.decideCall({ toolName: 'write', args: docArgs, userRules: rule({ fields: ['content'] }) }).decision,
+    'deny',
+    '显式 fields:["content"] 才扫正文',
+  )
+  assert.equal(
+    mod.decideCall({ toolName: 'write', args: docArgs, userRules: rule({ fields: ['*'] }) }).decision,
+    'deny',
+    'fields:["*"] 显式恢复整段参数 JSON 匹配',
+  )
+  assert.equal(
+    mod.decideCall({ toolName: 'bash', args: { command: 'echo SECRETWORD' }, userRules: rule({ tool: '^bash$' }) }).decision,
+    'deny',
+    '默认范围内仍能命中命令文本',
+  )
+
+  const badFields = mod.parseRulesConfig(JSON.stringify([{ decision: 'deny', match: 'x', fields: 'content' }]), 'user')
+  assert.equal(badFields.rules.length, 0, '非法 fields 丢掉这条规则')
+  assert.match(badFields.errors[0], /fields/)
+  ok('用户规则 fields：未写时只看命令/路径，显式 ["content"] / ["*"] 才扩大范围')
 }
 
 // ---- 5) 优先级 ----
@@ -331,6 +373,28 @@ const mod = await import('../../dsh-auto-approve/index.js')
     assert.equal(brokenStatus.files.find((entry) => entry.scope === 'project').rules, 0)
     assert.ok(brokenStatus.errors.some((entry) => /不是合法 JSON/.test(entry)), '坏配置要记进 status')
     ok('坏配置 fail-safe：不干预 + 记进 status + 工具调用不挂')
+
+    // 超大规则文件（>64KB）：整份忽略是正确取舍，但绝不能静默 fail-open——
+    // lastError 与 status.errors 必须让人看得见「规则没生效」（扫描 #3）。
+    const oversized = JSON.stringify([
+      { name: '超大规则', tool: '^bash$', match: 'OVERSIZED_RULE', decision: 'deny', reason: 'y'.repeat(70 * 1024) },
+    ])
+    assert.ok(oversized.length > 64 * 1024, '样本必须超过 64KB 上限')
+    writeFileSync(path.join(proj, '.dsh', 'auto-approve.json'), oversized, 'utf8')
+    calls = 0
+    const afterOversized = await pre(execFor('bash', { command: 'echo OVERSIZED_RULE' }), async () => {
+      calls += 1
+      return { kind: 'allow' }
+    })
+    assert.equal(afterOversized.kind, 'allow', '超限规则整份忽略（fail-safe 不干预）')
+    assert.equal(calls, 1)
+    const oversizedStatus = await statusTool.execute({}, { agent: { session: { id: 's1' } } })
+    const oversizedLayer = oversizedStatus.files.find((entry) => entry.scope === 'project')
+    assert.equal(oversizedLayer.rules, 0)
+    assert.ok(oversizedLayer.errors.some((entry) => /65536/.test(entry)), '超限要落进该层的 errors')
+    assert.ok(oversizedStatus.errors.length > 0, 'status.errors 必须可见')
+    assert.match(oversizedStatus.lastError, /65536/, 'lastError 必须报出来，不能静默 fail-open')
+    ok('超大规则文件（>64KB）：整份忽略但 lastError + status.errors 可见（不静默）')
   } finally {
     if (prevHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = prevHome

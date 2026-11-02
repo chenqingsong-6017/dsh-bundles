@@ -96,6 +96,18 @@ config:
 | 真机 P2（2026-11-01，源码直跑真实 vault） | ✅ 新建 71 字节成功（自动补 .md）/ 二次写 `file_exists` / `10-Life` 与模板目录 `denied` / append 85 字节 / 检索与读单篇回归正常；验证文件已删，索引重建回 21 篇 |
 | 接口契约补丁（2026-11-01） | ✅ `obsidian_status` 增 `ready`/`unavailableReason`（判据＝vault 存在，复用 `vaultExists`），`required` 含 `ready`，`ready:false` 时 render 首行「不可用：<原因>」；`memoryPointers` 拼串逻辑未动。`index`/`search`/`note`/`lint`/`status` 的错误返回补 UPPER_SNAKE `code`（VAULT_MISSING / STATUS_ERROR / VAULT_UNREADABLE / INDEX_ERROR / EMPTY_QUERY / SEARCH_ERROR / EMPTY_PATH / PATH_ESCAPE / NOT_FOUND / UNSUPPORTED_TYPE / TOO_LARGE / NOTE_ERROR / LINT_ERROR）；`obsidian_write` 原有 lowercase 码（`file_exists` 等）保持不变。实测：vault 在 → `ready:true`、vault 不在 → `ready:false` + render「不可用：vault 不存在…」；`node --check` 通过、`obsidian.test.mjs` 12 项全过 |
 
+## 验证记录（2026-11-02，误报扫描 #21 #22）
+
+| 项 | 结果 |
+|---|---|
+| `isWriteAllowed` 大小写不敏感（v0.3.1） | ✅ 比较前统一 `toLowerCase()`：`00-inbox/`、`00-Inbox/AI-Drafts/`、`00-INBOX/...` 放行；`90-shared/91-templates/`、`.OBSIDIAN/` 仍命中「受保护目录」（不再只靠白名单兜底） |
+| `sectionRange` 标题容忍尾随冒号/空格 | ✅ `观测：` / `观测:` / `## 观测： ` / `  观测  ` 均命中 `## 观测`；只有冒号仍返回 null |
+| 证伪 | ✅ 先加用例跑旧代码：白名单大小写用例失败（`false !== true`）；改后全过 |
+| 工具级单测 | ✅ `obsidian_write({path:'00-inbox/AI-Drafts/case.md'})` 写入成功；`90-SHARED/91-TEMPLATES/` 仍 `DENIED`；section 模式 `section:'观测：'` 替换成功 |
+| `node --check index.js` | 通过 |
+| 单测 `_selftest/tests/obsidian.test.mjs` | 12 项通过（新增断言并入现有分组） |
+| `obsidian_note` render（2026-11-02 18:13 修） | 未回退；单测仍断言 render 含正文 / frontmatter / 出链 |
+
 ## 已知边界（诚实清单）
 
 - **写只进白名单**：这是设计，不是遗漏。要让 AI 直接改正文，得先改白名单配置并想清冲突策略。

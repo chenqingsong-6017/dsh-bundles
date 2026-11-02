@@ -42,6 +42,13 @@ const DECISION_LABEL = { allow: '放行', ask: '需人工确认', deny: '拒绝'
  */
 const COMMAND_FIELDS = ['command', 'code', 'script', 'text']
 const PATH_FIELDS = ['file_path', 'filePath', 'path', 'target', 'target_path', 'new_path', 'old_path']
+/**
+ * 用户规则没写 `fields` 时的默认匹配范围：只看「命令/路径」字段，不对整段参数 JSON 匹配。
+ * 理由（2026-11-01 扫描 #4）：写文档/写测试时正文 `content` 里提到规则关键词，
+ * 按整段 JSON 匹配会把「写文档」也判成违规；规则作者要扫正文时显式写 `fields: ["content"]`，
+ * 要恢复旧行为（整段 JSON）写 `fields: ["*"]`。
+ */
+const DEFAULT_RULE_FIELDS = [...PATH_FIELDS, ...COMMAND_FIELDS]
 
 const text = (value) => ({ type: 'text', text: value })
 
@@ -200,6 +207,20 @@ export function parseRulesConfig(raw, source = 'user') {
         return
       }
     }
+    // fields：不写就只看命令/路径字段（DEFAULT_RULE_FIELDS），不扫正文；
+    // 显式 ["*"] = 恢复旧行为（整段参数 JSON）；显式空/非法 → 丢掉这条并记错。
+    let fields = DEFAULT_RULE_FIELDS
+    if (item.fields !== undefined) {
+      const wildcard = item.fields === '*' || (Array.isArray(item.fields) && item.fields.length === 1 && item.fields[0] === '*')
+      if (wildcard) {
+        fields = null
+      } else if (Array.isArray(item.fields) && item.fields.some((entry) => typeof entry === 'string' && entry.trim() !== '')) {
+        fields = item.fields.filter((entry) => typeof entry === 'string' && entry.trim() !== '').map((entry) => entry.trim())
+      } else {
+        errors.push(at + '：fields 必须是非空字符串数组（如 ["command"]），要匹配整段参数写 ["*"]')
+        return
+      }
+    }
     const ruleName = typeof item.name === 'string' && item.name.trim() !== '' ? item.name.trim() : '#' + (index + 1)
     rules.push({
       name: ruleName,
@@ -207,6 +228,7 @@ export function parseRulesConfig(raw, source = 'user') {
       decision,
       tool,
       match,
+      fields,
       reason: typeof item.reason === 'string' ? item.reason.trim() : '',
     })
   })

@@ -29,12 +29,29 @@ assert.equal(sessionIdOf('/x/y/8f0e-11/session.v4.jsonl.zstd'), '8f0e-11')
 ok('sessionIdOf：取父目录名作为会话 id')
 
 // ---- priceFor ----
-const prices = { 'deepseek-flash': { input: 0.5, output: 8, cacheRead: 0.05, cacheWrite: 0.5 }, 'kimi-': { input: 4 } }
+// 2026-11-02（报告 #47）：族匹配只认显式通配键（`model*`），裸键不再当前缀用，避免 deepseek 吞掉 deepseek-flash。
+const prices = { 'deepseek-flash': { input: 0.5, output: 8, cacheRead: 0.05, cacheWrite: 0.5 }, 'kimi-*': { input: 4 } }
 assert.deepEqual(priceFor(prices, 'deepseek-official', 'deepseek-flash').input, 0.5)
-assert.deepEqual(priceFor(prices, 'x', 'kimi-k3').input, 4, '前缀匹配')
+assert.deepEqual(priceFor(prices, 'x', 'kimi-k3').input, 4, '显式通配键才做族匹配（kimi-* → kimi-k3）')
 assert.equal(priceFor(prices, 'x', 'unknown-model'), null)
 assert.equal(priceFor(null, 'x', 'y'), null)
-ok('priceFor：精确匹配、模型族前缀匹配、未配置返回 null')
+
+const familyPrices = {
+  deepseek: { input: 9 },
+  'deepseek*': { input: 1 },
+  'deepseek-flash*': { input: 2 },
+  'deepseek-flash': { input: 0.5 },
+}
+assert.equal(priceFor(familyPrices, 'p', 'deepseek-flash').input, 0.5, '精确命中优先于任何通配键')
+assert.equal(priceFor(familyPrices, 'p', 'deepseek-flash-2026').input, 2, '最长通配前缀胜出（deepseek-flash* > deepseek*）')
+assert.equal(priceFor(familyPrices, 'p', 'deepseek-pro').input, 1, '只有短前缀匹配时用短前缀')
+assert.equal(
+  priceFor({ deepseek: { input: 9 } }, 'p', 'deepseek-flash'),
+  null,
+  '裸键 deepseek 不再吞掉同前缀模型（修复 #47 的核心：不再 model.startsWith(裸键)）',
+)
+assert.equal(priceFor({ '*': { input: 3 } }, 'p', 'whatever-model').input, 3, '显式 * 是兜底价，允许')
+ok('priceFor：精确匹配优先、显式通配键族匹配取最长前缀、裸键不再当前缀')
 
 // ---- costOf ----
 const bucket = { provider: 'deepseek-official', model: 'deepseek-flash', input: 1e6, output: 1e6, cacheRead: 1e6, cacheWrite: 0 }
@@ -69,6 +86,15 @@ try {
     line(day1, 'deepseek-flash', 100, 10, 1000),
     line(day1, 'deepseek-flash', 200, 20, 2000),
     line(day2, 'deepseek-pro', 300, 30, 3000),
+    // 2026-11-02（报告 #48）：time 缺失的事件不许用 Date.now() 冒充「今天」，必须跳过并计数
+    JSON.stringify({
+      type: 'assistant/message',
+      seq: 9,
+      data: {
+        usage: { inputTokens: 999, outputTokens: 9, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 1008 },
+        message: { role: 'assistant', source: { kind: 'model', provider: 'deepseek-official', model: 'deepseek-flash' } },
+      },
+    }),
     'not-json-line',
     JSON.stringify({ type: 'turn/start', data: {} }),
   ].join('\n')
@@ -83,6 +109,7 @@ try {
   const parsed = await parseSessionFile(files.find((f) => f.includes('session-aaa')), { timeZone: 'Asia/Shanghai' })
   assert.equal(parsed.calls, 3, 'bad lines skipped, 3 usage events kept')
   assert.equal(parsed.buckets.length, 2, 'two (date,model) buckets')
+  assert.equal(parsed.skippedNoTime, 1, 'time 缺失的事件必须跳过并计数（不许 Date.now() 冒充日期）')
   const b1 = parsed.buckets.find((b) => b.date === '2026-10-26' && b.model === 'deepseek-flash')
   assert.equal(b1.calls, 2)
   assert.equal(b1.input, 300)
@@ -155,6 +182,10 @@ try {
   assert.ok(status.output.schema.required.includes('ready'), 'status schema 必须含 ready')
   assert.ok(status.output.schema.required.includes('unavailableReason'), 'status schema 必须含 unavailableReason')
   assert.ok(status.output.schema.properties.probe.required.includes('code'), '探针错误必须有稳定 code')
+  assert.ok(
+    status.output.schema.required.includes('skippedNoTime'),
+    'status 必须报「time 缺失被跳过的事件数」（跳过就要看得见，不能静默）',
+  )
 
   const sample = {
     ready: false,

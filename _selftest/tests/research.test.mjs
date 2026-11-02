@@ -54,6 +54,21 @@ const checker = (ref) => {
   assert.deepEqual(parseRef('note.md:2-4'), { kind: 'file', value: 'note.md', start: 2, end: 4 })
   assert.equal(parseRef('D:/AI/x.md:12').kind, 'file')
   assert.equal(parseRef('就是感觉').kind, 'none')
+  // 2026-11-02：#25 扩展合法证据形态（arXiv 规范化为 abs 链接）
+  assert.deepEqual(parseRef('arXiv:2410.12345'), { kind: 'url', value: 'https://arxiv.org/abs/2410.12345' })
+  assert.deepEqual(parseRef('arxiv:2410.12345v2'), { kind: 'url', value: 'https://arxiv.org/abs/2410.12345v2' }, '带版本后缀也要规范化')
+  assert.deepEqual(parseRef('arXiv:hep-th/9901001'), { kind: 'url', value: 'https://arxiv.org/abs/hep-th/9901001' })
+  assert.deepEqual(parseRef('session:abc123'), { kind: 'session', value: 'abc123' })
+  assert.deepEqual(parseRef('git:9F2C1A0'), { kind: 'git', value: '9f2c1a0' })
+  // 断的形态仍拒
+  assert.equal(parseRef('arXiv:2410').kind, 'none', '不完整 arXiv 编号要拒')
+  assert.equal(parseRef('arXiv:abc').kind, 'none', '非数字 arXiv 编号要拒')
+  assert.equal(parseRef('session:').kind, 'none', '空 session id 要拒')
+  assert.equal(parseRef('session:' + 'a'.repeat(65)).kind, 'none', 'session id 超过 64 字符要拒')
+  assert.equal(parseRef('git:9f2c1a').kind, 'none', 'git sha 少于 7 位要拒')
+  assert.equal(parseRef('git:' + 'a'.repeat(41)).kind, 'none', 'git sha 超过 40 位要拒')
+  assert.equal(parseRef('git:zzzzzzz').kind, 'none', 'git sha 非 hex 要拒')
+  assert.equal(parseRef('session:abc 123').kind, 'none', 'session id 含空格要拒')
   assert.equal(normalizeTier('PAPER'), 'paper')
   assert.equal(normalizeTier('blog'), '')
   assert.equal(normalizeConfidence('high', 'search'), 'medium')
@@ -70,16 +85,38 @@ const checker = (ref) => {
       { id: 'e2', claim: '断引用', tier: 'source', ref: 'note.md:99', confidence: 'high' },
       { id: 'e3', claim: '推断', tier: 'search', ref: '', confidence: 'medium', inferred: true },
       { id: 'e4', claim: '只有链接', tier: 'official', ref: 'https://x.dev', confidence: 'medium' },
+      { id: 'e5', claim: '会话日志里看到的', tier: 'source', ref: 'session:abc123', confidence: 'high' },
+      { id: 'e6', claim: '源码里一行为证', tier: 'source', ref: 'git:9f2c1a0', confidence: 'high' },
     ],
   }
   const lint = lintTask(task, checker)
-  assert.equal(lint.total, 4)
+  assert.equal(lint.total, 6)
   assert.equal(lint.inferred, 1)
   assert.equal(lint.missingEvidence, 0, '推断项不计入「无落点」')
   assert.equal(lint.uncheckedUrls, 1)
+  assert.equal(lint.uncheckedRefs, 2, 'session / git 是格式合法但未核对的落点')
   assert.equal(lint.brokenRefs.length, 1, 'note.md:99 应判为断引用')
   assert.equal(lint.canClose, false)
   ok('lintTask：落点 / 推断 / 链接未核 / 断引用 / 不能收尾')
+}
+
+// 2026-11-02：#25 新增形态不能当断引用；只有格式合法的落点也能收尾
+{
+  const task = {
+    id: 't2',
+    evidence: [
+      { id: 'e1', claim: '论文里写的', tier: 'paper', ref: 'arXiv:2410.12345', confidence: 'high' },
+      { id: 'e2', claim: '会话里看到的', tier: 'source', ref: 'session:s-2026-11-02', confidence: 'high' },
+      { id: 'e3', claim: '提交里写的', tier: 'source', ref: 'git:9f2c1a0', confidence: 'high' },
+    ],
+  }
+  const lint = lintTask(task, checker)
+  assert.equal(lint.missingEvidence, 0, '三种新形态都算有落点')
+  assert.equal(lint.brokenRefs.length, 0, '不能拿文件核对去查 arXiv/session/git')
+  assert.equal(lint.uncheckedUrls, 1, 'arXiv 规范化为链接 → 归入链接未核对')
+  assert.equal(lint.uncheckedRefs, 2)
+  assert.equal(lint.canClose, true)
+  ok('lintTask：arXiv / session / git 有落点、不误判断引用、不挡收尾')
 }
 
 // ---- renderReport ----
@@ -130,7 +167,25 @@ const checker = (ref) => {
   assert.equal(searchHigh.ok, true)
   const inferred = await ev.execute({ claim: '我猜是这样', tier: 'source', inferred: true })
   assert.equal(inferred.ok, true, 'inferred 允许无落点')
-  ok('research_evidence：无落点拒 / url 未核 / 文件核对 / 断引用标 false / inferred 放行')
+  // 2026-11-02：#25 三种合法形态要收，断的形态仍拒
+  const arxiv = await ev.execute({ claim: '论文说上下文越长召回越差', tier: 'paper', ref: 'arXiv:2410.12345' })
+  assert.equal(arxiv.ok, true, 'arXiv 编号应被接受')
+  assert.equal(arxiv.refKind, 'url')
+  assert.equal(arxiv.verified, false, '离线只校验格式')
+  const sessionRef = await ev.execute({ claim: '会话日志里出现过', tier: 'source', ref: 'session:abc123' })
+  assert.equal(sessionRef.ok, true, 'session id 应被接受')
+  assert.equal(sessionRef.refKind, 'session')
+  assert.equal(sessionRef.verified, false)
+  const gitRef = await ev.execute({ claim: '提交里有这一行', tier: 'source', ref: 'git:9f2c1a0' })
+  assert.equal(gitRef.ok, true, 'git sha 应被接受')
+  assert.equal(gitRef.refKind, 'git')
+  assert.equal(gitRef.verified, false)
+  for (const bad of ['arXiv:abc', 'session:' + 'a'.repeat(65), 'git:9f2c1a', 'git:zzzzzzz']) {
+    const rejected = await ev.execute({ claim: '形态不合法', tier: 'paper', ref: bad })
+    assert.equal(rejected.ok, false, `${bad} 应被拒`)
+    assert.equal(rejected.code, 'EVIDENCE_UNVERIFIABLE')
+  }
+  ok('research_evidence：无落点拒 / url 未核 / 文件核对 / 断引用标 false / inferred 放行 / arXiv·session·git 收、坏形态拒')
 }
 
 // ---- research_check + report ----

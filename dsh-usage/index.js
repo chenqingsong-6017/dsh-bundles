@@ -141,12 +141,13 @@ export async function parseSessionFile(file, options = {}) {
   const buckets = new Map()
   let calls = 0
   let lines = 0
+  let skippedNoTime = 0
 
   let text
   try {
     text = decompressSessionBuffer(readFileSync(file)).toString('utf8')
   } catch (error) {
-    return { buckets: [], calls: 0, lines: 0, error: error instanceof Error ? error.message : String(error) }
+    return { buckets: [], calls: 0, lines: 0, skippedNoTime: 0, error: error instanceof Error ? error.message : String(error) }
   }
   // 让出一次事件循环：多文件连续解压时不要让单个大文件把 Host 卡住。
   await Promise.resolve()
@@ -166,7 +167,12 @@ export async function parseSessionFile(file, options = {}) {
     const source = event?.data?.message?.source
     const provider = typeof source?.provider === 'string' && source.provider !== '' ? source.provider : 'unknown'
     const model = typeof source?.model === 'string' && source.model !== '' ? source.model : 'unknown'
-    const date = dayOf(typeof event.time === 'number' ? event.time : Date.now(), timeZone)
+    // 2026-11-02（报告 #48）：time 缺失不许用 Date.now() 冒充「今天」——跳过并计数，交由 usage_status 报出。
+    if (typeof event.time !== 'number' || !Number.isFinite(event.time)) {
+      skippedNoTime += 1
+      continue
+    }
+    const date = dayOf(event.time, timeZone)
     if (date === '') continue
 
     const key = `${date}\u0000${provider}\u0000${model}`
@@ -187,18 +193,31 @@ export async function parseSessionFile(file, options = {}) {
     bucket.total += num(usage.totalTokens) || inputTokens + outputTokens + cacheRead + cacheWrite
     calls += 1
   }
-  return { buckets: [...buckets.values()], calls, lines }
+  return { buckets: [...buckets.values()], calls, lines, skippedNoTime }
 }
 
-/** 价格查找：先精确匹配 model / provider/model，再按前缀匹配（价格表键可以写模型族前缀）。 */
+/**
+ * 价格查找（2026-11-02，报告 #47 修）：
+ *   ① 精确命中 `model` / `provider/model`；
+ *   ② 族匹配只认**显式通配键**（键以 `*` 结尾，如 `deepseek-flash*`），多个命中取**最长前缀**；
+ *      裸键（如 `deepseek`）不再被当成模型族前缀 —— 否则一个 `deepseek` 会吞掉所有同前缀模型，
+ *      成本数字系统性偏离。`*` 单独作兜底价。
+ */
 export function priceFor(prices, provider, model) {
   if (!prices || typeof prices !== 'object') return null
   const direct = prices[model] ?? prices[`${provider}/${model}`]
   if (direct) return direct
+  let best = null
+  let bestPrefixLength = -1
   for (const key of Object.keys(prices)) {
-    if (key !== '' && model.startsWith(key)) return prices[key]
+    if (!key.endsWith('*')) continue
+    const prefix = key.slice(0, -1)
+    if (prefix.length > bestPrefixLength && model.startsWith(prefix)) {
+      best = prices[key]
+      bestPrefixLength = prefix.length
+    }
   }
-  return null
+  return best
 }
 
 /** 成本 = Σ(tokens × 每百万单价) / 1e6；没配价格返回 0。 */
@@ -310,6 +329,7 @@ export function apply(ctx, config) {
           mtimeMs: stat.mtimeMs,
           sessionId: sessionIdOf(file),
           calls: parsed.calls,
+          skippedNoTime: parsed.skippedNoTime ?? 0,
           buckets: parsed.buckets,
         }
         refreshed += 1
@@ -526,6 +546,7 @@ export function apply(ctx, config) {
             storeBytes: { type: 'integer' },
             indexedFiles: { type: 'integer' },
             totalCalls: { type: 'integer' },
+            skippedNoTime: { type: 'integer' },
             lastScanAt: { type: 'string' },
             pricesConfigured: { type: 'boolean' },
             currency: { type: 'string' },
@@ -563,6 +584,7 @@ export function apply(ctx, config) {
             'storeBytes',
             'indexedFiles',
             'totalCalls',
+            'skippedNoTime',
             'lastScanAt',
             'pricesConfigured',
             'currency',
@@ -584,6 +606,7 @@ export function apply(ctx, config) {
                 `会话日志：${value?.sessionsRoot ?? '?'}`,
                 `索引存档：${value?.storeFile ?? '?'}（${fmtTokens(value?.storeBytes ?? 0)}B）`,
                 `已索引：${value?.indexedFiles ?? 0} 个会话文件 / ${value?.totalCalls ?? 0} 次模型调用`,
+                `跳过无时间戳事件：${value?.skippedNoTime ?? 0} 条（无 time 的事件不冒充「今天」，未计入任何日期桶）`,
                 `最后扫描：${value?.lastScanAt ?? '（还没扫过）'}`,
                 `价格表：${value?.pricesConfigured ? `已配置（${value?.currency ?? ''}）` : '未配置（只报 token）'}`,
                 `时区：${value?.timeZone ?? '系统默认'}`,
@@ -651,6 +674,7 @@ export function apply(ctx, config) {
           storeBytes: Math.round(storeBytes),
           indexedFiles: files.length,
           totalCalls: Math.round(files.reduce((sum, entry) => sum + (entry?.calls ?? 0), 0)),
+          skippedNoTime: Math.round(files.reduce((sum, entry) => sum + num(entry?.skippedNoTime), 0)),
           lastScanAt: typeof state.lastScanAt === 'string' ? state.lastScanAt : '',
           pricesConfigured,
           currency,

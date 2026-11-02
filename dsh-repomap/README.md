@@ -93,3 +93,7 @@ DSH bundle（Host 侧插件）：给任意工作区生成"按引用热度排序�
 | `node --check index.js` | 通过 |
 | `node _selftest/tests/repomap.test.mjs` | 15 项通过，退出码 0 |
 | 契约真机校验 | 真实目录 `ready:true` 且数到源文件；目录不存在 → `REPO_ROOT_MISSING`；把文件当根 → `REPO_ROOT_NOT_DIRECTORY` |
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：超大文件跳过与符号截断在 block/render 明示，不再静默失真（#50）。

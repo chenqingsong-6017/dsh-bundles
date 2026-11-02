@@ -968,3 +968,7 @@ memory_add {..., status: "draft"}        # 先存成待证实
 | `node --check index.js` | 通过 |
 | `node _selftest/tests/memory.test.mjs` | 131 项通过，退出码 0 |
 | 契约真机校验（mock ctx + 真实临时库） | schema 严格通过（`additionalProperties:false` 不拒）；健康库 `ready:true`、损坏库 `ready:false` + `MEMORY_STORE_CORRUPT`、目录不可建 `ready:false` |
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：冲突阈值 0.92 + 双方 scope 非空判定；预算墙归档放宽到 7 天；超长文本给可操作提示（#10 #11 #13）。

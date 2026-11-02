@@ -113,3 +113,7 @@ plugin_manager action=remove_bundle target=@local/dsh-checkpoint
 ```
 
 改代码后需要 `remove_bundle` + `install_bundle` 才会加载新的模块代际（热替换不换 JS 模块）。
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：restore/forget/diff 严格匹配：歧义命中 ≥2 个直接拒绝并列出候选（#29，高）。

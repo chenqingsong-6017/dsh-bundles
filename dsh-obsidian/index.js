@@ -358,13 +358,18 @@ export function normalizeVaultPath(relPath) {
   return rel
 }
 
-/** 写白名单判定：受保护前缀优先拒，其次必须命中 allowlist */
+/** 写白名单判定：受保护前缀优先拒，其次必须命中 allowlist。
+ *  2026-11-02 修 #21：Windows 路径大小写不敏感，比较前统一 toLowerCase()，
+ *  否则 00-inbox/、00-Inbox/AI-Drafts/ 会被误拒，90-shared/91-templates/ 会绕过保护区判定。 */
 export function isWriteAllowed(relPath, allowlist) {
-  const rel = String(relPath ?? '').replace(/\\/g, '/')
-  const denied = WRITE_DENY_PREFIXES.find((prefix) => rel === prefix.slice(0, -1) || rel.startsWith(prefix))
+  const rel = String(relPath ?? '').replace(/\\/g, '/').toLowerCase()
+  const denied = WRITE_DENY_PREFIXES.find((prefix) => {
+    const lower = prefix.toLowerCase()
+    return rel === lower.slice(0, -1) || rel.startsWith(lower)
+  })
   if (denied) return { allowed: false, reason: '受保护目录：' + denied }
   const list = Array.isArray(allowlist) && allowlist.length > 0 ? allowlist.map(String) : DEFAULT_WRITE_ALLOWLIST
-  const hit = list.find((prefix) => rel.startsWith(String(prefix).replace(/\\/g, '/')))
+  const hit = list.find((prefix) => rel.startsWith(String(prefix).replace(/\\/g, '/').toLowerCase()))
   if (!hit) return { allowed: false, reason: '不在写白名单内（允许写：' + list.join(' / ') + '）' }
   return { allowed: true, reason: '' }
 }
@@ -374,16 +379,25 @@ export function sha256(value) {
   return createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex')
 }
 
+/** 标题归一：去 # 前缀、首尾空白，以及尾随冒号（2026-11-02 修 #22：「观测：」等同「观测」） */
+function normalizeHeading(value) {
+  return String(value ?? '')
+    .trim()
+    .replace(/^#+\s*/, '')
+    .replace(/[\s:：]+$/, '')
+    .trim()
+}
+
 /** 定位 section 区间：标题行之后到下一个同级或更高级标题之前 */
 export function sectionRange(body, section) {
-  const bare = String(section ?? '').trim().replace(/^#+\s*/, '')
+  const bare = normalizeHeading(section)
   if (bare === '') return null
   const lines = String(body ?? '').split(/\r?\n/)
   let start = -1
   let level = 0
   for (let i = 0; i < lines.length; i += 1) {
     const match = /^(#{1,6})\s+(.+?)\s*$/.exec(lines[i])
-    if (!match || match[2].trim() !== bare) continue
+    if (!match || normalizeHeading(match[2]) !== bare) continue
     start = i
     level = match[1].length
     break

@@ -215,3 +215,7 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 - 大目录体积受每目录 20,000 项 / 1.5 秒上限约束，超出标「体积未量全」。
 - 台账引用扫描只覆盖上面列的六类；CLSID / 文件关联 / COM 注册不在其中，卸载后建议再跑一次 `tidy_scan residue:true` 补扫孤儿引用。
 - `inventory_check` 的复核只对「路径已不在」的条目重扫引用；路径还在的条目只核对存在性与数据目录缺项。
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：红线保护目录当前不存在时 tidy_status 点名告警（#37）。

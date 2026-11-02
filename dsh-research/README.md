@@ -61,6 +61,18 @@ config:
 | 真机 | 见下方「真机验收」 |
 | 统一契约（v0.1.2，2026-11-01） | `research_status` 加 `ready`/`unavailableReason`（store 可读+结构对才 true）；所有 `ok:false` 返回带 `code`。实测：store 正常 → `ready:true`；store 不存在 → `ready:false` + 「不可用：store.json 不存在（…）：先跑一次 research_new」；store 坏 JSON → 见「读不了：…」 ✅ |
 
+## 验证记录（2026-11-02，误报扫描 #25）
+
+| 项 | 结果 |
+|---|---|
+| `parseRef` 扩展形态（v0.1.3） | ✅ `arXiv:2410.12345` → `{kind:'url', value:'https://arxiv.org/abs/2410.12345'}`（含 `vN` 与旧式 `hep-th/9901001`）；`session:abc123` → `{kind:'session'}`（≤64 字符）；`git:9F2C1A0` → `{kind:'git', value:'9f2c1a0'}`（7-40 位 hex，小写归一） |
+| 断的形态仍拒 | ✅ `arXiv:2410` / `arXiv:abc` / 空 session / 65 字符 session / `git:9f2c1a`（6 位）/ 41 位 / 非 hex → `kind:'none'`，`research_evidence` 返回 `EVIDENCE_UNVERIFIABLE` |
+| lint 口径 | `uncheckedUrls` 收 arXiv（已规范化链接）；新增 `uncheckedRefs` 记 session/git「格式合法但未核对」；不再误走文件核对 → 不会判成断引用 |
+| 诚实边界 | ⚠️ session/git 只做格式校验，插件**不**查 git / 会话日志，返回值 `verified:false` |
+| 证伪 | ✅ 先加用例跑旧代码：`parseRef('arXiv:2410.12345')` 实得 `kind:'none'`（用例失败）；改后全过 |
+| `node --check index.js` | 通过 |
+| 单测 `_selftest/tests/research.test.mjs` | 10 项通过，退出码 0 |
+
 ## 已知边界（诚实清单）
 
 - **不联网**：`url` 只校验格式，不通就核不到内容；「链接未核对」会在返回值与报告里说明。

@@ -164,10 +164,14 @@ const NOISE = new Set([
   '__filename',
 ])
 
-/** 抽取一个文件的符号（导出是为了单测；不依赖任何服务） */
-export function extractSymbols(ext, content) {
+/**
+ * 抽取一个文件的符号（导出是为了单测；不依赖任何服务）。
+ * 返回 `{ symbols, truncated, total }`：`truncated` 是被 60 上限截掉的符号数——
+ * 上层必须把它报出来，否则地图会静默失真（报告 #50）。
+ */
+export function extractSymbolsDetailed(ext, content) {
   const patterns = languageFor(ext)
-  if (!patterns) return []
+  if (!patterns) return { symbols: [], truncated: 0, total: 0 }
   const starts = lineStarts(content)
   const seen = new Set()
   const symbols = []
@@ -184,7 +188,14 @@ export function extractSymbols(ext, content) {
     }
   }
   symbols.sort((a, b) => a.line - b.line)
-  return symbols.slice(0, MAX_SYMBOLS_PER_FILE)
+  const total = symbols.length
+  const capped = symbols.slice(0, MAX_SYMBOLS_PER_FILE)
+  return { symbols: capped, truncated: Math.max(0, total - capped.length), total }
+}
+
+/** 兼容旧签名：只要符号数组（单测/其它调用方都用这个）。 */
+export function extractSymbols(ext, content) {
+  return extractSymbolsDetailed(ext, content).symbols
 }
 
 function wordCounts(content) {
@@ -202,8 +213,16 @@ function wordCounts(content) {
 function collectEntries(root, options) {
   const entries = []
   const counters = { skippedLarge: 0, skippedUnsupported: 0, bytes: 0 }
+  // 上限真的拦下东西时置位：地图要把「已跳过」说出来（报告 #50），不能静默少扫。
+  let cappedHit = false
 
-  const capped = () => entries.length >= options.maxFiles || counters.bytes > options.maxBytes
+  const capped = () => {
+    if (entries.length >= options.maxFiles || counters.bytes > options.maxBytes) {
+      cappedHit = true
+      return true
+    }
+    return false
+  }
 
   const walk = (dir) => {
     if (capped()) return
@@ -252,7 +271,12 @@ function collectEntries(root, options) {
   walk(root)
   // 排序有两个作用：readdir 顺序不保证稳定，而缓存指纹要求稳定；顺带让结果可复现
   entries.sort((a, b) => a.rel.localeCompare(b.rel))
-  return { entries, skippedLarge: counters.skippedLarge, skippedUnsupported: counters.skippedUnsupported }
+  return {
+    entries,
+    skippedLarge: counters.skippedLarge,
+    skippedUnsupported: counters.skippedUnsupported,
+    capped: cappedHit,
+  }
 }
 
 /** 由"每个文件的相对路径 + mtimeMs + size"算出扫描指纹。任一项变化，指纹就变。 */
@@ -276,6 +300,7 @@ function readScannedFiles(entries, counters) {
     files: 0,
     skippedLarge: counters.skippedLarge,
     skippedUnsupported: counters.skippedUnsupported,
+    scanCapped: counters.capped === true,
     bytes: 0,
     readErrors: 0,
   }
@@ -287,11 +312,13 @@ function readScannedFiles(entries, counters) {
       state.readErrors += 1
       continue
     }
+    const extracted = extractSymbolsDetailed(entry.ext, content)
     files.push({
       rel: entry.rel,
       ext: entry.ext,
       size: entry.size,
-      symbols: extractSymbols(entry.ext, content),
+      symbols: extracted.symbols,
+      symbolsTruncated: extracted.truncated,
       words: wordCounts(content),
     })
     state.files += 1
@@ -443,6 +470,10 @@ export function apply(ctx, config) {
   function buildMap(root, maxChars) {
     const { files, state } = scanner.scan(root)
     const ranked = rankFiles(files)
+    const truncatedSymbols = ranked.reduce((sum, file) => sum + (file.symbolsTruncated ?? 0), 0)
+    const notes = []
+    if (state.skippedLarge > 0) notes.push(`已跳过超大文件 ${state.skippedLarge} 个（>512KB）`)
+    if (truncatedSymbols > 0) notes.push(`已截断符号 ${truncatedSymbols} 个（单文件上限 ${MAX_SYMBOLS_PER_FILE}）`)
     const lines = []
     let used = 0
     let included = 0
@@ -460,6 +491,7 @@ export function apply(ctx, config) {
       root,
       scanned: state.files,
       skippedLarge: state.skippedLarge,
+      truncatedSymbols,
       included,
       omitted: Math.max(0, ranked.filter((file) => file.symbols.length > 0).length - included),
       chars: used,
@@ -467,7 +499,7 @@ export function apply(ctx, config) {
         .filter((file) => file.symbols.length > 0)
         .slice(0, included)
         .map((file) => ({ path: file.rel, score: file.score, symbols: file.symbols.map((symbol) => symbol.name) })),
-      block: lines.join('\n'),
+      block: [notes.length ? `（${notes.join('；')}）` : '', lines.join('\n')].filter((line) => line !== '').join('\n'),
     }
   }
 
@@ -492,6 +524,7 @@ export function apply(ctx, config) {
             root: { type: 'string' },
             scanned: { type: 'integer' },
             skippedLarge: { type: 'integer' },
+            truncatedSymbols: { type: 'integer' },
             included: { type: 'integer' },
             omitted: { type: 'integer' },
             chars: { type: 'integer' },
@@ -510,7 +543,7 @@ export function apply(ctx, config) {
               },
             },
           },
-          required: ['root', 'scanned', 'skippedLarge', 'included', 'omitted', 'chars', 'block', 'entries'],
+          required: ['root', 'scanned', 'skippedLarge', 'truncatedSymbols', 'included', 'omitted', 'chars', 'block', 'entries'],
           additionalProperties: false,
         },
         render(_args, value) {

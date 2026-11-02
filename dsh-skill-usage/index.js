@@ -60,6 +60,12 @@ function storeLocation(overrideDir) {
 
 /**
  * 纯函数：给一条记录算状态。导出是为了能在 Node 里单测（不需要跑插件）。
+ *
+ * 锚点只认「真的动过」的时间：max(lastUsedAt, reviewedAt)。
+ * `firstSeenAt` 是插件首扫到该技能的时间，**不参与** stale/archive 判定 ——
+ * 否则首装那天登记的整库历史技能会在 14/30 天后集体翻成陈旧，与「真的没用过」混在一起
+ * （2026-11-01 误报扫描 #43）。它只作为「从未使用」的旁注返回（firstSeenDays）。
+ *
  * @param {{uses?:number, firstSeenAt?:string, lastUsedAt?:string, reviewedAt?:string}} record
  * @param {number} now epoch ms
  * @param {{staleAfterDays:number, archiveAfterDays:number}} thresholds
@@ -68,12 +74,21 @@ export function classifyUsage(record, now, thresholds) {
   const lastUsed = typeof record?.lastUsedAt === 'string' ? Date.parse(record.lastUsedAt) : NaN
   const reviewed = typeof record?.reviewedAt === 'string' ? Date.parse(record.reviewedAt) : NaN
   const firstSeen = typeof record?.firstSeenAt === 'string' ? Date.parse(record.firstSeenAt) : NaN
+  const firstSeenDays = Number.isFinite(firstSeen) ? Math.max(0, Math.round(((now - firstSeen) / DAY_MS) * 10) / 10) : null
   const candidates = [Number.isFinite(lastUsed) ? lastUsed : -Infinity, Number.isFinite(reviewed) ? reviewed : -Infinity]
   const anchorMs = Math.max(...candidates)
-  const fallback = Number.isFinite(firstSeen) ? firstSeen : undefined
-  const anchor = Number.isFinite(anchorMs) && anchorMs > -Infinity ? anchorMs : fallback
-  if (anchor === undefined) return { state: 'unknown', days: null, anchoredAt: null }
 
+  // 没有「用过/复核过」的锚点：不能拿 firstSeenAt 冒充。从未用过 = new（旁注登记天数），
+  // 用过但历史存档里缺 lastUsedAt = unknown（不知道上次用的时间，也不该进 attention）。
+  if (!(Number.isFinite(anchorMs) && anchorMs > -Infinity)) {
+    if (Number.isFinite(firstSeen)) {
+      const uses = Number.isInteger(record?.uses) && record.uses > 0 ? record.uses : 0
+      return { state: uses > 0 ? 'unknown' : 'new', days: null, anchoredAt: null, firstSeenDays }
+    }
+    return { state: 'unknown', days: null, anchoredAt: null, firstSeenDays }
+  }
+
+  const anchor = anchorMs
   const days = (now - anchor) / DAY_MS
   const state =
     days >= thresholds.archiveAfterDays
@@ -83,7 +98,29 @@ export function classifyUsage(record, now, thresholds) {
         : Number.isFinite(lastUsed)
           ? 'active'
           : 'new'
-  return { state, days: Math.round(days * 10) / 10, anchoredAt: new Date(anchor).toISOString() }
+  return { state, days: Math.round(days * 10) / 10, anchoredAt: new Date(anchor).toISOString(), firstSeenDays }
+}
+
+/** 技能名归一化：去首尾空白 + 大小写折叠（用于宽容匹配，不改存储里的原名）。 */
+export function normalizeSkillKey(value) {
+  return String(value ?? '').trim().toLowerCase()
+}
+
+/**
+ * 把用户输入的名字对到账本里的规范名：先精确、再大小写/空白折叠。
+ * 返回空串表示账本里没有这个技能。
+ * @param {string} input
+ * @param {Iterable<string>} knownNames
+ */
+export function resolveSkillName(input, knownNames) {
+  const trimmed = String(input ?? '').trim()
+  if (trimmed === '') return ''
+  const names = [...new Set(knownNames)]
+  const exact = names.find((known) => known === trimmed)
+  if (exact !== undefined) return exact
+  const key = normalizeSkillKey(trimmed)
+  const folded = names.find((known) => normalizeSkillKey(known) === key)
+  return folded ?? ''
 }
 
 export function apply(ctx, config) {
@@ -213,6 +250,7 @@ export function apply(ctx, config) {
           name: skillName,
           state: result.state,
           days: result.days,
+          firstSeenDays: result.firstSeenDays,
           uses: record.uses,
           lastUsedAt: record.lastUsedAt ?? null,
           reviewedAt: record.reviewedAt ?? null,
@@ -319,6 +357,7 @@ export function apply(ctx, config) {
                   name: { type: 'string' },
                   state: { type: 'string' },
                   days: { type: 'number' },
+                  firstSeenDays: { type: 'number' },
                   uses: { type: 'integer' },
                   lastUsedAt: { type: 'string' },
                   reviewedAt: { type: 'string' },
@@ -349,6 +388,7 @@ export function apply(ctx, config) {
             const bits = [`【${label(row.state)}】${row.name}`]
             if (row.uses > 0) bits.push(`用过 ${row.uses} 次`)
             if (typeof row.days === 'number' && row.uses > 0) bits.push(`${row.days} 天前用过`)
+            if (row.state === 'new' && typeof row.firstSeenDays === 'number') bits.push(`登记于 ${row.firstSeenDays} 天前（从未用过）`)
             if (row.note) bits.push(`备注：${row.note}`)
             return `- ${bits.join(' · ')}`
           })
@@ -382,6 +422,7 @@ export function apply(ctx, config) {
             state: row.state,
             uses: row.uses,
             ...(typeof row.days === 'number' ? { days: row.days } : {}),
+            ...(typeof row.firstSeenDays === 'number' ? { firstSeenDays: row.firstSeenDays } : {}),
             ...(row.lastUsedAt ? { lastUsedAt: row.lastUsedAt } : {}),
             ...(row.reviewedAt ? { reviewedAt: row.reviewedAt } : {}),
             ...(row.note ? { note: row.note } : {}),
@@ -400,7 +441,7 @@ export function apply(ctx, config) {
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Exact skill name.' },
+          name: { type: 'string', description: 'Exact skill name (trimmed; case-insensitive lookup).' },
           note: { type: 'string', description: 'Optional short note (<= 200 chars), e.g. why it is kept.' },
         },
         required: ['name'],
@@ -428,19 +469,21 @@ export function apply(ctx, config) {
       },
       async execute(args, exec) {
         const skillName = typeof args?.name === 'string' ? args.name.trim() : ''
-        if (skillName === '') throw fail('SKILL_USAGE_ARG_MISSING', 'skill_usage_mark 需要 name（精确技能名）。')
+        if (skillName === '') throw fail('SKILL_USAGE_ARG_MISSING', 'skill_usage_mark 需要 name（技能名，首尾空白与大小写不敏感）。')
         await refreshCatalog(exec?.agent ? { scope: exec.agent } : {})
-        if (!records.has(skillName) && !catalog.has(skillName)) {
-          const known = [...new Set([...records.keys(), ...catalog.keys()])].sort().slice(0, 12)
+        const knownNames = [...new Set([...records.keys(), ...catalog.keys()])]
+        const resolved = resolveSkillName(skillName, knownNames)
+        if (resolved === '') {
+          const known = knownNames.sort().slice(0, 12)
           throw fail('SKILL_USAGE_UNKNOWN_SKILL', `未知技能：${skillName}。可用的名字例如：${known.join(', ')}`)
         }
-        const record = ensureRecord(skillName)
+        const record = ensureRecord(resolved)
         record.reviewedAt = new Date().toISOString()
         if (typeof args?.note === 'string' && args.note.trim() !== '') record.note = args.note.trim().slice(0, MAX_NOTE)
         schedulePersist()
         const result = classifyUsage(record, Date.now(), thresholds)
         return {
-          name: skillName,
+          name: resolved,
           state: result.state,
           reviewedAt: record.reviewedAt,
           ...(record.note ? { note: record.note } : {}),

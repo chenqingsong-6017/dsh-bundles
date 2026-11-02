@@ -133,3 +133,7 @@ plugin_manager remove_bundle   target = @local/dsh-notify
 - 只处理 `turn/end` 级别的事件；子代理/后台任务的完成通知没有单独做；
 - `sound: false` 只静音 Toast 本身；托盘气泡的提示音由系统控制，无法静音。
 - **依赖 `subprocess` 服务**：`canToast` 需要 `ctx.get('subprocess')`。v0.1.0 的 `inject` 只声明了 `['tools']`，而 cordis 4.x 的 `ctx.get` 只返回「提供者已激活」的实现（`cordis/lib/index.js`：`strict` 检查 `impl.fiber.state === 2`），`apply()` 时服务尚未就绪 → `canToast` 永久 false，10-27 起所有通知只写日志。v0.1.1 起 `inject` 补上 `'subprocess'`，cordis 会保证服务先就绪；判断逻辑本身不变，拿不到时仍降级为只写日志（fail-safe）。
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：耗时缺失不静默漏报（明确走未知分支）+ 正文截断附可操作提示（#45 #46）。

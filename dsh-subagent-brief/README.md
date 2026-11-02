@@ -204,3 +204,7 @@ node D:\AI\dsh-bundles\_selftest\tests\subagent-brief.test.mjs
 ## v1 的教训（为什么改拦截点）
 
 v1 在 `tools/post-execute` 上截「工具返回的 content」。2026-10-30 真机实测：子 agent 写 3900 字报告，主干收到的结算消息**没有**尾注、`truncatedCount` 仍为 0。原因就是上面「拦截点在哪」的第 1 条：子会话结果根本不经过工具返回值。v1 因此被关掉，v2 按源码把拦截点挪到 `agent/pre-step`。
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：清单类交付放宽额度到 3000；幂等只认尾注形态，引用同款文案不再误判（#39 #40）。

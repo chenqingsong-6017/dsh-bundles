@@ -43,12 +43,24 @@ const SNAPSHOT = [
 
 const matches = (patterns, name) => patterns.some((re) => re.test(name))
 
-function targetKey(args) {
+/**
+ * 目标 key：`pid|window_id`。
+ *
+ * 2026-11-02 修 #33：按官方推荐用 `element_token` 寻址时，参数里往往没有 window_id，
+ * 原先会算成 `pid|-`，而 get_window_state(pid, window_id) 复位的是 `pid|12345`——
+ * 同一个目标被拆成两个 key，block 模式下「刚快照过仍被拦」。
+ * 现在：缺 window_id 时先按 pid 反查最近一次快照的 window_id；查不到才退回 pid 级 key（`pid|*`）。
+ */
+function resolveKey(args, snapshots) {
   const a = args ?? {}
   const pid = a.pid ?? a.target?.pid
   if (pid === undefined || pid === null) return null
-  const windowId = a.window_id ?? a.target?.window_id ?? '-'
-  return `${pid}|${windowId}`
+  let windowId = a.window_id ?? a.target?.window_id
+  if (windowId === undefined || windowId === null) {
+    const cached = snapshots.byPid.get(String(pid))
+    if (cached && cached.windowId !== undefined && cached.windowId !== null) windowId = cached.windowId
+  }
+  return `${pid}|${windowId ?? '*'}`
 }
 
 function carriedTokens(args) {
@@ -82,6 +94,9 @@ export function apply(ctx, config) {
 
   /** key -> { stale: boolean, blind: number } */
   const state = new Map()
+  /** 最近一次快照：pid -> { windowId, snapshotId }，用于给 element_token 寻址反查窗口 */
+  const snapshots = { byPid: new Map() }
+  const targetKey = (args) => resolveKey(args, snapshots)
   const read = (key) => state.get(key) ?? { stale: false, blind: 0 }
   // 挂载结果是 ready 的真实依据：没挂上就是没生效，不能假装可用。
   let guardMounted = false
@@ -101,9 +116,11 @@ export function apply(ctx, config) {
     if (current.blind < limit) return undefined
 
     const [pid, windowId] = key.split('|')
+    const target = windowId === '*' ? `pid=${pid}` : `pid=${pid} window=${windowId}`
+    const nextStep = windowId === '*' ? `get_window_state(pid=${pid})` : `get_window_state(pid=${pid}, window_id=${windowId})`
     return (
-      `staleness-watch 已拦截:目标 pid=${pid} window=${windowId} 已连续 ${current.blind} 次输入操作未重新观察。` +
-      `请先调用 get_window_state(pid=${pid}, window_id=${windowId}) 取得新快照,确认页面/窗口的实际状态后再继续。`
+      `staleness-watch 已拦截:目标 ${target} 已连续 ${current.blind} 次输入操作未重新观察。` +
+      `请先调用 ${nextStep} 取得新快照,确认页面/窗口的实际状态后再继续。`
     )
   }
   if (typeof ctx.tools?.guard === 'function') {
@@ -126,7 +143,20 @@ export function apply(ctx, config) {
     const current = read(key)
 
     if (matches(SNAPSHOT, toolName)) {
+      // 记下该 pid 最近一次快照的窗口，供后续 element_token 寻址反查（#33 修）
+      const pid = args.pid ?? args.target?.pid
+      if (pid !== undefined && pid !== null) {
+        snapshots.byPid.set(String(pid), {
+          windowId: args.window_id ?? args.target?.window_id ?? null,
+          snapshotId: typeof args.snapshot_id === 'string' ? args.snapshot_id : '',
+        })
+      }
       state.set(key, { stale: false, blind: 0 })
+      // pid 级 key 也复位：同一次快照等于「该 pid 刚观察过」，不能因为是另一张 key 就继续拦
+      if (pid !== undefined && pid !== null) {
+        const pidKey = `${pid}|*`
+        if (pidKey !== key) state.set(pidKey, { stale: false, blind: 0 })
+      }
       return decision
     }
 

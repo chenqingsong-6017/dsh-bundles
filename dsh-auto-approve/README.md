@@ -27,7 +27,7 @@ DSH 安装包自带可选 bundle `@deepseek-ai/dsh-experimental-auto-review`：�
 ## 与 dsh-hooks 六层护栏的分工
 
 - **dsh-hooks 拦硬红线**：danger-guard 37 条（卷影/备份删除、凭据倾倒、代理执行、持久化、编码命令、反弹 shell、凭据外发、不可逆删除）、self-guard、fs-guard、code-guard、cred-guard、gui-guard，全部 onError: deny。它们是「守门」，宁可误杀。
-- **本插件做日常放行判断**：内置只保留 5 条最不可逆的红线，其余交给规则文件，用来**少点确认**。默认**不做 allow 放行**（没有配置 allow 规则时，行为等于没装），避免和 hooks 抢同一个判断。
+- **本插件做日常放行判断**：内置只保留 7 条最不可逆的红线，其余交给规则文件，用来**少点确认**。默认**不做 allow 放行**（没有配置 allow 规则时，行为等于没装），避免和 hooks 抢同一个判断。
 - 两层同时存在时：hooks 的 deny 不会被本插件放松；本插件的 deny 也不会因为 hooks 放行而失效。
 
 ## 规则文件
@@ -42,6 +42,7 @@ JSON 数组（也接受 `{"rules": [...]}` 形式），每条：
     {
       "name": "跑测试",
       "tool": "^bash$",
+      "fields": ["command"],
       "match": "(pnpm|npm) test",
       "decision": "allow",
       "reason": "跑测试不需要每次点确认"
@@ -49,11 +50,12 @@ JSON 数组（也接受 `{"rules": [...]}` 形式），每条：
 
 - `name`：规则名，出现在判定理由和 status 里；不写自动编 #1、#2…
 - `tool`：工具名正则，可省（省了匹配所有工具）
-- `match`：对 `JSON.stringify(工具参数)` 做匹配的正则，可省。所以 bash/pwsh 的 command、write/edit 的 file_path 都在里面
+- `fields`：只从哪些参数里取文本匹配，可省。**不写时默认只看命令/路径字段**（command/code/script/text + file_path/path/target/…），不扫 `content`/`description`——写文档提到规则关键词不会误命中；要扫正文写 `fields: ["content"]`；要恢复旧行为（整段参数 JSON）写 `fields: ["*"]`
+- `match`：对 `fields` 取出的文本做匹配的正则，可省（省了 = 不做参数匹配，只按 tool 判）。旧文档说的「整段 JSON」自 0.1.2 起需要显式 `fields: ["*"]`
 - 正则统一按 `i` 编译（不区分大小写），**不要写 `(?i)`，JS 不支持**
 - `decision`：只认 `allow` / `ask` / `deny`
 - `reason`：人话理由，会原样出现在拒绝/确认提示里
-- 单条坏规则只丢那一条；整个文件坏了只丢那一层（规则按空处理），错误进 status，**绝不抛错、绝不让工具调用挂掉**
+- 单条坏规则只丢那一条；整个文件坏了、或文件超过 64KB，只丢那一层（规则按空处理），错误进 status 的 `errors` / `lastError`，**绝不抛错、绝不让工具调用挂掉**
 - 按 mtime + size 缓存，改完不用重启，下一次调用就读新文件
 
 ## 判定模型
@@ -80,8 +82,10 @@ JSON 数组（也接受 `{"rules": [...]}` 形式），每条：
 | rm-root | rm -rf /、rm -fr /、--no-preserve-root | rm -rf /tmp/build、rm -rf node_modules、rm -rf ~/ |
 | windows-format | format C:、Format-Volume | pnpm run format、git log --format=%H |
 | vssadmin-shadows | vssadmin delete shadows | vssadmin list shadows |
-| ssh-write | 写 .ssh/ 目录（只对写类工具：write/edit/bash/pwsh/run_code/terminal…） | 用 read 读 .ssh 不拦（读凭据归 hooks 的 cred-guard） |
-| credentials-write | 写 .credentials、.credentials.yaml 等 | 参数里出现 credentials 字样但没写文件的不拦 |
+| ssh-write-path | 写类工具（write/edit/apply_patch…）的**路径参数**指向 .ssh/ 目录 | 用 read 读 .ssh 不拦（读凭据归 hooks 的 cred-guard） |
+| ssh-write-shell | 命令里**写动词 + .ssh 路径**成对出现（`>`/`>>`/Set-Content/Out-File/Copy-Item/cp/mv/tee…） | `ls ~/.ssh/`、`Get-ChildItem .ssh`、`Select-String 'ssh'` 这类只读命令放行 |
+| credentials-write-path | 写类工具的路径参数以 `.credentials` / `.credentials.yaml` 这类**文件名后缀**结尾 | `.credentials-guide.md` 是文档，不拦 |
+| credentials-write-shell | 命令里写动词 + `.credentials` 成对出现 | `git log -- .credentials.yaml`、`echo 'see .credentials'` 只是提及，放行 |
 
 红线可以整体关：配置 `builtins: false`（不建议，除非你另有等价护栏）。
 
@@ -89,8 +93,9 @@ JSON 数组（也接受 `{"rules": [...]}` 形式），每条：
 
 - 命令/代码类：command、code、script、text（bash / pwsh / run_code / terminal）
 - 路径类：file_path、filePath、path、target、target_path、new_path、old_path（write / edit / apply_patch…）
+- 两条 shell 红线要求「写动词 → 目标」成对出现（中间不跨 `|`/`;`），单看文本里有没有 `.ssh`/`.credentials` 不再算违规（2026-11-02 修，扫描 #1 #2）
 
-自己写在规则文件里的规则没有这个限制：match 默认匹配整段 JSON.stringify(args)，想更精确就把 tool 写细一点（例如只对 `^bash$` 生效）。
+自己写在规则文件里的规则默认也是这个范围（见上面 `fields`）；要扫整段参数 JSON 得显式 `fields: ["*"]`。
 
 ## 两个工具
 
@@ -203,6 +208,8 @@ JSON 数组（也接受 `{"rules": [...]}` 形式），每条：
 
 **2026-11-01 接口契约补丁**：`auto_approve_status` 增 `ready` / `unavailableReason`（判据＝插件启用且「项目级/用户级规则文件可读 或 内置红线开着」），`required` 含 `ready`，`ready:false` 时 render 首行「不可用：<原因>」；本插件不返回错误对象（坏配置一律 fail-safe 放行并记进 `status.errors`），`code` 只需保留原有的 `AUTO_APPROVE_DENIED`。实测：项目级规则文件可读 → `ready:true`；`enabled:false` → `ready:false`（理由「插件已停用」）；无规则文件 + `builtins:false` → `ready:false`；`node --check` 通过、`auto-approve.test.mjs` 19 项全过。
 
+**2026-11-02 验证记录（扫描 #1–#4 收尾）**：①两条红线已改成「写动词 + 目标」成对判定（path 红线只看写类工具的路径字段，shell 红线要求动词与 `.ssh`/`.credentials` 相邻），本次补 3 条负向样本（`git log -- .credentials.yaml`、`echo 'see .credentials'`、`Select-String 'ssh|credentials'`）与 1 条正向（`Set-Content` 写 `.ssh`）；②用户规则未写 `fields` 时不再对整段参数 JSON 匹配（默认只看命令/路径字段，显式 `fields: ["content"]` / `["*"]` 才扩大），补 5 条断言；③规则文件 >64KB 整份忽略时 `lastError` + `status.errors` 可见，补 1 条端到端断言。`node --check index.js` 通过，`node _selftest/tests/auto-approve.test.mjs` 全部通过（**未做真机工具调用**：本片约定只跑单测，线上生效由 Lead 重组后复核）。
+
 安装/重载由 Lead 统一做：源码在 `D:\AI\dsh-bundles\dsh-auto-approve`，用 plugin_manager install_bundle 安装，重载用 remove_bundle + install_bundle。
 
 ## 已知边界（诚实清单）
@@ -229,5 +236,5 @@ JSON 数组（也接受 `{"rules": [...]}` 形式），每条：
 
 1. 源码在 `D:\AI\dsh-bundles\dsh-auto-approve`，不要放进工作区
 2. `plugin_manager install_bundle` 安装；改完重载用 `remove_bundle` + `install_bundle`（热替换不换 JS 模块代际）
-3. 装完先跑 `auto_approve_status`：确认两个规则文件路径、内置红线 5 条
+3. 装完先跑 `auto_approve_status`：确认两个规则文件路径、内置红线 7 条
 4. 再跑 `auto_approve_check` 试几条日常命令（例如 pnpm test 应读作「不干预」或「放行」，取决于规则）

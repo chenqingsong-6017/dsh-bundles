@@ -51,6 +51,18 @@ staleness-watch 已拦截: 目标 pid=100 window=7 已连续 2 次输入操作�
 - 不感知"内容是否真的变了"，只计"有没有重新观察"；
 - `block` 模式会改变执行结果（拒绝），排查问题时先切回 `warn`。
 
+## 验证记录（2026-11-02，误报扫描 #33：element_token 寻址 key 分裂）
+
+| 项 | 结果 |
+|---|---|
+| 现象 | 旧实现 `targetKey = pid + (args.window_id ?? '-')`；用 `element_token` 寻址（参数常无 window_id）时 key 变 `pid\|-`，而 `get_window_state(pid, window_id)` 复位的是 `pid\|12345` → block 模式下「刚快照过仍被拦」 |
+| 修法（v0.1.2） | 缺 `window_id` 时按 pid 反查最近一次快照的 window_id（`snapshots.byPid`）；查不到才退回 pid 级 key `pid\|*`；快照同时复位该 pid 的 pid 级 key |
+| 证伪 | ✅ 先加用例跑旧代码：4 次 element_token 盲操作 + 快照后 guard 仍拦截（「已连续 4 次…」），用例失败；改后放行 |
+| 新增用例 | ✅ element_token 盲操作后快照可复位（key 不再分裂）；element_token 与显式 window_id 共享同一计数器；缓存按 pid 隔离；拦截文案对 `pid\|*` 只提示 `get_window_state(pid=…)` |
+| `node --check index.js` | 通过 |
+| `node _selftest/tests/staleness-watch.test.mjs` | 9 项通过，退出码 0 |
+| 未做 | ⚠️ 未用真实 cua 工具跑 `click({pid, element_token})` + `mode:block` 复现（扫描报告 #33 建议的真机复核）；本次验收是 mock ctx 单测级 |
+
 ## 验证记录（2026-11-01，统一契约：ready / unavailableReason / 错误 code）
 
 | 项 | 结果 |

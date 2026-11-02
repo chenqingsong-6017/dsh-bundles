@@ -45,6 +45,12 @@ export const STRUCTURED_PREFIX = 'Structured result:'
 export const SUMMARY_HEAD = '（已按摘要契约截断：原文 '
 export const SUMMARY_TAIL = ' 字符，完整内容在子会话，需要细节请让子 agent 只报关键结论）'
 /**
+ * 结构化内容（路径清单 / 表格行 / 待办 / URL）不按叙述型额度一刀切：
+ * 报告 #39 的误伤是「必须完整的交付被收成摘要」，所以命中这些形态时放宽到 3000 字符。
+ */
+export const STRUCTURED_EVIDENCE = /(^|\n)\s*(\||- \[|[A-Z]:\\|https?:\/\/)/m
+export const STRUCTURED_HINT_LIMIT = 3000
+/**
  * 截断位置要落在「最后一个换行」上，但换行太靠前就不值当（会白丢一大截）。
  * 只有换行落在最后 50% 区间里才按行断。
  */
@@ -160,7 +166,8 @@ export function isBodyPart(part) {
   if (text.startsWith(STRUCTURED_PREFIX)) return false
   if (/^diagnostic(s)?\b/i.test(text)) return false
   if (text.startsWith('诊断')) return false
-  if (text.includes(SUMMARY_HEAD)) return false
+  // 只有「尾注形态的整块」才不算正文；正文里引用同款文案不能被吞（报告 #40）。
+  if (text.startsWith(SUMMARY_HEAD) && text.endsWith(SUMMARY_TAIL) && text.length < 200) return false
   return true
 }
 
@@ -184,21 +191,29 @@ export function summarizeNotice(message, maxChars = DEFAULT_MAX_CHARS) {
   const markerIndex = findClosingMarker(content)
   if (markerIndex < 0) return unchanged
 
-  // 幂等：正文里已经有我们的尾注，就不再截（哪怕它仍比阈值长）。
+  // 幂等：只认「尾注形态的整块」（SUMMARY_HEAD 开头 + SUMMARY_TAIL 结尾 + 短），
+  // 避免子 agent 自己引用了同款句子就把整段跳过（报告 #40）。
   for (let index = markerIndex + 1; index < content.length; index += 1) {
     const part = content[index]
-    if (isTextPart(part) && part.text.includes(SUMMARY_HEAD)) return unchanged
+    if (!isTextPart(part)) continue
+    const trimmed = part.text.trim()
+    if (trimmed.startsWith(SUMMARY_HEAD) && trimmed.endsWith(SUMMARY_TAIL) && trimmed.length < 200) return unchanged
   }
 
   let bodyTotal = 0
+  let bodyText = ''
   for (let index = markerIndex + 1; index < content.length; index += 1) {
     const part = content[index]
-    if (isBodyPart(part)) bodyTotal += part.text.length
+    if (isBodyPart(part)) {
+      bodyTotal += part.text.length
+      bodyText += part.text
+    }
   }
-  if (bodyTotal <= limit) return unchanged
+  const effectiveLimit = STRUCTURED_EVIDENCE.test(bodyText) ? Math.max(limit, STRUCTURED_HINT_LIMIT) : limit
+  if (bodyTotal <= effectiveLimit) return unchanged
 
   const nextContent = content.slice(0, markerIndex + 1)
-  let remaining = limit
+  let remaining = effectiveLimit
   let lastBodyPos = -1
   for (let index = markerIndex + 1; index < content.length; index += 1) {
     const part = content[index]

@@ -174,6 +174,28 @@ assert.ok(LONG_BODY.length > 1200, '长报告要真的超过 1200，实际 ' + L
   assert.equal(summarizeNotice(noMarker, 100).changed, false, '没有结算标记的消息不处理')
   ok('没有 Its closing message: 标记：不处理（保守放行）')
 
+  // ---- 2026-11-02 升级（报告 #39/#40） ----
+  {
+    // #39：清单类内容（路径 / 表格 / 待办 / URL）不按叙述型额度一刀切，1200–3000 内放行
+    const structuredBody = [
+      '## 改动清单',
+      '| 文件 | 说明 |',
+      '| --- | --- |',
+      '- [x] D:\\AI\\dsh-bundles\\dsh-memory\\index.js 改预算',
+      '- [ ] D:\\AI\\dsh-bundles\\dsh-memory\\README.md 补记录',
+    ].join('\n') + '\n' + '说明文字。'.repeat(260)
+    assert.ok(structuredBody.length > 1200 && structuredBody.length < 3000, '构造的清单正文要落在 1200–3000')
+    const structuredMsg = settle([{ type: 'text', text: structuredBody }])
+    assert.equal(summarizeNotice(structuredMsg, 1200).changed, false, '结构化交付 1200–3000 字符内不该被截残（放宽到 3000）')
+
+    // #40：正文里只是「引用」同款文案，不能把整段当已截断跳过
+    const quotedBody = '引用：' + SUMMARY_HEAD + '123 字符' + SUMMARY_TAIL + '\n' + '真正文。'.repeat(300)
+    const quotedMsg = settle([{ type: 'text', text: quotedBody }])
+    assert.equal(summarizeNotice(quotedMsg, 1200).changed, true, '只是引用了同款文案，仍应正常截断')
+
+    ok('升级：清单类内容放宽额度 / 引用尾注文案不误判幂等')
+  }
+
   const noColon = {
     role: 'user',
     content: [

@@ -298,6 +298,103 @@ try {
   assert.equal(captured.version, 3)
   ok('新快照记录写入 sessionId（exec.agent.id）与可解析时间戳，存档 version=3')
 
+  // ---------- 严格匹配：restore / forget / diff 歧义必须拒绝，restore 只动一个目标 ----------
+  const ambRoot = path.join(root, 'ambiguous')
+  const ambWork = path.join(ambRoot, 'work')
+  const ambStore = path.join(ambRoot, 'store')
+  mkdirSync(ambWork, { recursive: true })
+  const ambA = path.join(ambWork, 'index-a.txt')
+  const ambB = path.join(ambWork, 'index-b.txt')
+  const ambOther = path.join(ambWork, 'other.txt')
+  for (const file of [ambA, ambB, ambOther]) writeFileSync(file, `live ${path.basename(file)}`, 'utf8')
+  seedStore(ambStore, [
+    { path: ambA, content: 'snap a', capturedAt: isoDaysAgo(1), created: false },
+    { path: ambB, content: 'snap b', capturedAt: isoDaysAgo(1), created: false },
+    { path: ambOther, content: 'snap other', capturedAt: isoDaysAgo(1), created: false },
+  ])
+  const ambFiles = new Map([
+    [ambA, 'live a'],
+    [ambB, 'live b'],
+    [ambOther, 'live other'],
+  ])
+  const ambFs = {
+    resolve: async (raw) => ({ displayPath: typeof raw === 'string' ? raw : String(raw?.displayPath ?? '') }),
+    stat: async (target) =>
+      ambFiles.has(target.displayPath) ? { type: 'file', size: String(ambFiles.get(target.displayPath) ?? '').length } : null,
+    readText: async (target) => ambFiles.get(target.displayPath),
+    writeText: async (target, content) => {
+      ambFiles.set(target.displayPath, content)
+    },
+    processPath: (target) => target.displayPath,
+  }
+  const amb = makeHarness({ storeDir: ambStore, protectDirs: [protectedDir] }, { fs: ambFs })
+  const ambList = () => call(amb, 'checkpoint_list', {})
+  assert.equal((await ambList()).total, 3, '3 个快照就位')
+  ok('严格匹配用例就位：3 个快照（index-a / index-b / other）')
+
+  // 文件名片段 "index" 命中两个 → 三个工具都必须拒绝，且列出候选路径
+  const ambiguous = { code: 'AMBIGUOUS_TARGET', hasCandidates: (message) => message.includes(ambA) && message.includes(ambB) }
+  await assert.rejects(
+    () => call(amb, 'checkpoint_forget', { path: 'index' }),
+    (error) => {
+      assert.equal(error.code, ambiguous.code)
+      assert.match(error.message, /命中 2 个快照/)
+      assert.ok(ambiguous.hasCandidates(error.message), '候选路径必须列全，不能只说"命中多个"')
+      return true
+    },
+  )
+  assert.equal((await ambList()).total, 3, '歧义被拒后记录一条都不能少')
+  ok('checkpoint_forget：模糊命中 2 个 → 拒绝并列出候选，记录不变')
+
+  await assert.rejects(
+    () => call(amb, 'checkpoint_restore', { path: 'index' }),
+    (error) => {
+      assert.equal(error.code, ambiguous.code)
+      assert.ok(ambiguous.hasCandidates(error.message), '候选路径必须列全')
+      return true
+    },
+  )
+  assert.equal(ambFiles.get(ambA), 'live a', '歧义被拒时不能碰 index-a')
+  assert.equal(ambFiles.get(ambB), 'live b', '歧义被拒时不能碰 index-b')
+  assert.equal((await ambList()).total, 3)
+  ok('checkpoint_restore：歧义被拒，文件一个都没动（旧行为会逐个恢复）')
+
+  await assert.rejects(
+    () => call(amb, 'checkpoint_diff', { path: 'index' }),
+    (error) => {
+      assert.equal(error.code, ambiguous.code)
+      assert.ok(ambiguous.hasCandidates(error.message), '候选路径必须列全')
+      return true
+    },
+  )
+  ok('checkpoint_diff：歧义被拒并列出候选')
+
+  // 唯一后缀 / 全等路径仍可用
+  const singleDiff = await call(amb, 'checkpoint_diff', { path: 'index-a.txt' })
+  assert.equal(singleDiff.entries.length, 1, '唯一后缀只命中一个目标')
+  assert.equal(singleDiff.entries[0].path, ambA)
+  ok('checkpoint_diff：唯一后缀 index-a.txt 只对比一个目标')
+
+  const restoredOne = await call(amb, 'checkpoint_restore', { path: 'index-a.txt' })
+  assert.equal(restoredOne.restored.length, 1, 'restore 只处理一个目标')
+  assert.equal(restoredOne.restored[0].path, ambA)
+  assert.equal(ambFiles.get(ambA), 'snap a', '唯一命中的目标被恢复成快照内容')
+  assert.equal(ambFiles.get(ambB), 'live b', '另一个同片段目标绝不能被一起恢复')
+  assert.equal((await ambList()).total, 2)
+  ok('checkpoint_restore：只动一个目标，index-b 原样保留')
+
+  const restoredExact = await call(amb, 'checkpoint_restore', { path: ambB })
+  assert.equal(restoredExact.restored.length, 1)
+  assert.equal(ambFiles.get(ambB), 'snap b', '全等路径（含盘符大小写差异也可）直接可用')
+  ok('checkpoint_restore：全等路径可直接恢复')
+
+  const forgotOne = await call(amb, 'checkpoint_forget', { path: 'other' })
+  assert.deepEqual(forgotOne.forgotten, [ambOther], '唯一后缀只丢一条快照')
+  assert.equal(forgotOne.remaining, 0)
+  assert.ok(existsSync(ambOther), 'forget 只丢快照，不删文件')
+  amb.flush()
+  ok('checkpoint_forget：唯一后缀只丢一条，文件不动')
+
   console.log(`checkpoint: ${passed} 项通过`)
 } finally {
   rmSync(root, { recursive: true, force: true })

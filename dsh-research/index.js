@@ -59,11 +59,30 @@ export function makeId(slug, now = Date.now()) {
   return 'r-' + day + '-' + rand
 }
 
-/** 引用解析：http(s) 链接 / path:line / path:line-line / 纯文本（无落点）。 */
+/** arXiv 编号：新式 YYMM.NNNNN(vN) 或旧式 archive[.CC]/YYMMNNN(vN)。 */
+const ARXIV_ID = /^(?:\d{4}\.\d{4,5}|[a-z][a-z-]*(?:\.[a-z]{2})?\/\d{7})(?:v\d+)?$/i
+/** 会话 id：字母数字下划线与连字符，≤64 字符。 */
+const SESSION_ID = /^[A-Za-z0-9_-]{1,64}$/
+/** git 提交：7-40 位十六进制。 */
+const GIT_SHA = /^[0-9a-f]{7,40}$/i
+
+/** 引用解析：http(s) 链接 / arXiv:编号 / session:id / git:sha / path:line / 纯文本（无落点）。
+ *  2026-11-02 修 #25：论文编号、会话 id、commit sha 都是合法证据形态，不再一律判「无落点」。 */
 export function parseRef(ref) {
   const raw = strValue(ref)
   if (raw === '') return { kind: 'none', value: '' }
   if (/^https?:\/\//i.test(raw)) return { kind: 'url', value: raw }
+  const arxiv = /^arxiv:\s*(\S+)$/i.exec(raw)
+  if (arxiv) {
+    // 规范化为可点击的 abs 链接；编号不合法仍判无落点。
+    return ARXIV_ID.test(arxiv[1])
+      ? { kind: 'url', value: 'https://arxiv.org/abs/' + arxiv[1] }
+      : { kind: 'none', value: raw }
+  }
+  const session = /^session:\s*(\S+)$/i.exec(raw)
+  if (session) return SESSION_ID.test(session[1]) ? { kind: 'session', value: session[1] } : { kind: 'none', value: raw }
+  const git = /^git:\s*(\S+)$/i.exec(raw)
+  if (git) return GIT_SHA.test(git[1]) ? { kind: 'git', value: git[1].toLowerCase() } : { kind: 'none', value: raw }
   const match = /^(\.{0,2}[\\/]?.+?):(\d+)(?:-(\d+))?$/.exec(raw)
   if (match) {
     const start = Number(match[2])
@@ -93,6 +112,7 @@ export function lintTask(task, fileChecker) {
   const missing = []
   const inferred = []
   const uncheckedUrls = []
+  const uncheckedRefs = []
   const brokenRefs = []
   const lowConfidence = []
   for (const item of evidence) {
@@ -101,6 +121,8 @@ export function lintTask(task, fileChecker) {
     const ref = parseRef(item.ref)
     if (ref.kind === 'none') { missing.push(item); continue }
     if (ref.kind === 'url') { uncheckedUrls.push(item); continue }
+    // session / git 是格式合法的落点，没法像文件那样真去查行号：单独记账，不判定引用。
+    if (ref.kind === 'session' || ref.kind === 'git') { uncheckedRefs.push(item); continue }
     const check = fileChecker(ref)
     if (check.ok !== true) brokenRefs.push({ item, reason: check.reason })
     if (item.confidence === 'low') lowConfidence.push(item)
@@ -112,6 +134,7 @@ export function lintTask(task, fileChecker) {
     missing,
     inferred: inferred.length,
     uncheckedUrls: uncheckedUrls.length,
+    uncheckedRefs: uncheckedRefs.length,
     brokenRefs,
     lowConfidence: lowConfidence.length,
     canClose: evidence.length > 0 && missing.length === 0 && brokenRefs.length === 0,
@@ -281,6 +304,7 @@ export function apply(ctx, config) {
       missingEvidence: lint.missingEvidence,
       inferred: lint.inferred,
       uncheckedUrls: lint.uncheckedUrls,
+      uncheckedRefs: lint.uncheckedRefs,
       brokenRefs: lint.brokenRefs.map((entry) => ({ claim: entry.item.claim, reason: entry.reason })),
       lowConfidence: lint.lowConfidence,
       canClose: lint.canClose,
@@ -393,7 +417,7 @@ export function apply(ctx, config) {
           const ref = strValue(args?.ref)
           const parsed = parseRef(ref)
           if (!inferred && parsed.kind === 'none') {
-            return { ok: false, code: 'EVIDENCE_UNVERIFIABLE', lastError: '证据必须能回到一行：给 http(s) 链接或 文件:行；确实没取证就传 inferred:true（会进未验证区）' }
+            return { ok: false, code: 'EVIDENCE_UNVERIFIABLE', lastError: '证据必须能回到一行：给 http(s) 链接、arXiv:编号、session:id、git:sha 或 文件:行；确实没取证就传 inferred:true（会进未验证区）' }
           }
           const confidence = normalizeConfidence(args?.confidence, tier)
           const item = {
@@ -410,7 +434,10 @@ export function apply(ctx, config) {
           let noteText = ''
           if (!inferred) {
             if (parsed.kind === 'url') { verified = false; noteText = '链接未联网核对（离线环境只校验格式）' }
-            else {
+            else if (parsed.kind === 'session' || parsed.kind === 'git') {
+              verified = false
+              noteText = (parsed.kind === 'git' ? '提交 sha' : '会话 id') + '格式合法，未核对（插件不做 git / 会话日志查询）'
+            } else {
               const check = fileChecker(parsed)
               verified = check.ok === true
               noteText = check.ok === true ? (check.note || '文件与行号已核对') : String(check.reason || '')
@@ -439,7 +466,7 @@ export function apply(ctx, config) {
           type: 'object',
           properties: {
             ok: { type: 'boolean' }, code: { type: 'string' }, id: { type: 'string' }, evidence: { type: 'integer' }, missingEvidence: { type: 'integer' },
-            inferred: { type: 'integer' }, uncheckedUrls: { type: 'integer' }, lowConfidence: { type: 'integer' },
+            inferred: { type: 'integer' }, uncheckedUrls: { type: 'integer' }, uncheckedRefs: { type: 'integer' }, lowConfidence: { type: 'integer' },
             brokenRefs: { type: 'array', items: { type: 'object', additionalProperties: true } },
             canClose: { type: 'boolean' }, tiers: { type: 'object', additionalProperties: true }, lastError: { type: 'string' },
           },
@@ -448,7 +475,8 @@ export function apply(ctx, config) {
         },
         render(_args, value) {
           if (value.ok !== true) return [text('检查失败：' + (value.lastError || '未知原因'))]
-          return [text('任务 ' + value.id + '：证据 ' + value.evidence + ' 条，无落点 ' + value.missingEvidence + '，推断 ' + value.inferred + '，断引用 ' + (value.brokenRefs || []).length + '，可收尾=' + value.canClose)]
+          const extra = value.uncheckedRefs > 0 ? '，格式未核 ' + value.uncheckedRefs : ''
+          return [text('任务 ' + value.id + '：证据 ' + value.evidence + ' 条，无落点 ' + value.missingEvidence + '，推断 ' + value.inferred + '，断引用 ' + (value.brokenRefs || []).length + extra + '，可收尾=' + value.canClose)]
         },
       },
       async execute(args) {

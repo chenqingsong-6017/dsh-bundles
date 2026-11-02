@@ -113,3 +113,7 @@ plugin_manager remove_bundle   target = @local/dsh-usage
 - **会话被删除后，其历史也会从报表里消失**（报表永远反映磁盘现状，不做独立归档）；
 - 成本只算 token 单价，不含套餐折扣、免费额度、按次计费等情况，属于"账面估算"；
 - 只统计 `assistant/message` 的成功调用；失败的请求若有 usage 也会被计入（DSH 目前失败一般不记 usage）。
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：价格表前缀匹配收紧（需显式 * 通配）；event.time 缺失跳过并计数，不用 Date.now 冒充（#47 #48）。

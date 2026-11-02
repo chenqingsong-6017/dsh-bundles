@@ -82,3 +82,7 @@ plugin_manager action=remove_bundle target=@local/dsh-skill-usage
 | `node --check index.js` | 通过 |
 | `node _selftest/tests/skill-usage.test.mjs` | 7 项通过，退出码 0 |
 | 契约真机校验 | 可写目录 `ready:true`；存档坏 JSON → `SKILL_USAGE_STORE_UNREADABLE`；目录不可建 → `SKILL_USAGE_STORE_UNWRITABLE` |
+
+## 2026-11-02 升级记录
+
+- 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：firstSeenAt 不再冒充 lastUsedAt 进 stale 判定；技能名归一化后再匹配（#43 #44）。

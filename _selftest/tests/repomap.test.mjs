@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { apply, createScanCache, extractSymbols } from '../../dsh-repomap/index.js'
+import { apply, createScanCache, extractSymbols, extractSymbolsDetailed } from '../../dsh-repomap/index.js'
 
 let passed = 0
 const ok = (label) => {
@@ -162,6 +162,31 @@ try {
   assert.deepEqual(outlineBefore.symbols.map((symbol) => symbol.name), ['alpha'])
   assert.deepEqual(outlineAfter.symbols.map((symbol) => symbol.name), ['alpha', 'omega'])
   ok('repo_outline 单文件缓存：文件改动后立刻失效')
+
+  // ---------- 2026-11-02 新增（报告 #50）：跳过 / 截断必须明示，不许静默失真 ----------
+  {
+    writeSource('src/huge.js', 'export function hugeOne() {}\n// ' + 'x'.repeat(520 * 1024) + '\n')
+    const manyFunctions = Array.from({ length: 70 }, (_, index) => `export function fn${index}() {}`).join('\n')
+    writeSource('src/many.js', manyFunctions)
+
+    const detailed = extractSymbolsDetailed('.js', manyFunctions)
+    assert.equal(detailed.symbols.length, 60, '单文件符号上限 60（原有行为不变）')
+    assert.equal(detailed.truncated, 10, '被截掉的符号数必须如实报出（原实现是静默 slice(0,60)）')
+    assert.equal(extractSymbols('.js', manyFunctions).length, 60, 'extractSymbols 兼容旧签名，仍返回符号数组')
+
+    const map = await repoMap.execute({ path: fixture }, {})
+    assert.ok(map.skippedLarge >= 1, `>512KB 文件必须计入 skippedLarge，实际 ${map.skippedLarge}`)
+    assert.ok(map.truncatedSymbols >= 10, `70 符号文件必须计入 truncatedSymbols，实际 ${map.truncatedSymbols}`)
+    assert.ok(map.block.includes('已跳过'), `地图正文必须明示已跳过，实际：${map.block.slice(0, 300)}`)
+    assert.ok(map.block.includes('512'), '跳过原因要写清阈值（>512KB）')
+    assert.ok(map.block.includes('已截断'), '符号超上限必须明示已截断')
+    const rendered = repoMap.output.render({}, map)[0].text
+    assert.ok(
+      rendered.includes('已跳过') && rendered.includes('已截断'),
+      `render 顶部也必须明示跳过/截断，实际：${rendered.slice(0, 220)}`,
+    )
+    ok('repo_map：超大文件跳过与符号截断都带明示标记（不再静默失真）')
+  }
 } finally {
   rmSync(fixture, { recursive: true, force: true })
 }
