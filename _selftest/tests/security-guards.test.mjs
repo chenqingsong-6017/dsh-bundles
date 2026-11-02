@@ -89,6 +89,10 @@ const CASES = [
   ['fs', 'write', { file_path: 'C:/Users/x/.dsh/hooks.json', content: 'x' }, 2, '改护栏配置'],
   ['fs', 'edit', { file_path: 'D:/AI/dsh-bundles/dsh-hooks/examples/guard-danger.mjs', old_string: 'a', new_string: 'b' }, 2, '改护栏脚本'],
   ['fs', 'write', { file_path: 'D:/AI/dsh-bundles/dsh-hooks/README.md', content: 'x' }, 0, '写自己仓库'],
+  // 2026-11-03 全局审计 G1/G2：合并护栏与 net-guard 曾不在保护正则内
+  ['fs', 'write', { file_path: 'D:/AI/dsh-bundles/dsh-hooks/examples/guards-bash-pwsh.mjs', content: 'x' }, 2, '写合并护栏（G1）'],
+  ['fs', 'edit', { file_path: 'D:/AI/dsh-bundles/dsh-hooks/examples/guard-self.mjs', old_string: 'a', new_string: 'b' }, 2, '改自保护护栏（G1）'],
+  ['fs', 'write', { file_path: 'D:/AI/dsh-bundles/_ops/net-guard.mjs', content: 'x' }, 2, '写网络护栏（G2）'],
   ['fs', 'write', { file_path: 'D:/AI-date/dsh-date/dsh-创建/AGENTS.md', content: 'x' }, 0, '写工作区规则'],
   ['cred', 'read', { file_path: 'C:/Users/x/.dsh/.credentials.yaml' }, 2, '读凭据'],
   ['cred', 'read', { file_path: 'C:/Users/x/.ssh/id_rsa' }, 2, '读私钥'],
@@ -106,6 +110,10 @@ const CASES = [
   ['self', 'pwsh', { command: 'node --check D:/AI/dsh-bundles/dsh-hooks/examples/guard-self.mjs' }, 0, '检查护栏语法'],
   ['self', 'pwsh', { command: 'git add dsh-hooks/examples/guard-self.mjs 2>&1 | Out-String' }, 0, 'git add + 2>&1 不写护栏（误报回归）'],
   ['self', 'pwsh', { command: 'echo hacked > D:/AI/dsh-bundles/dsh-hooks/examples/guard-self.mjs' }, 2, '重定向写护栏必须拦'],
+  // 2026-11-03 全局审计 G1/G2
+  ['self', 'pwsh', { command: 'Set-Content D:/AI/dsh-bundles/dsh-hooks/examples/guards-bash-pwsh.mjs x' }, 2, 'pwsh 写合并护栏（G1）'],
+  ['self', 'pwsh', { command: 'echo hacked > D:/AI/dsh-bundles/_ops/net-guard.mjs' }, 2, '重定向写网络护栏（G2）'],
+  ['self', 'pwsh', { command: 'node --check D:/AI/dsh-bundles/dsh-hooks/examples/guards-bash-pwsh.mjs' }, 0, '检查合并护栏语法（放行）'],
   ['gui', 'cua_driver_native__launch_app', { path: 'C:/Windows/System32/cmd.exe' }, 2, 'GUI 起系统二进制'],
   ['gui', 'cua_driver_native__launch_app', { path: 'D:/tmp/x.hta' }, 2, 'GUI 起脚本'],
   ['gui', 'cua_driver_native__launch_app', { name: 'notepad' }, 0, 'GUI 起普通应用'],

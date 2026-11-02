@@ -19,6 +19,25 @@
  * 规则同源：DANGER_RULES 与 guard-danger.mjs 的 RULES 逐字一致，SELF_* 与 guard-self.mjs 一致。
  * 漂移由 guards-merge.test.mjs 的 drift 用例守护：原文件改了而这里没同步，测试就红。
  */
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import path from 'node:path'
+
+/** 配置驱动（2026-11-03 修 G1/G2）：命令行里是否点名了 hooks.json 任意 run 指向的脚本。 */
+function configuredScriptTouched(cmdText) {
+  try {
+    const file = process.env.DSH_HOME
+      ? path.join(process.env.DSH_HOME, 'hooks.json')
+      : path.join(homedir(), '.dsh', 'hooks.json')
+    const text = readFileSync(file, 'utf8')
+    for (const m of text.matchAll(/"([^"]+\.(?:mjs|js|cjs))"/g)) {
+      const p = m[1].replace(/\\/g, '/').toLowerCase()
+      if (p !== '' && cmdText.includes(p)) return true
+    }
+  } catch { /* 读不到配置就只用静态正则 */ }
+  return false
+}
+
 const raw = await new Promise((resolve) => {
   let buffer = ''
   process.stdin.setEncoding('utf8')
@@ -98,7 +117,7 @@ const MSG_SELF = "拒绝执行：命令在写护栏文件或配置（hooks.json 
 
 // ---- 规则集 B：护栏自保护（与 guard-self.mjs 同源） ----
 const SELF_WRITE_VERB = /(set-content|add-content|out-file|copy-item|move-item|rename-item|new-item|del\s|erase\s|rimraf|tee\b|>{1,2}\s*(?!&))\S*/
-const SELF_GUARD_TARGET = /(hooks\.json|guard-[a-z]+\.mjs)/
+const SELF_GUARD_TARGET = /(hooks\.json|guards?-[a-z-]+\.mjs|net-guard\.mjs|install-net-guard\.mjs|guard-protect-apply\.mjs)/
 
 // ---- 评估：两套规则都跑，任一击中即 stderr + exit 2（等价于 deny > ask > allow 折叠） ----
 const HITS = []
@@ -110,7 +129,7 @@ if (DANGER_ON) {
     }
   }
 }
-if (SELF_ON && SELF_WRITE_VERB.test(cmd) && SELF_GUARD_TARGET.test(cmd)) HITS.push(MSG_SELF)
+if (SELF_ON && SELF_WRITE_VERB.test(cmd) && (SELF_GUARD_TARGET.test(cmd) || configuredScriptTouched(cmd))) HITS.push(MSG_SELF)
 if (HITS.length === 0) process.exit(0)
 for (const hit of HITS) console.error(hit)
 process.exit(2)
