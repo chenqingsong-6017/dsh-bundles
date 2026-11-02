@@ -1,7 +1,7 @@
 <#
   DSH 自研插件栈自检（开发期脚本，不是插件）。
 
-  一条命令跑完：结构 → 清单 → 语法 → schema → 单元测试 → profile 安装一致性。
+  一条命令跑完：结构 → 清单 → 语法 → schema → 单元测试 → profile 安装一致性 → 装配顺序。
   退出码 0 表示全绿；任何一项失败返回 1。
 
   用法：
@@ -165,6 +165,16 @@ if (Test-Path $profileJson) {
     }
   }
 }
+
+Write-Host ""
+Write-Host "=== 5. pre-execute 装配顺序（checkpoint → hooks → auto-approve） ==="
+# 顺序 = profile.dsh.profile.bundles 数组下标 = Cordis 插件注册顺序 = tools/pre-execute waterfall 调用顺序。
+# 语义依据：官方 docs/tool-execution-pipeline.zh.md + docs/cordis-primer.zh.md（waterfall 注册顺序/短路）；本仓说明见 README.md。
+$orderScript = Join-Path $root '_selftest\assembly-order.mjs'
+$orderOutput = node $orderScript --profile $profileJson 2>&1
+$orderExit = $LASTEXITCODE
+Check ($orderExit -eq 0) "装配顺序 checkpoint < hooks < auto-approve（$($orderOutput | Select-Object -Last 1)）"
+if ($orderExit -ne 0) { $orderOutput | ForEach-Object { Write-Host "    $_" -ForegroundColor Red } }
 
 Write-Host ""
 if ($failures.Count -eq 0) {

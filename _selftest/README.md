@@ -9,14 +9,15 @@ pwsh -NoProfile -File D:\AI\dsh-bundles\_selftest\selfcheck.ps1
 pwsh -NoProfile -File ...\selfcheck.ps1 -SkipTests    # 跳过单测，只跑结构/manifest/schema
 ```
 
-检查四层，退出码非 0 表示有失败：
+检查五层，退出码非 0 表示有失败：
 
 1. **结构与清单**（每个 bundle）：`package.json` 可解析、声明 `dsh.bundle.patch`、patch 有 insert 或覆盖行、`index.js` 语法（纯配置 bundle 自动跳过）、严格清单里还要求 `locale/en+zh`、`icon.svg`（<256 KiB 且是 SVG）、`README.md`；
 2. **工具输出 schema**：调 `schema-check.mjs`（见下），25 个工具全覆盖；
 3. **单元测试**：跑 `tests/*.test.mjs`（checkpoint 的 diff/hunk、repomap 的符号抽取、skill-usage 的陈旧判定、memory 的渲染、verify 的项目识别、usage 的日志解析、audit 的危险分级与脱敏、notify 的触发规则与通知脚本）；
 4. **profile 安装一致性**：bundle 在 `dsh.profile.bundles` 里、依赖是 `link:<bundle 目录>`、`node_modules` 里的链接确实指向同一个目录。
+5. **pre-execute 装配顺序**：`checkpoint → hooks → auto-approve` 的相对顺序必须保持（`_selftest/assembly-order.mjs`）；反序会让 harness 的 waterfall 早停，安全语义退化。顺序的理由与证伪方式见仓库根 [README.md](../README.md)「pre-execute 拦截链顺序」。
 
-当前结果：**277 项检查全部通过**。
+当前结果：**345 项检查全部通过**（2026-11-02 21:55 实测；基线为 328，本轮新增装配顺序/锚点/护栏合并/write-scope 等用例。项数会随用例增长，以 `selfcheck.ps1` 末行实际输出为准）。
 
 ## schema-check.mjs
 
