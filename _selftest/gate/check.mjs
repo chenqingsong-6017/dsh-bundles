@@ -255,7 +255,11 @@ for (const name of foundTests) {
 }
 
 if (tested.length > 0) lines.push('测试门：全量跑了 ' + tested.length + ' 个测试（' + (testMs / 1000).toFixed(1) + 's）')
-else lines.push('测试门：_selftest/tests 里没有测试文件')
+else {
+  // 2026-11-03 全局审计：测试目录为空/被清空时，旧实现只打一行字、不失败（门被掏空仍绿）
+  lines.push('测试门：_selftest/tests 里没有测试文件')
+  failures.push('✗ 测试门：_selftest/tests 里没有测试文件 —— 门被掏空（目录被移走/清空时不应绿）')
+}
 
 // 洞 2：覆盖缺口棘轮。baseline 是「当前已欠账」的白名单，只允许收紧：
 //   - 不在白名单里的「有入口无测试」→ 失败（新增插件必须补测试）；
@@ -290,6 +294,10 @@ if (existsSync(standardScript)) {
   const std = run([standardScript], BUNDLES_DIR)
   const summary = (std.output.split('\n').find((line) => line.startsWith('共 ')) ?? '').trim()
   lines.push('标准门（report）：' + (summary || (std.ok ? '已跑' : '执行异常，见 standard-check')))
+} else {
+  // 2026-11-03：脚本被改名/移走时旧实现静默跳过（与「空插件目录必须红」口径不一致）
+  lines.push('标准门（report）：脚本缺失')
+  failures.push('✗ 标准门：找不到 ' + standardScript + ' —— 脚本被改名/移走，不能静默跳过')
 }
 
 // ---- 阶段 5：性能基线慢门（--perf，默认关闭） ----
