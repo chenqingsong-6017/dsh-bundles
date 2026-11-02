@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Reasoning effort slider",
+    "description": "A four-stop slider beside the composer that switches this session's reasoning effort (off / low / high / max) without opening the model menu."
+  }
+}
