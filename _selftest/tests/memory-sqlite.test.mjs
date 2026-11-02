@@ -9,6 +9,7 @@ import { copyFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { apply, canonicalJson, isArchivedEntry, isInvalidEntry, migrateState, readStoreSnapshot } from '../../dsh-memory/index.js'
+import { makeTmp, cleanup, sweepStaleDirs } from './_tmp-dirs.mjs'
 
 let passed = 0
 const ok = (label) => { passed += 1; console.log('  ✓ ' + label) }
@@ -58,11 +59,10 @@ function host(dir, extra) {
   apply(ctx, { storeDir: dir, maxInjectChars: 1500, maxBytes: 20000, captureCandidates: false, captureRuleFiles: false, ...(extra ?? {}) })
   return { defs, layers, handlers }
 }
-function tmp(tag) { return mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-sqlite-' + tag + '-')) }
-// 进程内打开的 SQLite 连接会锁住临时文件；清理失败不影响结论（临时目录交给系统清理）。
-function cleanup(dir) {
-  try { rmSync(dir, { recursive: true, force: true, maxRetries: 3 }) } catch (error) { /* 连接仍打开时忽略 */ }
-}
+// 临时目录统一交给 _tmp-dirs.mjs：带 pid、退出兜底、下次运行清扫上次遗留。
+// （2026-11-02 修：原来这里 rmSync 失败被静默吞掉，5 小时积了 122 个垃圾目录。）
+function tmp(tag) { return makeTmp('dsh-memory-sqlite-' + tag) }
+sweepStaleDirs()
 
 const QUERIES = [
   '插件放哪个盘', '改完插件要重启吗', 'vault 分层 指针', '待复核的事实', '新的生效事实',

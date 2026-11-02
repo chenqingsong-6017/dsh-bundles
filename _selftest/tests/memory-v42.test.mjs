@@ -5,6 +5,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { makeTmp, cleanup, sweepStaleDirs } from './_tmp-dirs.mjs'
 import {
   apply,
   derivableHit,
@@ -21,7 +22,10 @@ const ok = (label) => {
   passed += 1
   console.log('  ✓ ' + label)
 }
-const tmp = (tag) => mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-v42-' + tag + '-'))
+// 临时目录统一交给 _tmp-dirs.mjs：带 pid、退出兜底、下次运行清扫上次遗留。
+// （2026-11-02 修：原来 reference / budget 两个用例压根没清理，5 小时积了 27 个垃圾目录。）
+const tmp = (tag) => makeTmp('dsh-memory-v42-' + tag)
+sweepStaleDirs()
 
 // 测试宿主：结构与 memory.test.mjs 的 host() 同构；多的能力是能把 cwd 灌进去（写入过滤要读规则源）。
 function host(dir, extra) {
@@ -91,8 +95,8 @@ const priming = (h) => h.layers[0].text({ agent: { session: {} } })
   priming(h2)
   const off = await h2.defs.get('memory_add').execute({ text: ruleLine })
   assert.ok(off.entry && off.entry.id, 'deriveGate:off 时不拦')
-  rmSync(root, { recursive: true, force: true })
   ok('2.1 memory_add：可推导 → skipped（不写库），force:true / deriveGate:off 两条逃生口可用')
+  cleanup(root)
 }
 
 // ── 2.2 reference 类型（Anthropic 四类笔记之一）──
@@ -119,6 +123,7 @@ const priming = (h) => h.layers[0].text({ agent: { session: {} } })
   const full = renderMemory([{ ...added.entry, pinned: true }], { maxInjectChars: 1500 })
   assert.ok(full.includes('↗ ') && full.includes(added.entry.text), '全文注入行要带 reference 标记，实际：' + full.slice(0, 200))
   ok('2.2 reference：写入 / 重要度 / 180 天复核 / 检索 / 注入标记 全部成立')
+  cleanup(dir)
 }
 
 // ── 2.3 预算见顶：报错里带「建议合并 / drop」具体条目（Anthropic A2）──
@@ -157,6 +162,7 @@ const priming = (h) => h.layers[0].text({ agent: { session: {} } })
   assert.match(message, /m3（staleAfter 2026-01-01 已过/, 'drop 建议要点名 stale 条目 m3，实际：' + message)
   assert.ok(!/m4（/.test(message), '规则条目 m4 不能被列为 drop 候选（与 makeRoom 的 kind!==rule 同口径），实际：' + message)
   ok('2.3 预算见顶：错误里带「建议合并 m1+m2 / drop m3（stale）」，且不把规则 m4 当 drop 候选')
+  cleanup(dir)
 }
 
 // ── 2.4 procedure 类型（Google ADK Procedural / Voyager 验证门槛）──
@@ -204,7 +210,7 @@ const priming = (h) => h.layers[0].text({ agent: { session: {} } })
   const exported = await h.defs.get('memory_export').execute({})
   const cards = exported.entries.map((item) => readFileSync(item.file, 'utf8'))
   assert.ok(cards.some((card) => /verifiedCount: \d+/.test(card)), '导出卡片要带 verifiedCount')
-  rmSync(dir, { recursive: true, force: true })
+  cleanup(dir)
   ok('2.4 procedure：verifiedCount≥2 才收 / 落证据 / 可检索 / 可注入 / 可累加 / 不能无证据升级')
 }
 

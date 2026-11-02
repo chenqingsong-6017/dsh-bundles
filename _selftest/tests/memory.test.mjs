@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { makeTmp, sweepStaleDirs } from './_tmp-dirs.mjs'
 import {
   apply,
   detectScope,
@@ -42,6 +43,9 @@ import {
   migrateState,
   textSimilarity as sim,
 } from '../../dsh-memory/index.js'
+
+// 清掉上次运行遗留的临时目录（此刻本文件还没建任何目录，安全）。
+sweepStaleDirs()
 
 let passed = 0
 const ok = (label) => {
@@ -199,7 +203,7 @@ assert.deepEqual(normalized.tags, ['a', 'b'])
 assert.equal(normalized.usedCount, 3)
 ok('normalizeEntry 保留 v2 字段')
 
-const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-test-'))
+const tmpDir = makeTmp('dsh-memory-test')
 const host = (dir, extra) => {
   const defs = new Map()
   const layers = []
@@ -258,7 +262,7 @@ renderMemory(supEntries, { maxInjectChars: 1000, stats: renderStats })
 assert.deepEqual(renderStats.indexed, ['s2'])
 ok('v2.1 renderMemory 输出注入统计（供使用计数）')
 
-const tmp2 = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-test2-'))
+const tmp2 = makeTmp('dsh-memory-test2')
 const h = host(tmp2)
 const aEntry = await h.defs.get('memory_add').execute({ text: '记忆模块的预算上限是 1500 字符', scope: 'plugin-dev', kind: 'fact', tags: ['budget'] })
 const bEntry = await h.defs.get('memory_add').execute({ text: '记忆模块的预算上限是 1500 字符左右', scope: 'plugin-dev', kind: 'fact', tags: ['budget'] })
@@ -327,7 +331,7 @@ const scoped = renderMemory(scopePool, { maxInjectChars: 800, query: '插件改�
 assert.ok(scoped.indexOf('- (p1)') < scoped.indexOf('- (g1)'), '同等相关度时，命中当前 scope 的条目应排前')
 ok('v2.2 scope 加分：当前工作区域条目优先')
 
-const tmp3 = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-test3-'))
+const tmp3 = makeTmp('dsh-memory-test3')
 const h3 = host(tmp3)
 const turnStopping = h3.handlers.get('agent/turn-stopping')
 assert.equal(typeof turnStopping, 'function', '应注册 agent/turn-stopping 钩子')
@@ -391,7 +395,7 @@ const relevant = renderMemory(floorPool, { maxInjectChars: 800, query: '记忆�
 assert.ok(/相关 [1-9]/.test(relevant), '真正相关的仍要注入')
 ok('v2.3 绝对下限门：弱匹配宁可不注入，强匹配照常')
 
-const tmpImp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-test4-'))
+const tmpImp = makeTmp('dsh-memory-test4')
 const hImp = host(tmpImp)
 const addedImp = await hImp.defs.get('memory_add').execute({ text: '测试重要度字段', kind: 'fact', importance: 7 })
 assert.equal(addedImp.entry.importance, 7)
@@ -423,7 +427,7 @@ assert.deepEqual(crossStats.indexed, ['glob', 'in1'], '索引按数组从新到�
 ok('v2.4 注入统计区分 indexed / compact')
 
 // ---- v2.5 数据安全：损坏保护 + 每日备份轮转 ----
-const tmpCorrupt = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-corrupt-'))
+const tmpCorrupt = makeTmp('dsh-memory-corrupt')
 writeFileSync(path.join(tmpCorrupt, 'memory.json'), '{ this is not json', 'utf8')
 const hCorrupt = host(tmpCorrupt)
 const corruptList = await hCorrupt.defs.get('memory_list').execute({})
@@ -441,7 +445,7 @@ assert.equal(readFileSync(path.join(tmpCorrupt, corruptCopies[0]), 'utf8'), '{ t
 rmSync(tmpCorrupt, { recursive: true, force: true })
 ok('v2.5 损坏保护：改名留证 + 只读拒绝写入，绝不静默覆盖')
 
-const tmpBackup = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-backup-'))
+const tmpBackup = makeTmp('dsh-memory-backup')
 writeFileSync(
   path.join(tmpBackup, 'memory.json'),
   JSON.stringify({ version: 2, nextId: 2, entries: [{ id: 'm1', text: '既有记忆', addedAt: new Date().toISOString(), updatedAt: new Date().toISOString() }] }),
@@ -515,7 +519,7 @@ assert.ok(draftBlock.includes('标记含义'))
 ok('v2.6 draft 条目注入时明确标「未证实」')
 
 // 端到端：add / update / 持久化
-const tmpTrust = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-trust-'))
+const tmpTrust = makeTmp('dsh-memory-trust')
 const hTrust = host(tmpTrust)
 await hTrust.defs.get('memory_add').execute({
   text: '待验证的猜测',
@@ -583,7 +587,7 @@ ok('v2.6.1 normalizeEntry 全字段都被 memoryEntrySchema 覆盖（lastUsedAt 
 
 // 真实工具的返回也必须过 schema：直接对 memory_list 的返回做键覆盖检查
 {
-  const tmpSchema = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-schema-'))
+  const tmpSchema = makeTmp('dsh-memory-schema')
   const hSchema = host(tmpSchema)
   await hSchema.defs.get('memory_add').execute({
     text: '带全部字段的条目',
@@ -623,7 +627,7 @@ ok('v2.6.1 memory_list 实际返回值不含 schema 未声明字段')
 ok('v2.7 跨域压缩保留主题摘要（原来只剩 <scope>，等于没注入）')
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-v27-'))
+  const tmp = makeTmp('dsh-memory-v27')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '第一条记忆内容' })
   await h.defs.get('memory_add').execute({ text: '第二条完全无关的内容' })
@@ -637,7 +641,7 @@ ok('v2.7 跨域压缩保留主题摘要（原来只剩 <scope>，等于没注入
 ok('v2.7 memory_search 支持 m\\d+ 按 id 直取（此前命中 0）')
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-sim-'))
+  const tmp = makeTmp('dsh-memory-sim')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '抖音必须用普通权限启动，提权会静默退出' })
   const second = await h.defs.get('memory_add').execute({ text: '抖音必须用普通权限启动，提权就会静默退出' })
@@ -662,7 +666,7 @@ ok('v2.7 memory_add 写入时提示相似邻居（A-MEM strengthen 的零模型�
 ok('v2.8 deriveStaleAfter：fact 90 天 / note 30 天 / rule 与 preference 不设')
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-stale-'))
+  const tmp = makeTmp('dsh-memory-stale')
   const h = host(tmp)
   const factEntry = await h.defs.get('memory_add').execute({ text: '某个会变的版本号', kind: 'fact' })
   assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(factEntry.entry.staleAfter ?? ''), 'fact 类应自动带 staleAfter')
@@ -675,7 +679,7 @@ ok('v2.8 deriveStaleAfter：fact 90 天 / note 30 天 / rule 与 preference 不�
 ok('v2.8 memory_add 按 kind 自动补 staleAfter，显式值优先')
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-review-'))
+  const tmp = makeTmp('dsh-memory-review')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '一条硬规则', kind: 'rule', pinned: true })
   await h.defs.get('memory_add').execute({ text: '一条没被引用过的事实', kind: 'fact' })
@@ -694,7 +698,7 @@ ok('v2.8 memory_add 按 kind 自动补 staleAfter，显式值优先')
 ok('v2.8 memory_review：分类计数 + markdown + 落盘 + 可关写')
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-budget-'))
+  const tmp = makeTmp('dsh-memory-budget')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '一条记忆' })
   const listed = await h.defs.get('memory_list').execute({})
@@ -733,7 +737,7 @@ ok('v2.9 effectiveImportance：遗忘曲线 7/30/90 天分档，pinned 与 rule 
 ok('v2.9 extractCandidates：知识型规则 + 原子化切句 + 每轮上限 2')
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-ttl-'))
+  const tmp = makeTmp('dsh-memory-ttl')
   host(tmp)
   writeFileSync(
     path.join(tmp, 'candidates.json'),
@@ -787,7 +791,7 @@ ok('v3.1 污染门：注入块自身的标记与提示语一律不入候选')
 
 // ---- v3.3 生效口径统一 ----
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-archived-'))
+  const tmp = makeTmp('dsh-memory-archived')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '会被留档的条目一', kind: 'fact' })
   await h.defs.get('memory_add').execute({ text: '会被留档的条目二', kind: 'fact' })
@@ -808,7 +812,7 @@ ok('v3.3 口径统一：review / audit / list 对 deprecated 的处理一致')
 
 // ---- v3.4 输出契约自检：required 必须真的返回，且不能越界 ----
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-contract-'))
+  const tmp = makeTmp('dsh-memory-contract')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '契约测试条目一，用于校验返回字段', kind: 'fact', tags: ['contract'] })
   await h.defs.get('memory_add').execute({ text: '契约测试条目二，用于校验返回字段', kind: 'rule' })
@@ -943,7 +947,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 }
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-alias-hint-'))
+  const tmp = makeTmp('dsh-memory-alias-hint')
   const h = host(tmp)
   const bare = await h.defs.get('memory_add').execute({ text: '插件更新后要重启才生效' })
   assert.ok(bare.aliasHint !== undefined, '没写别名时应返回 aliasHint')
@@ -955,7 +959,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 }
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-merge-alias-'))
+  const tmp = makeTmp('dsh-memory-merge-alias')
   const h = host(tmp)
   const a = await h.defs.get('memory_add').execute({ text: '第一条关于部署的说法', aliases: ['上线', 'deploy'] })
   const b = await h.defs.get('memory_add').execute({ text: '第二条关于部署的说法', aliases: ['发布', 'deploy'] })
@@ -966,7 +970,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 }
 
 {
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-audit-alias-'))
+  const tmp = makeTmp('dsh-memory-audit-alias')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '有别名的一条', aliases: ['同义'] })
   await h.defs.get('memory_add').execute({ text: '没别名的一条' })
@@ -1051,7 +1055,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 // ---- v3.9 数据安全：一轮独立审查（两个审查员 + Lead 复验）修掉的缺陷 ----
 {
   // B07：每日备份轮转不能吃掉手工回滚点
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-bak-'))
+  const tmp = makeTmp('dsh-memory-bak')
   writeFileSync(path.join(tmp, 'memory.json'), JSON.stringify({ version: 1, nextId: 1, entries: [] }), 'utf8')
   for (let i = 1; i <= 11; i += 1) writeFileSync(path.join(tmp, `memory.json.bak-202610${String(i).padStart(2, '0')}`), '{}', 'utf8')
   writeFileSync(path.join(tmp, 'memory.json.bak-before-aliases'), '{"keep":1}', 'utf8')
@@ -1068,7 +1072,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B01：写盘失败必须报错，不能报「已记住」
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-writefail-'))
+  const tmp = makeTmp('dsh-memory-writefail')
   const h = host(tmp)
   mkdirSync(path.join(tmp, 'memory.json')) // 把目标路径做成目录 → rename 必失败（等价于磁盘/权限出错）
   let threw = false
@@ -1084,7 +1088,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B03：add 的去重只认生效条目；命中的是失效条目时应重新生效
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-dedupe-dead-'))
+  const tmp = makeTmp('dsh-memory-dedupe-dead')
   const h = host(tmp)
   const first = await h.defs.get('memory_add').execute({ text: '旧事实：预算 8000' })
   await h.defs.get('memory_update').execute({ id: first.entry.id, text: '新事实：预算 12000', supersede: true })
@@ -1098,7 +1102,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B04：命中同一个生效条目时，新给的字段要合并进去
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-dedupe-fields-'))
+  const tmp = makeTmp('dsh-memory-dedupe-fields')
   const h = host(tmp)
   await h.defs.get('memory_add').execute({ text: '同一句话' })
   const second = await h.defs.get('memory_add').execute({
@@ -1120,7 +1124,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B05：supersede 的新条目继承重要度与过期日
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-supersede-fields-'))
+  const tmp = makeTmp('dsh-memory-supersede-fields')
   const h = host(tmp)
   const old = await h.defs.get('memory_add').execute({ text: '旧说法', importance: 10, staleAfter: '2026-12-31', kind: 'fact' })
   const next = await h.defs.get('memory_update').execute({ id: old.entry.id, text: '新说法', supersede: true })
@@ -1132,7 +1136,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B06 / B16：merge 继承 workspaces，且不接受重复 id
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-merge-fields-'))
+  const tmp = makeTmp('dsh-memory-merge-fields')
   const h = host(tmp)
   const a = await h.defs.get('memory_add').execute({ text: '项目A规则一：提交前跑验证门', workspaces: ['D:\\AI\\projA'] })
   const b = await h.defs.get('memory_add').execute({ text: '项目A规则二：收工前不许跳门', workspaces: ['D:\\AI\\projA'] })
@@ -1152,7 +1156,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B11：删条目后 nextId 不能回退（否则复用 id）
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-nextid-'))
+  const tmp = makeTmp('dsh-memory-nextid')
   const h = host(tmp)
   const a = await h.defs.get('memory_add').execute({ text: '第一条' })
   const b = await h.defs.get('memory_add').execute({ text: '第二条' })
@@ -1167,7 +1171,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B13：verified:true 要清掉 ⏰，别一条记忆同时挂「待重验 + 已验证」
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-verified-'))
+  const tmp = makeTmp('dsh-memory-verified')
   const h = host(tmp)
   const a = await h.defs.get('memory_add').execute({ text: '依赖版本的事实', kind: 'fact', staleAfter: '2020-01-01' })
   const after = await h.defs.get('memory_update').execute({ id: a.entry.id, text: a.entry.text, verified: true })
@@ -1225,7 +1229,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 // ---- v3.10 并发与长句检索（B02 / A3）----
 {
   // B02：两个宿主 = 两个进程各自 load 后各自整库覆盖写 —— 后写者不能把前写者的条目抹掉
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-multiproc-'))
+  const tmp = makeTmp('dsh-memory-multiproc')
   const a = host(tmp)
   const b = host(tmp) // 先建好 = b 拿到的是空库快照
   const ra = await a.defs.get('memory_add').execute({ text: 'A 进程写的：回答用中文' })
@@ -1240,7 +1244,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 {
   // B02：陈旧锁（进程崩了没清）不能把后续写入永久卡死
-  const tmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-stalelock-'))
+  const tmp = makeTmp('dsh-memory-stalelock')
   const h = host(tmp)
   const lockFile = path.join(tmp, 'memory.json.lock')
   writeFileSync(lockFile, '999999', 'utf8')
@@ -1467,8 +1471,8 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 // ---- v3.19 自动入库 + 预算保护：真跑一遍 turn-stopping（闭包逻辑的集成测试） ----
 {
-  const workTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-ws-'))
-  const storeTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-auto-'))
+  const workTmp = makeTmp('dsh-memory-ws')
+  const storeTmp = makeTmp('dsh-memory-auto')
   writeFileSync(path.join(workTmp, 'AGENTS.md'), '- 部署前必须跑 npm run check 并确认输出\n', 'utf8')
   const defs = new Map()
   const layers = []
@@ -1511,8 +1515,8 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 // ---- v3.26 captureRuleFiles：单独关掉「规则文件沉淀」，默认行为不变 ----
 {
   const runCapture = async (extraConfig) => {
-    const workTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-rule-'))
-    const storeTmp = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-rule-store-'))
+    const workTmp = makeTmp('dsh-memory-rule')
+    const storeTmp = makeTmp('dsh-memory-rule-store')
     writeFileSync(path.join(workTmp, 'AGENTS.md'), '- 部署前必须跑 npm run check 并确认输出\n', 'utf8')
     const defs = new Map()
     const layers = []
@@ -1569,7 +1573,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 // ---- v3.20 归档分文件冷存（archive.json）：主库只留生效、列表默认不吐归档、归档可恢复 ----
 {
-  const sepDir = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-archive-'))
+  const sepDir = makeTmp('dsh-memory-archive')
   writeFileSync(
     path.join(sepDir, 'memory.json'),
     JSON.stringify({
@@ -1658,7 +1662,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 // ---- v3.21 预算放宽 + append-only 历史 + 批量清归档 ----
 {
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-v321-'))
+  const dir = makeTmp('dsh-memory-v321')
   const h = host(dir)
   const listed = await h.defs.get('memory_list').execute({})
   assert.equal(listed.maxBytes, 12000, '默认存储预算应为 12000（v3.21 放宽）')
@@ -1678,7 +1682,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(onlyMine.matched >= 2, '按 id 过滤应命中多条，实际 ' + onlyMine.matched)
   ok('v3.21 append-only 历史：add/update/remove 落 history.jsonl，可按 id 过滤')
 
-  const dir2 = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-purge-'))
+  const dir2 = makeTmp('dsh-memory-purge')
   writeFileSync(
     path.join(dir2, 'memory.json'),
     JSON.stringify({
@@ -1725,7 +1729,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(normalizeEntry({ id: 'x', text: 'y' }).inject, undefined, '缺省不写 inject 字段')
   assert.equal(normalizeEntry({ id: 'x', text: 'y', inject: true }).inject, undefined, 'inject:true 不落盘（缺省即注入）')
   // 集成：memory_add 必须真的把 inject:false 落盘（v3.23 修过一次漏接）
-  const d3 = mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-inject-'))
+  const d3 = makeTmp('dsh-mem-inject')
   const h3 = host(d3)
   const added = await h3.defs.get('memory_add').execute({ text: '只检索的事实', inject: false })
   assert.equal(added.entry.inject, false, 'memory_add 要接住 inject:false')
@@ -1752,7 +1756,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
 // v3.25（考虑以后）：存储撞墙时先归档「30 天没动过、从未被检索命中」的条目，而不是直接拒绝写入
 {
-  const d4 = mkdtempSync(path.join(os.tmpdir(), 'dsh-mem-cap-'))
+  const d4 = makeTmp('dsh-mem-cap')
   const old = new Date(Date.now() - 60 * 86400000).toISOString()
   const big = 'Z'.repeat(120)
   writeFileSync(
@@ -1796,7 +1800,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 }
 
 {
-  const d = mkdtempSync(path.join(os.tmpdir(), 'dsh-memory-v40-'))
+  const d = makeTmp('dsh-memory-v40')
   const h = host(d)
   const textA = '这是一条很长的测试记忆内容，用来验证冲突检测是否生效，内容需要足够长'
   const textB = textA + '。'
