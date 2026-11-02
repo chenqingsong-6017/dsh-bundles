@@ -57,6 +57,10 @@ function writeBaseline(root, allow) {
   const tests = path.join(root, "_selftest", "tests");
   mkdirSync(tests, { recursive: true });
   writeFileSync(path.join(tests, "coverage-baseline.json"), JSON.stringify({ _note: "gate-hollow fixture", allow, _reasons: {} }, null, 2));
+  // 2026-11-03：门现在把「测试目录为空」与「标准门脚本缺失」也当失败（堵掏空）
+  // —— 假目录必须提供最小骨架，否则测的就不是本用例想测的那个洞。
+  writeFileSync(path.join(tests, "fixture-smoke.test.mjs"), "console.log('fixture-smoke: 1 项通过')\nprocess.exit(0)\n");
+  writeFileSync(path.join(root, "_selftest", "standard-check.mjs"), "console.log('共 1 个插件：合规 1，不合规 0（report 模式）')\n");
 }
 
 const tmpRoots = [];
