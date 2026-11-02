@@ -5,7 +5,8 @@
  * 洞（证据：_research/deepseek-repos/05c-harness-adr-practice.md §4.2）：
  *   1) 插件目录缺失/为空时，旧版打印「跳过」后 exit 0；
  *   2) 「有入口无测试」只打印不阻断；
- *   3) 覆盖缺口没有棘轮（新增插件可以不写测试）。
+ *   3) 覆盖缺口没有棘轮（新增插件可以不写测试）；
+ *   4) locale/*.json 从不 parse（2026-11-02 加的 2b 门：坏掉时界面报「包元信息错误」）。
  *
  * 做法：用 os.tmpdir 下的假插件目录 + DSH_BUNDLES_DIR 跑「真 check.mjs」，断言退出码。
  * 时间预算：4 次门各 ~0.6s（假目录没有测试要跑），整体 < 5s。
@@ -109,6 +110,39 @@ try {
     const root = freshRoot();
     const r = runGate(root, { DSH_ALLOW_EMPTY_BUNDLES: "1" });
     ok("空目录 + 逃生口 exit 0（仅测试）", r.status === 0, "实际 exit " + r.status);
+  }
+
+  // (v) locale JSON 坏掉 → exit 1，并点名文件与错误（2026-11-02 实测事故：
+  //     dsh-obsidian/locale/zh.json 里未转义的 Windows 路径让界面报「包元信息错误」，
+  //     旧门只 parse package.json，locale 从没被检查，所以这个错一路绿灯到界面）
+  {
+    const root = freshRoot();
+    makePlugin(root, "dsh-fake-locale-broken");
+    writeBaseline(root, ["dsh-fake-locale-broken"]);
+    const localeDir = path.join(root, "dsh-fake-locale-broken", "locale");
+    mkdirSync(localeDir, { recursive: true });
+    // 注意：这里要写出一个「真·坏 JSON」，所以路径反斜杠在 JS 字符串里只写一层
+    writeFileSync(path.join(localeDir, "zh.json"),
+      '{\n  "meta": {\n    "title": "假插件",\n    "description": "把 D:\\AI-date\\vault 扫成索引"\n  }\n}\n');
+    const r = runGate(root);
+    ok("locale JSON 坏掉 exit 1", r.status === 1, "实际 exit " + r.status + "\n" + r.out.slice(0, 300));
+    ok("失败点名 locale/zh.json", r.out.includes("locale/zh.json"), (r.out.match(/✗[^\n]*/) || [""])[0].slice(0, 160));
+    ok("失败写出 JSON 错因", r.out.includes("不是合法 JSON"), (r.out.match(/✗[^\n]*/) || [""])[0].slice(0, 160));
+  }
+
+  // (vi) 同一个插件，把反斜杠转义对 → exit 0（证明这条检查不是「永远红」）
+  {
+    const root = freshRoot();
+    makePlugin(root, "dsh-fake-locale-ok");
+    writeBaseline(root, ["dsh-fake-locale-ok"]);
+    const localeDir = path.join(root, "dsh-fake-locale-ok", "locale");
+    mkdirSync(localeDir, { recursive: true });
+    writeFileSync(path.join(localeDir, "zh.json"),
+      '{\n  "meta": {\n    "title": "假插件",\n    "description": "把 D:\\\\AI-date\\\\vault 扫成索引"\n  }\n}\n');
+    writeFileSync(path.join(localeDir, "en.json"), '{ "meta": { "title": "Fake" } }\n');
+    const r = runGate(root);
+    ok("locale JSON 合法 exit 0", r.status === 0, "实际 exit " + r.status + "\n" + r.out.slice(0, 400));
+    ok("输出统计 locale 文件数", r.out.includes("locale 文件"), r.out.slice(0, 200));
   }
 } finally {
   for (const dir of tmpRoots) {

@@ -175,6 +175,29 @@ for (const bundle of bundles) {
 }
 lines.push('结构门：检查 ' + structural + ' 个 manifest')
 
+// ---- 阶段 2b：locale/*.json 必须能解析（2026-11-02 补） ----
+// 实测事故：dsh-obsidian/locale/zh.json 里写了一条未转义的 Windows 路径
+// （"把 D:\AI-date\obsidian\vault 扫成索引"），`\A` 不是合法转义，JSON.parse 抛
+// `Bad escaped character in JSON at position 67`，插件列表上直接显示「包元信息错误」。
+// 旧门只 parse package.json，locale 文件从没被读过，所以这个错误一路绿灯到界面。
+// 这条只在「文件真坏了」时才会红，正反两向断言见 gate-hollow.test.mjs 用例 (v)/(vi)。
+let localeChecked = 0
+for (const bundle of bundles) {
+  const localeDir = path.join(BUNDLES_DIR, bundle, 'locale')
+  if (!existsSync(localeDir)) continue
+  for (const name of readdirSync(localeDir).filter((entry) => entry.endsWith('.json')).sort()) {
+    localeChecked += 1
+    const file = path.join(localeDir, name)
+    try {
+      JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''))
+    } catch (error) {
+      failures.push('✗ ' + bundle + '/locale/' + name + ' 不是合法 JSON：' + ((error && error.message) || String(error)) +
+        '\n  （常见原因：description 里直接写了 Windows 路径，反斜杠要写成 \\\\）')
+    }
+  }
+}
+if (localeChecked > 0) lines.push('结构门：检查 ' + localeChecked + ' 个 locale 文件')
+
 // ---- 阶段 3：测试门（全量） ----
 // 测试文件名惯例是去掉 `dsh-` 前缀（audit.test.mjs 对应 dsh-audit），
 // 也兼容带前缀的写法，免得以后又踩「找不到测试」。

@@ -11,6 +11,7 @@
 
 ### Fixed
 - `missing_one_liner` 误报：真实库 5 张卡用 `> 一句话：`（非加粗）被当成缺结论头。改为按结构判定——`> 一句话：` / `> **一句话**：` / `> __一句话__：` / 半角冒号都算过，代码块里的不算，真缺仍报。
+- `locale/zh.json` 不是合法 JSON（2026-11-02 21:2x 界面报「包元信息错误」）：`description` 里直接写了 Windows 路径 `D:\AI-date\obsidian\vault`，`\A` 不是合法转义，`JSON.parse` 抛 `Bad escaped character at position 67`。改为双反斜杠。同一类错已加进验证门（`_selftest/gate/check.mjs` 阶段 2b 解析所有插件的 `locale/*.json`，正反用例在 `gate-hollow.test.mjs` (v)/(vi)）。
 
 ### Changed
 - 索引 `notes[]` 新增 `oneLiner`（索引期算一次，已剥 fenced code；超大文件为 `null` = 不判定）。旧索引没有该字段时退回扁平文本判断，不会误报。
@@ -20,6 +21,7 @@
 - 真实 `memory.json`：88 条 / 25 条唯一指针 / 24 条带锚点 / broken 0。
 - strict GitHub slug 实测只过 4/25 → 21 条误报，是加 ②③ 两条兼容规则的直接依据。
 - 负向对照（用例能失败）：关掉锚点判定 → 用例红；结论头退回字面量匹配 → 用例红。
+- locale 修复验证：`JSON.parse` 前后对照（修前 `Bad escaped character at position 67`，修后输出 title/description 正常）；门禁新增 2b 段后真机跑 `node _selftest/gate/check.mjs` → `结构门：检查 38 个 locale 文件`、门通过；`gate-hollow.test.mjs` 16 条断言全过。
 
 ## v0.3.0 — 2026-11-01
 
