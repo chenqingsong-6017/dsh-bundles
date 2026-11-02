@@ -847,7 +847,14 @@ export function apply(ctx, config) {
         },
         render(_args, value) {
           if (value.ok === false) return [text('读取失败：' + (value.lastError || '未知原因'))]
-          return [text(value.path + '（' + value.body.length + ' 字符' + (value.truncated ? '，已截断' : '') + '）')]
+          const head = value.path + '（' + value.body.length + ' 字符' + (value.truncated ? '，已截断' : '') + '）'
+          const fm = value.frontmatter && typeof value.frontmatter === 'object'
+            ? Object.keys(value.frontmatter).map((key) => key + ': ' + JSON.stringify(value.frontmatter[key])).join('\n')
+            : ''
+          const links = Array.isArray(value.links) && value.links.length
+            ? '出链 ' + value.links.length + ' 条：' + value.links.map((link) => (link.embed ? '!' : '') + '[[' + link.target + ']]').join('、')
+            : ''
+          return [text([head, fm ? 'frontmatter：\n' + fm : '', links, value.body].filter((part) => part !== '').join('\n\n'))]
         },
       },
       async execute(args) {
