@@ -13,6 +13,13 @@
  *   node _ops/cua-tool-filter.mjs --revert
  *
  * 注意：DSH 只在启动时加载插件 JS，改完必须重启 DSH；dsh 升级/重装会覆盖补丁，重跑 --apply。
+ *
+ * 删除三查（2026-11-02 复核，结论=保留，不删）：
+ *   ① 过时？没有——DSH 升级/重装会覆盖官方包，重跑 --apply 仍是「升级后必做」第 2 步（AGENTS.md）。
+ *   ② 以后有用？有——每次升级、cua 工具数不对、或要临时放开某工具（--allow / --revert）都用它。
+ *   ③ 有价值？有——allowlist 把 56 个工具收窄到 20 个（声明省约 43k 字符，见 AGENTS.md）；
+ *      而且 restart-dsh.ps1:30 的预检直接调它 --status，删了预检会空转（并非「零代码引用」）。
+ *   什么时候用：DSH 升级或重装后、cua 工具数/声明异常时、临时放开/收回某个工具时；其余时间别动它。
  */
 import { existsSync, readFileSync, writeFileSync, copyFileSync, statSync } from 'node:fs'
 import path from 'node:path'
