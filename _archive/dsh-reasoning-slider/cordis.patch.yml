@@ -1,4 +1,0 @@
-# 推理等级滑条：挂到输入栏右侧工具行（conversation.input.right）。
-- insert:
-    - id: reasoning-slider
-      name: '@local/dsh-reasoning-slider'
