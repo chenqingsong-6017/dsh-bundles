@@ -91,6 +91,44 @@ exit ≠0: 按 onError 处理，并记进 hooks_status
 
 > 示例脚本都用 **node 而不是 echo**：Windows 的 `cmd.exe` 按控制台代码页（中文系统 GBK/936）输出，中文会乱码；node 写管道固定 UTF-8。插件侧也做了 GBK 回退解码，双保险。
 
+## 6.5 bash/pwsh 护栏合并（2026-11-02）
+
+**问题**：`danger-guard` 与 `self-guard` 两条 hook 的 `match` 都是 `^(bash|pwsh)$`，插件按配置顺序串行执行，
+所以每次 bash/pwsh 调用要 spawn 两次 node（实测中位 123.9ms；`shell:true` 真实口径 161.7ms，见 `_ops/hook-bench.mjs`）。
+
+**做法**：`examples/guards-bash-pwsh.mjs` 一个进程读一次 stdin，分别跑两套规则集，任一击中即 stderr + exit 2。
+决策等价于官方 `@deepseek-ai/dsh-hook-protocol` 的 `mergeHookOutputs`（同一扩展点按 deny > ask > allow 折叠，最严格者胜）。
+两套规则集保持独立，可分别关闭（等价于把对应 hook 的 `enabled` 设 false）：
+
+| 环境变量 | 作用 |
+|---|---|
+| `DSH_GUARD_DANGER=0` | 只关危险命令规则集（42 条） |
+| `DSH_GUARD_SELF=0` | 只关护栏自保护规则集（写护栏文件/配置的命令行入口） |
+
+取值 `0` / `false` / `off` 视为关闭；未设或其它值一律开启（fail-safe）。两个都关 = 直通。
+
+**应用（只能人工）**：`~/.dsh/hooks.json` 是护栏配置，agent 的 write/edit 与命令行两条路都被禁止改它。
+所以合并只能由人在终端执行（脚本默认 dry-run，写前备份、写后复检、失败自动回滚）：
+
+```
+node D:/AI/dsh-bundles/_ops/hooks-merge-apply.mjs            # 预演，只打印将做的改动
+node D:/AI/dsh-bundles/_ops/hooks-merge-apply.mjs --apply    # 真写（需 TTY；备份落 D:/AI/dsh-data/backup/guards）
+node D:/AI/dsh-bundles/_ops/hooks-merge-revert.mjs           # 回滚到最近一次备份（也需 TTY）
+```
+
+应用后 hook 条数 7 → 6：`danger-guard` + `self-guard` 换成一条 `bash-pwsh-guards`（其余 5 条原样保留）。
+**未应用时行为不变**（仍是两个进程、两条 hook），合并脚本此时不参与任何调用。
+
+**验证**（`_selftest/tests/`）：
+
+| 用例集 | 判据 |
+|---|---|
+| `guards-merge.test.mjs` | 54 条 command 样本逐条对拍「两条原脚本的最严格折叠 vs 合并脚本」exit code，零差异；空白/非 JSON stdin 放行；drift（原文件 vs 合并副本 42 条规则 + 2 条自保护正则）不一致即红；两个开关单独生效；mock ctx 端到端数 hook 执行次数 2 → 1 |
+| `hooks-merge-apply.test.mjs` | 7→6 合并、dry-run 字节不变、写前备份、备份内容=原文、回滚后逐字段还原、缺脚本/坏 JSON/已是合并态三种拒绝、无 TTY 的 `--apply` 退 2 且文件不动 |
+| `security-guards.test.mjs` | 81 条全过（原两个脚本未被改动，合并脚本额外由上面第一项覆盖） |
+
+实测（n=3，预热 1 次不入账，中位/均值）：两进程串行 123.9 / 123.6 ms → 合并一进程 60.3 / 60.8 ms（省 51.3%）；`shell:true` 口径 161.7 / 165.1 → 81.0 / 81.2 ms（省 49.9%）。
+
 ## 7. 安全边界（说实话）
 
 - 钩子是**你自己写的 shell 命令**，权限等价于你自己的终端。本插件不含任何内置放行策略，也不联网。
