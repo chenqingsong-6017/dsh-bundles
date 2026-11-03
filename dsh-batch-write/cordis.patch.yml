@@ -1,0 +1,7 @@
+# dsh-batch-write: batch file edits as a tool, so the model does not have to remember a script.
+- insert:
+    - id: batch-write
+      name: './index.js'
+      # config:
+      #   backupDir: D:\AI\dsh-data\batch-write\backup
+      #   workspaceDir: D:\AI-date\dsh-date\dsh-创建

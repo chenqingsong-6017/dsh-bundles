@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Batch write",
+    "description": "Edit many files in one call: auto read-before-write, dry-run by default, backup before write, protected paths refused. Turns the \"use bulk-write.mjs\" prompt rule into a tool."
+  }
+}
