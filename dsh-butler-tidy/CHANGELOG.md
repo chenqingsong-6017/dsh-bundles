@@ -2,6 +2,13 @@
 
 本文件于 2026-10-31 按「改到谁补谁」的规则建立；当前版本为存量版本，本节为补记。
 
+## v0.11.4 — 2026-11-03
+
+### Fixed（诊断口径）
+- `tidy_status.limits` 文案没跟上 v0.11.3：仍写「单次最多整理 300 个文件」，从输出上看不出 `clean` 也受同一条上限约束（用户据此会以为 clean 上限没修）。改为「单次最多 300 条（organize 按文件数 / clean 按清理条目数，maxFiles 可调 1-2000）」，与实际行为一致。
+
+### Verification
+- `node --check index.js`；重组后真机 `tidy_status` 输出新文案。
 ## v0.11.3 — 2026-11-03
 
 ### Fixed（稳健性，来源：`_reports/global-audit-ops-2026-11-03.md` T4-T7）

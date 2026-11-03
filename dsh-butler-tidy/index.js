@@ -2614,7 +2614,7 @@ function doStatus(config, store, guard) {
     lastUndo,
     logEntries,
     protectCount: guard.length,
-    limits: `单次最多整理 ${DEFAULT_MAX_APPLY} 个文件；盘点上限 ${fmtCount(SCAN_MAX_ENTRIES)} 项 / ${SCAN_DEADLINE_MS / 1000} 秒`,
+    limits: `单次最多 ${DEFAULT_MAX_APPLY} 条（organize 按文件数 / clean 按清理条目数，maxFiles 可调 1-2000）；盘点上限 ${fmtCount(SCAN_MAX_ENTRIES)} 项 / ${SCAN_DEADLINE_MS / 1000} 秒`,
     notices,
     inventoryEntries: inventory.entries,
     inventoryActive: inventory.active,
