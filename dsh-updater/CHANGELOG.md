@@ -2,6 +2,16 @@
 
 本文件于 2026-10-31 按「改到谁补谁」的规则建立；v0.1.0 为存量版本补记。
 
+## v0.1.3 — 2026-11-03
+
+### Fixed（稳健性，来源：`_reports/global-audit-ops-2026-11-03.md` U2/U3/U5）
+- **U2 无并发锁**：`updater_apply` / `updater_rollback` 对同一个源加进程内互斥；第二个调用立刻返回 `UPDATER_BUSY`，不再交错写同一目录（跨进程锁未做，如实记在 README）。
+- **U3 超大旧文件整读**：`fileDiffKind` 任一侧 `> 4 MB` 即短路判 `differ`，不再把旧文件整读成 utf8（原来只判新文件一侧）。
+- **U5 staging 残留**：clone / fetch / checkout 失败与 apply 全程 `try/finally` 清理，失败不留半截克隆。
+- **U4 文档不实**：README 把 `dryRun` 的「不写盘」改为「不改本地插件目录」（仍会浅克隆到 staging 再删）。
+
+### Verification
+- `_selftest/tests/updater.test.mjs` 30 项全过；U3 的「旧文件超大」用例在 HEAD 上先红后绿；`node --check index.js` 通过。
 ## v0.1.2 — 2026-11-03
 
 ### Fixed（安全，来源：`_reports/global-audit-ops-2026-11-03.md` U1）

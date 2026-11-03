@@ -200,7 +200,7 @@ const checker = (ref) => {
   assert.equal(lint.ok, true)
   assert.ok(lint.brokenRefs.length >= 1)
   assert.equal(lint.canClose, false)
-  const outFile = path.join(root, 'out-r1.md')
+  const outFile = path.join(root, 'out', 'out-r1.md')
   const refused = await report.execute({ outPath: outFile })
   assert.equal(refused.ok, false, '有断引用时不该出报告')
   assert.ok(refused.blockedBy.length > 0)
@@ -213,6 +213,37 @@ const checker = (ref) => {
   ok('检查/报告：断引用挡住报告，allowIncomplete 才出，文件含未验证区')
 }
 
+// ---- B5（2026-11-03 审计 M6）：outPath 默认只允许落在 outDir（<workspace>/_research）----
+{
+  const h = host({})
+  await h.defs.get('research_new').execute({ question: '报告能不能写到任意路径', decision: '决定是否收紧 outPath 白名单' })
+  await h.defs.get('research_evidence').execute({ claim: '有一条可核对落点', tier: 'official', ref: 'https://example.com/x', confidence: 'high' })
+  const report = h.defs.get('research_report')
+  const outDir = path.join(root, 'out')
+  const inside = path.join(outDir, 'sub', 'ok.md')
+  const written = await report.execute({ outPath: inside })
+  assert.equal(written.ok, true, JSON.stringify(written))
+  assert.equal(written.path, inside)
+  assert.ok(existsSync(inside))
+
+  const outside = path.join(root, 'outside-b5.md')
+  const blocked = await report.execute({ outPath: outside })
+  assert.equal(blocked.ok, false, '绝对路径越界必须拒')
+  assert.equal(blocked.code, 'RESEARCH_OUTPATH_INVALID')
+  assert.match(blocked.lastError, /allowOutsideWorkspace/)
+  assert.equal(existsSync(outside), false, '被拒时不许落盘')
+
+  const traversal = await report.execute({ outPath: '../escape-b5.md' })
+  assert.equal(traversal.ok, false)
+  assert.equal(traversal.code, 'RESEARCH_OUTPATH_INVALID', '.. 穿越必须拒')
+  assert.equal(existsSync(path.join(root, 'escape-b5.md')), false)
+
+  const optIn = await report.execute({ outPath: outside, allowOutsideWorkspace: true })
+  assert.equal(optIn.ok, true, '显式 opt-in 才允许外部路径')
+  assert.ok(existsSync(outside))
+  ok('B5：outPath 默认锁在 outDir 内，绝对/.. 越界报 RESEARCH_OUTPATH_INVALID，allowOutsideWorkspace 才放行')
+}
+
 // ---- 收尾与状态 ----
 {
   const h = host({})
@@ -221,7 +252,7 @@ const checker = (ref) => {
   const report = h.defs.get('research_report')
   const status = h.defs.get('research_status')
   await ev.execute({ claim: '这条能核对', tier: 'source', ref: 'note.md:1' })
-  const written = await report.execute({ outPath: path.join(root, 'out-r2.md'), close: true })
+  const written = await report.execute({ outPath: path.join(root, 'out', 'out-r2.md'), close: true })
   assert.equal(written.ok, true)
   assert.equal(written.closed, true)
   const after = await ev.execute({ claim: '收尾后还能记吗', tier: 'source', ref: 'note.md:1' })

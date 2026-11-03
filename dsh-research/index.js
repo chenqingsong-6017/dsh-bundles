@@ -48,6 +48,16 @@ function nowIso(ms) {
   return new Date(ms).toISOString()
 }
 
+/** child 是否在 parent 之内（含相等）；Windows 路径大小写不敏感，统一折叠后再比。 */
+function isInsidePath(parent, child) {
+  const fold = (value) => {
+    const resolved = path.resolve(value)
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  }
+  const relative = path.relative(fold(parent), fold(child))
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
 /** id：给了 slug 就用 slug-YYYYMMDD，否则 r-YYYYMMDD-随机 4 位。 */
 export function makeId(slug, now = Date.now()) {
   const date = new Date(now)
@@ -502,7 +512,8 @@ export function apply(ctx, config) {
         properties: {
           item: { type: 'string', description: 'Task id; omit for the latest open task.' },
           title: { type: 'string', description: 'Report title (default: the question).' },
-          outPath: { type: 'string', description: 'Where to write the .md (default <workspace>/_research/research-<id>.md). Relative paths resolve from cwd.' },
+          outPath: { type: 'string', description: 'Where to write the .md (default <workspace>/_research/research-<id>.md). Relative paths resolve from workspaceDir; by default the result must stay inside the configured outDir (<workspace>/_research), otherwise RESEARCH_OUTPATH_INVALID.' },
+          allowOutsideWorkspace: { type: 'boolean', description: 'Opt-in (default false): allow outPath outside <workspace>/_research when the user explicitly wants to write elsewhere (e.g. a vault folder).' },
           allowIncomplete: { type: 'boolean', description: 'Write the report even when some conclusions lack evidence (they land in the unverified section).' },
           close: { type: 'boolean', description: 'Mark the task closed after writing. Default false.' },
         },
@@ -540,8 +551,22 @@ export function apply(ctx, config) {
           const visible = Object.assign({}, task, { title: strValue(args?.title) || task.question })
           const markdown = renderReport(visible, Date.now())
           if (markdown.length > MAX_OUT_BYTES) return { ok: false, code: 'REPORT_TOO_LARGE', lastError: '报告过大（> ' + MAX_OUT_BYTES + ' 字节）' }
+          // 2026-11-03 审计 M6：outPath 原本可写任意路径。默认只允许落在 outDir
+          // （<workspace>/_research），越界（绝对路径 / .. 穿越）直接拒；写外部必须显式 opt-in。
           const rawOut = strValue(args?.outPath)
-          const outPath = rawOut !== '' ? (path.isAbsolute(rawOut) ? rawOut : path.resolve(workspaceDir, rawOut)) : path.join(defaultOutDir, 'research-' + task.id + '.md')
+          const allowOutside = args?.allowOutsideWorkspace === true
+          const outDir = path.resolve(defaultOutDir)
+          const outPath = rawOut !== '' ? (path.isAbsolute(rawOut) ? path.resolve(rawOut) : path.resolve(workspaceDir, rawOut)) : path.join(defaultOutDir, 'research-' + task.id + '.md')
+          if (!allowOutside && !isInsidePath(outDir, outPath)) {
+            return {
+              ok: false,
+              code: 'RESEARCH_OUTPATH_INVALID',
+              id: task.id,
+              lastError:
+                'outPath 越界：报告默认只能写到 ' + outDir + '（本次解析为 ' + outPath + '）。' +
+                '相对路径先按 workspaceDir 解析；确实要写到外部目录，请显式传 allowOutsideWorkspace:true。',
+            }
+          }
           mkdirSync(path.dirname(outPath), { recursive: true })
           const tmp = outPath + '.tmp-' + process.pid
           writeFileSync(tmp, markdown + '\n', 'utf8')

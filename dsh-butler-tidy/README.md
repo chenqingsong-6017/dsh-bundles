@@ -121,7 +121,7 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 ## 安全设计
 
 1. **先预览后动手**：`tidy_plan` 纯计算；`tidy_apply` 没有 `confirm:true` 一律拒绝。
-2. **可撤销**：每次操作写 `manifests/<kind>-<时间戳>.json`，`tidy_undo` 按清单反向搬回；原位已有同名文件则跳过，不覆盖。
+2. **可撤销**：每次操作写 `manifests/<kind>-<时间戳>.json`（临时文件 + rename 原子落位），`tidy_undo` 按清单反向搬回；原位已有同名文件则跳过，不覆盖；`renameSync` 落位前再判一次目标存在（`DEST_EXISTS`，不静默覆盖）。清单写失败时返回 `MANIFEST_WRITE_FAILED` 并说明「文件已动、无法撤销」。
 3. **红线目录**：`C:\Windows`、`C:\Program Files*`、`C:\ProgramData`、用户 `AppData`、
    `D:\AI\dsh-bundles`（插件源码）、`D:\AI\deepsek harness`、`D:\AI\hermes-agent`、
    `D:\AI-date\workbuddy-date\学习`（记忆红线）。采集阶段就排除。
@@ -129,7 +129,9 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 5. **清理只碰白名单目录**；回收站属谨慎项，必须点名；`Windows.old` 只报告，需管理员处理。
 6. **不动快捷方式与系统文件**：`.lnk`、`.url`、`desktop.ini`、`Thumbs.db` 一律跳过。
 7. **有界采集**：盘点上限 8 万项 / 7 秒；目录体积最多量 20 个、超预算标「未量」不谎报 0；
-   单次执行上限 300 个文件。
+   单次执行上限 300 条（`maxFiles` 可调，1-2000）：`organize` 按文件数、`clean` 按清理条目数截断，
+   超限时返回实际处理数与 `remaining`，再执行一次继续。`clean` 的 `targets:[]` = 一条都不删（`EMPTY_TARGETS`），
+   不是「全删」；不传 `targets` 才按默认 `policy:safe` 清理。
 8. **搬目录前查依赖**（v0.4）：移动前探测服务、开机自启、计划任务、开始菜单快捷方式是否引用该目录，
    命中就列为 `blockers` 拒绝执行——避免"改名一时爽，引用全断光"。
    确需强搬时传 `force:true`，并自行准备好修改这些引用。
@@ -146,6 +148,11 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
     typeMap:                          # 追加/覆盖分类
       '.log': 'Logs'
       '.dxf': 'Drawings'
+    junkDirs:                         # 追加可清目录（id/path 必填，policy ∈ safe|cautious|admin，默认 safe）
+      - id: my-temp
+        label: 我的构建临时目录
+        path: 'E:\build\tmp'
+        policy: safe
 ```
 
 数据目录（默认 `D:\AI\dsh-data\tidy`）：
@@ -196,7 +203,7 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 |---|---|---|
 | 清单排序按文件名 | `folders-*` 排在 `organize-*` 后面，`tidy_undo` 撤销错了对象 | 改为按时间戳排序 |
 | 同秒两份清单 | 整理+改名同一秒发生，撤销取错 | 文件名加毫秒 |
-| 数据默认落 C 盘 | 清单写进 `C:\Users\...\.dsh`，违反本机约定 | 默认 `D:\AI\dsh-data\tidy`，无 D 盘才退 |
+| 数据默认落 C 盘 | 清单写进 `%USERPROFILE%\.dsh`，违反本机约定 | 默认 `D:\AI\dsh-data\tidy`，无 D 盘才退 |
 | 未量目录显示 0 B | 大目录多时后面的目录误报 0 B | 加 `measured` 标记，显示「未量」 |
 | 盘根改名必失败 | 目标是 `D:\` 下的对象时 `mkdirSync('D:\\')` 抛 EPERM，改名全挂 | 只在父目录不存在时才 mkdir |
 | **改目录名前不查引用**（v0.4 补） | 把 `D:\YULE` 改名后，13 个开始菜单快捷方式、6 个服务、10 个注册表卸载项、1 个计划任务全部指旧路径 → 图标变白、卸载失灵 | 搬前用 `detectDependencies` 探测四类引用，命中即 `blockers` 拒绝；确需强搬传 `force:true` |

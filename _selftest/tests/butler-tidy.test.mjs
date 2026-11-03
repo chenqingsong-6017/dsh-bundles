@@ -347,6 +347,83 @@ try {
   assert.equal(normalPlan.value.code, undefined, '普通临时目录必须仍可出方案')
   assert.equal(normalPlan.value.totalFiles, 2)
   ok('反向保险：普通本地临时目录仍正常出方案（2 个文件）')
+  // ── 10) B7（2026-11-03 审计 T4/T5/T6/T7）：clean 上限 / targets:[] 语义 / 清单原子写 / 不覆盖同名
+  {
+    const junkDir = path.join(ROOT, 'junk-b7')
+    mkdirSync(junkDir, { recursive: true })
+    for (let i = 1; i <= 5; i += 1) writeFileSync(path.join(junkDir, `junk-${i}.tmp`), 'x')
+    const storeB7 = path.join(ROOT, 'store-b7')
+    const { ctx: ctxB7, registered: regB7 } = makeMockContext()
+    mod.apply(ctxB7, { storeDir: storeB7, junkDirs: [{ id: 'b7-junk', label: 'B7 测试垃圾', path: junkDir, policy: 'safe' }] })
+    const toolsB7 = new Map(regB7.map((definition) => [definition.name, definition]))
+    const execB7 = async (toolName, args) => toolsB7.get(toolName).execute(args)
+
+    // 10.1 targets:[] ≠ 全删
+    const emptyTargets = await execB7('tidy_apply', { kind: 'clean', confirm: true, targets: [] })
+    assert.equal(emptyTargets.code, 'EMPTY_TARGETS', `targets:[] 必须回 EMPTY_TARGETS，实际 ${JSON.stringify(emptyTargets).slice(0, 240)}`)
+    assert.equal(emptyTargets.applied, false)
+    assert.equal(readdirSync(junkDir).length, 5, 'targets:[] 一条都不许删')
+    ok('B7/T6：clean 的 targets:[] = 一条都不删（EMPTY_TARGETS），不再等价于全删')
+
+    // 10.2 clean 单次条目上限
+    const capped = await execB7('tidy_apply', { kind: 'clean', confirm: true, targets: ['b7-junk'], maxFiles: 2 })
+    assert.equal(capped.applied, true)
+    assert.equal(capped.deletedFiles, 2, `只处理 2 条，实际删了 ${capped.deletedFiles}`)
+    assert.equal(capped.remaining, 3, `剩余必须如实报 3，实际 ${capped.remaining}`)
+    assert.equal(readdirSync(junkDir).length, 3, '超出上限的条目必须留着')
+    assert.match(capped.hint, /上限 2|还有 3 条/)
+    ok('B7/T4：clean 受 maxFiles 上限约束，超限截断并回报 deletedFiles/remaining')
+
+    const rest = await execB7('tidy_apply', { kind: 'clean', confirm: true, targets: ['b7-junk'] })
+    assert.equal(rest.remaining, 0)
+    assert.equal(readdirSync(junkDir).length, 0, '第二次清理把剩余的 3 条清掉')
+    ok('B7/T4：再执行一次可继续清理剩余条目')
+
+    // 10.3 清单原子写：落盘是完整 JSON，且不留 .tmp 临时文件
+    const organizeDir = path.join(ROOT, 'b7-organize')
+    mkdirSync(organizeDir, { recursive: true })
+    writeFileSync(path.join(organizeDir, 'a.txt'), 'a')
+    writeFileSync(path.join(organizeDir, 'b.txt'), 'b')
+    const organized = await execB7('tidy_apply', { kind: 'organize', target: organizeDir, confirm: true })
+    assert.equal(organized.applied, true)
+    assert.ok(organized.manifest && existsSync(organized.manifest), '正常整理必须写出清单')
+    JSON.parse(readFileSync(organized.manifest, 'utf8'))
+    assert.equal(readdirSync(path.dirname(organized.manifest)).filter((name) => name.includes('.tmp-')).length, 0, '清单写不许留半截临时文件')
+    ok('B7/T5：清单写是完整 JSON（临时文件 + rename 原子落位），不留 .tmp 残件')
+
+    // 10.4 清单写失败不能假装没动：如实报「已移动 N 个 + MANIFEST_WRITE_FAILED」
+    const blockedStore = path.join(ROOT, 'store-b7-blocked')
+    mkdirSync(blockedStore, { recursive: true })
+    writeFileSync(path.join(blockedStore, 'manifests'), '占位文件（不是目录）')
+    const { ctx: ctxBlocked, registered: regBlocked } = makeMockContext()
+    mod.apply(ctxBlocked, { storeDir: blockedStore })
+    const toolsBlocked = new Map(regBlocked.map((definition) => [definition.name, definition]))
+    const blockedDir = path.join(ROOT, 'b7-blocked')
+    mkdirSync(blockedDir, { recursive: true })
+    writeFileSync(path.join(blockedDir, 'x.txt'), 'x')
+    const failedManifest = await toolsBlocked.get('tidy_apply').execute({ kind: 'organize', target: blockedDir, confirm: true })
+    assert.equal(failedManifest.applied, true, '文件确实已移动，不能假装没动')
+    assert.equal(failedManifest.moved, 1)
+    assert.equal(failedManifest.code, 'MANIFEST_WRITE_FAILED', `清单写失败必须如实回报，实际 ${JSON.stringify(failedManifest).slice(0, 300)}`)
+    assert.equal(failedManifest.manifest, '')
+    assert.match(failedManifest.hint, /无法用 tidy_undo 撤销/)
+    ok('B7/T5：清单写失败时返回 MANIFEST_WRITE_FAILED + 「已移动」事实（不再抛异常丢掉现场）')
+
+    // 10.5 renameSync 落位前判存在：绝不同名覆盖
+    assert.equal(typeof mod.movePath, 'function', 'movePath 必须导出以便验证 T7')
+    const fromFile = path.join(ROOT, 'b7-move-from.txt')
+    const toFile = path.join(ROOT, 'b7-move-to.txt')
+    writeFileSync(fromFile, 'from-content')
+    writeFileSync(toFile, 'to-content')
+    assert.throws(
+      () => mod.movePath(fromFile, toFile),
+      (error) => error && error.code === 'DEST_EXISTS',
+      '目标已存在时必须报 DEST_EXISTS，不能静默覆盖',
+    )
+    assert.equal(readFileSync(toFile, 'utf8'), 'to-content', '同名目标原内容必须一字未动')
+    assert.ok(existsSync(fromFile), '源文件必须还在（没有发生过移动）')
+    ok('B7/T7：movePath 目标已存在时报 DEST_EXISTS，不静默覆盖')
+  }
 } finally {
   rmSync(ROOT, { recursive: true, force: true })
 }

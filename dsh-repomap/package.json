@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-repomap",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "engines": {
     "node": ">=22.19.0"

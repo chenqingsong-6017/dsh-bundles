@@ -80,9 +80,12 @@
 
 ### `updater_apply`
 
-`name` 必填。`dryRun: true` 只克隆+校验+算差异，**不写盘**；真正落盘要 `confirm: true`。
+`name` 必填。`dryRun: true` 只克隆+校验+算差异，**不改本地插件目录**；真正落盘要 `confirm: true`。
+（实现上 dryRun 仍会联网浅克隆到 `staging\` 并在结束时删除，所以需要磁盘与网络，只是不碰 localDir——2026-11-03 审计 U4 修正原文「不写盘」的不实说法。）
 
 流程：浅克隆 → 定位子目录 → 静态校验 → 算差异 → 整目录备份 → 落位。
+
+并发：同一个源在同一刻只允许一个 `updater_apply` / `updater_rollback`（插件进程内锁，2026-11-03 审计 U2）。第二个调用立刻返回 `UPDATER_BUSY`（「正在执行…」），不会交错写目录；staging 从克隆成功到结束全程 `try/finally` 清理，失败不留半成品（审计 U5）。
 
 校验门（任何 error 都会中止，本地不动）：
 - `package.json` 存在且合法

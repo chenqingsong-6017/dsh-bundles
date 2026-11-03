@@ -14,9 +14,10 @@
  */
 import assert from 'node:assert/strict'
 import { spawn as nodeSpawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, ftruncateSync, mkdtempSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 let passed = 0
 const ok = (label, extra = '') => {
@@ -232,6 +233,37 @@ assert.equal(result.ok, false)
 assert.match(result.message, /白名单/)
 ok('白名单外的 localDir 被拒绝登记')
 
+// ------------------------------------------------------------ 并发锁（2026-11-03 审计 U2）
+
+section('并发锁：同源 apply / rollback 同刻只允许一个')
+{
+  const realSpawn = ctx.subprocess.spawn
+  let delayNext = 400
+  ctx.subprocess.spawn = (options) => {
+    const handle = realSpawn(options)
+    if (delayNext > 0) {
+      const ms = delayNext
+      delayNext = 0
+      return { ...handle, done: new Promise((resolve) => { setTimeout(() => resolve(handle.done), ms) }) }
+    }
+    return handle
+  }
+  try {
+    const first = tool('updater_apply').execute({ name: 'demo', confirm: true, dryRun: true })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const busyApply = await tool('updater_apply').execute({ name: 'demo', confirm: true, dryRun: true })
+    assert.equal(busyApply.code, 'UPDATER_BUSY', JSON.stringify(busyApply).slice(0, 300))
+    assert.match(busyApply.message, /正在执行/)
+    const busyRollback = await tool('updater_rollback').execute({ name: 'demo', confirm: true })
+    assert.equal(busyRollback.code, 'UPDATER_BUSY', JSON.stringify(busyRollback).slice(0, 300))
+    const firstResult = await first
+    assert.equal(firstResult.status, 'validated', JSON.stringify(firstResult).slice(0, 300))
+  } finally {
+    ctx.subprocess.spawn = realSpawn
+  }
+  ok('锁：第二个 apply 与并发 rollback 均回 UPDATER_BUSY「正在执行」；第一个正常完成')
+}
+
 // ------------------------------------------------------------ 应用 v1
 
 section('应用更新')
@@ -340,6 +372,58 @@ assert.equal(result.status, 'restored', JSON.stringify(result).slice(0, 400))
 assert.ok(existsSync(userFile), '白名单外的用户文件必须保留（原实现会当「多余文件」删掉）')
 assert.match(result.message, /白名单外 \d+ 个文件保留未删/)
 ok('合法备份名仍可回滚；白名单外的 user-notes.md 保留未删')
+// ------------------------------------------------------------ staging 清理（2026-11-03 审计 U5）
+section('clone / apply 失败清理 staging')
+{
+  const brokenDir = path.join(pluginsRoot, 'broken-sha')
+  mkdirSync(brokenDir, { recursive: true })
+  const registeredBroken = await tool('updater_source').execute({
+    action: 'add',
+    name: 'broken-sha',
+    repo: remote,
+    localDir: brokenDir,
+    ref: '0000000000000000000000000000000000000000',
+  })
+  assert.equal(registeredBroken.ok, true, registeredBroken.message)
+  const staging = path.join(store, 'staging')
+  const stagingCount = () => (existsSync(staging) ? readdirSync(staging).length : 0)
+  const before = stagingCount()
+  const cloneFailed = await tool('updater_apply').execute({ name: 'broken-sha', confirm: true })
+  assert.equal(cloneFailed.code, 'CLONE_FAILED', JSON.stringify(cloneFailed).slice(0, 300))
+  assert.equal(stagingCount(), before, 'clone 失败不许在 staging 留半截目录')
+  assert.equal(
+    existsSync(staging) ? readdirSync(staging).some((name) => name.startsWith('broken-sha-')) : false,
+    false,
+    'staging 里不许有 broken-sha-* 半成品',
+  )
+  ok('U5：ref 不存在导致 clone 失败后，staging 无半成品目录')
+}
+
+// ------------------------------------------------------------ 大文件不整读（2026-11-03 审计 U3）
+section('大文件比较有上限')
+{
+  const bigOld = path.join(tmp, 'u3-big-old.bin')
+  const smallNew = path.join(tmp, 'u3-small-new.txt')
+  writeFileSync(smallNew, 'new version\n')
+  const handle = openSync(bigOld, 'w')
+  try {
+    ftruncateSync(handle, 200 * 1024 * 1024)
+  } finally {
+    closeSync(handle)
+  }
+  const eolA = path.join(tmp, 'u3-eol-a.txt')
+  const eolB = path.join(tmp, 'u3-eol-b.txt')
+  writeFileSync(eolA, 'a\r\nb\r\n')
+  writeFileSync(eolB, 'a\nb\n')
+  assert.equal(updater.fileDiffKind(eolA, eolB), 'eol', '行尾差异语义不能被误伤')
+  assert.equal(updater.fileDiffKind(eolA, eolA), 'same')
+  assert.equal(updater.fileDiffKind(bigOld, smallNew), 'differ', '>4MB 一侧必须短路为 differ')
+  const entry = pathToFileURL(path.join('D:/AI/dsh-bundles/dsh-updater/index.js')).href
+  const script = `import(${JSON.stringify(entry)}).then((m) => { const r = m.fileDiffKind(${JSON.stringify(bigOld)}, ${JSON.stringify(smallNew)}); if (r !== 'differ') { console.error('unexpected ' + r); process.exit(2) } }).catch((e) => { console.error(e && e.message); process.exit(3) })`
+  const child = spawnSync(process.execPath, ['--max-old-space-size=64', '-e', script], { encoding: 'utf8', timeout: 60000, windowsHide: true })
+  assert.equal(child.status, 0, `大文件比较不应整读（64MB 堆下会 OOM）：${child.stderr || child.stdout}`)
+  ok('U3：>4MB 文件比较短路为 differ，不整读旧文件（64MB 堆子进程验证不 OOM）')
+}
 
 function listBackupNames() {
   return readdirSync(backupRoot).filter((name) => name !== '')

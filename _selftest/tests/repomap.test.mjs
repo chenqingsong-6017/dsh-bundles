@@ -187,6 +187,54 @@ try {
     )
     ok('repo_map：超大文件跳过与符号截断都带明示标记（不再静默失真）')
   }
+  // ---------- B6（2026-11-03 审计 M7）：默认根不再落到插件进程 cwd ----------
+  {
+    const makeCtx = (service) => {
+      const registered = new Map()
+      const ctx = {
+        tools: { register: (definition) => { registered.set(definition.name, definition); return () => {} } },
+        effect: (fn) => fn(),
+        get: (name) => (name === 'workingDirectory' ? service : undefined),
+      }
+      return { ctx, tool: (toolName) => registered.get(toolName) }
+    }
+    // 1) 会话工作目录可用 → 默认根就是它
+    {
+      const h = makeCtx({ ensure: async () => fixture })
+      apply(h.ctx, {})
+      const status = await h.tool('repo_status').execute({}, { agent: { session: 's1' } })
+      assert.equal(status.root, fixture, '默认根应为会话工作目录')
+      assert.equal(status.rootSource, 'workingDirectory')
+      assert.ok(status.sources > 0, `默认应扫出源文件，实际 ${status.sources}`)
+      const map = await h.tool('repo_map').execute({}, { agent: { session: 's1' } })
+      assert.ok(map.entries.some((entry) => entry.path.endsWith('alpha.js')), 'repo_map 默认根也应是工作区')
+    }
+    // 2) workingDirectory 不可用 → 回退 config.workspaceDir
+    {
+      const h = makeCtx(undefined)
+      apply(h.ctx, { workspaceDir: fixture })
+      const status = await h.tool('repo_status').execute({}, {})
+      assert.equal(status.root, fixture, '必须回退 workspaceDir')
+      assert.equal(status.rootSource, 'workspaceDir')
+      assert.ok(status.sources > 0)
+    }
+    // 3) 两者都没有 → 明确报错，不再回落 process.cwd()
+    {
+      const saved = { dsh: process.env.DSH_HOME, up: process.env.USERPROFILE }
+      delete process.env.DSH_HOME
+      delete process.env.USERPROFILE
+      try {
+        const h = makeCtx(undefined)
+        apply(h.ctx, {})
+        await assert.rejects(() => h.tool('repo_status').execute({}, {}), (error) => error?.code === 'REPO_NO_WORKSPACE')
+        await assert.rejects(() => h.tool('repo_map').execute({}, {}), (error) => error?.code === 'REPO_NO_WORKSPACE')
+      } finally {
+        if (saved.dsh !== undefined) process.env.DSH_HOME = saved.dsh
+        if (saved.up !== undefined) process.env.USERPROFILE = saved.up
+      }
+    }
+    ok('B6：默认根用会话工作目录；不可用回退 workspaceDir；都没有时报 REPO_NO_WORKSPACE（不再回落 process.cwd）')
+  }
 } finally {
   rmSync(fixture, { recursive: true, force: true })
 }

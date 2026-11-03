@@ -13,7 +13,7 @@ DSH bundle（Host 侧插件）：给任意工作区生成"按引用热度排序�
 - 预算单位用**字符**（`maxChars`）而不是 token：DSH 没有统一 tokenizer，字符稳定可验。
 
 - **安装位置**：`D:\AI\dsh-bundles\dsh-repomap`
-- **生效范围**：desktop profile，所有会话/工作目录（默认根 = 会话工作目录）
+- **生效范围**：desktop profile，所有会话/工作目录（默认根 = 会话工作目录；拿不到时回退 `config.workspaceDir` → DSH 最近工作区，**不再回落插件进程 cwd**）
 
 ## 工具
 
@@ -34,7 +34,10 @@ DSH bundle（Host 侧插件）：给任意工作区生成"按引用热度排序�
         maxChars: 8000        # 默认地图预算
         maxFiles: 4000        # 单次扫描文件上限
         maxCacheEntries: 8    # 内存扫描缓存条目上限（LRU 淘汰）
+        # workspaceDir: D:\AI-date\dsh-date\dsh-创建   # 可选兜底根（会话工作目录拿不到时用；不配则读 DSH 最近工作区）
 ```
+
+`repo_status.rootSource` 会说明扫描根是哪来的：`workingDirectory`（会话 cwd）/ `workspaceDir`（配置或最近工作区）/ `path`（显式传入）/ `relative`（相对显式 path）。两者都拿不到时工具报 `REPO_NO_WORKSPACE`，不会静默扫 profile 目录。
 
 ## 扫描缓存
 

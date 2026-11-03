@@ -368,7 +368,7 @@ function driveInfo(letter) {
 
 // ───────────────────────────── 可清目录白名单 ─────────────────────────────
 
-function junkCatalog() {
+function junkCatalog(extraDirs) {
   const home = os.homedir()
   const local = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local')
   const win = process.env.SystemRoot || 'C:\\Windows'
@@ -388,6 +388,24 @@ function junkCatalog() {
     { id: 'recycle-c', label: 'C 盘回收站', path: 'C:\\$Recycle.Bin', policy: 'cautious' },
     { id: 'recycle-d', label: 'D 盘回收站', path: 'D:\\$Recycle.Bin', policy: 'cautious' },
   ]
+
+  // 配置注入的可清目录（2026-11-03）：id / path 必填，policy 只认 safe / cautious / admin。
+  // 用于机器相关的自定义临时目录；默认 clean 只动 policy=safe 的项，点名要传 targets。
+  if (Array.isArray(extraDirs)) {
+    for (const item of extraDirs) {
+      if (!item || typeof item !== 'object') continue
+      const id = typeof item.id === 'string' ? item.id.trim() : ''
+      const itemPath = typeof item.path === 'string' ? item.path.trim() : ''
+      const policy = item.policy === 'cautious' || item.policy === 'admin' ? item.policy : 'safe'
+      if (id === '' || itemPath === '') continue
+      deletable.push({
+        id,
+        label: typeof item.label === 'string' && item.label.trim() !== '' ? item.label.trim() : itemPath,
+        path: path.resolve(itemPath),
+        policy,
+      })
+    }
+  }
 
   const observe = [
     { id: 'edge-cache', label: 'Edge 浏览器缓存', path: path.join(local, 'Microsoft', 'Edge', 'User Data', 'Default', 'Cache') },
@@ -574,11 +592,18 @@ function buildOrganizePlan(target, { rule, subfolders, typeMap, guard, conflict 
 
 // ───────────────────────────── 执行 ─────────────────────────────
 
-/** 移动文件或目录；跨卷时退回复制 + 删除 */
-function movePath(from, to) {
+/** 移动文件或目录；跨卷时退回复制 + 删除。导出供单测验证「不静默覆盖」（2026-11-03 审计 T7）。 */
+export function movePath(from, to) {
   // 注意：不能无条件 mkdir 父目录——目标是盘根（如 D:\）时 mkdirSync('D:\\') 会抛 EPERM
   const parent = path.dirname(to)
   if (!existsSync(parent)) mkdirSync(parent, { recursive: true })
+  // 2026-11-03 审计 T7：renameSync 会静默覆盖同名目标。方案期到执行期存在 TOCTOU 窗口
+  //（同秒并发 / 外部程序刚写入），这里在真正移动前再判一次存在：命中即报 DEST_EXISTS，绝不覆盖。
+  if (existsSync(to)) {
+    const conflict = new Error('目标已存在，不覆盖')
+    conflict.code = 'DEST_EXISTS'
+    throw conflict
+  }
   try {
     renameSync(from, to)
   } catch (error) {
@@ -616,11 +641,36 @@ function appendLog(logFile, record) {
   }
 }
 
+/**
+ * 写清单：临时文件 + rename 原子落位（2026-11-03 审计 T5）。
+ * 直接 writeFileSync 写一半断电会留下半截 JSON；先写 `.tmp-<pid>` 再改名，
+ * 读清单的一侧永远只会看到完整旧版或完整新版。
+ */
 function writeManifest(store, kind, payload) {
   mkdirSync(store.manifests, { recursive: true })
   const file = path.join(store.manifests, `${kind}-${stampOf()}.json`)
-  writeFileSync(file, JSON.stringify(payload, null, 2), 'utf8')
+  const temp = `${file}.tmp-${process.pid}`
+  try {
+    writeFileSync(temp, JSON.stringify(payload, null, 2), 'utf8')
+    renameSync(temp, file)
+  } catch (error) {
+    try {
+      rmSync(temp, { force: true })
+    } catch (ignored) {
+      /* 临时文件删不掉不影响报错 */
+    }
+    throw error
+  }
   return file
+}
+
+/** 清单写失败的统一出口：不把异常冒到工具层（那时文件已经动了，异常会丢掉「已移动」这个事实）。 */
+function tryWriteManifest(store, kind, payload) {
+  try {
+    return { file: writeManifest(store, kind, payload), error: '' }
+  } catch (error) {
+    return { file: '', error: lockHint(error) }
+  }
 }
 
 function listManifests(store) {
@@ -689,7 +739,7 @@ function doScan(config, args, guard, store) {
     if (info) drives.push(info)
   }
 
-  const catalog = junkCatalog()
+  const catalog = junkCatalog(config?.junkDirs)
   const cleanableItems = []
   let safeBytes = 0
   let cautiousBytes = 0
@@ -1514,9 +1564,13 @@ function doApplyFolders(args, guard, store) {
     }
   }
   let manifest = ''
+  let manifestError = ''
   if (records.length > 0) {
-    manifest = writeManifest(store, 'folders', { at: new Date().toISOString(), moves: records })
+    const written = tryWriteManifest(store, 'folders', { at: new Date().toISOString(), moves: records })
+    manifest = written.file
+    manifestError = written.error
   }
+  if (manifestError !== '') errors.push(`清单写失败：${manifestError}`)
   appendLog(store.logFile, {
     at: new Date().toISOString(),
     kind: 'folders',
@@ -1534,12 +1588,15 @@ function doApplyFolders(args, guard, store) {
     errors,
     blockers,
     manifest,
+    ...(manifestError !== '' ? { code: 'MANIFEST_WRITE_FAILED' } : {}),
     hint:
-      blockers.length > 0
-        ? '有目录被系统引用（服务/自启/计划任务/开始菜单），臣没有动。确认要强行搬时传 force:true，并准备好改这些引用。'
-        : manifest
-          ? '目录已归并，可 tidy_undo 撤回。'
-          : '一个都没动成，看上面原因。',
+      manifestError !== ''
+        ? `目录已归并 ${moved} 个，但清单写失败（${manifestError}）→ 这次无法用 tidy_undo 撤销，请人工核对。`
+        : blockers.length > 0
+          ? '有目录被系统引用（服务/自启/计划任务/开始菜单），臣没有动。确认要强行搬时传 force:true，并准备好改这些引用。'
+          : manifest
+            ? '目录已归并，可 tidy_undo 撤回。'
+            : '一个都没动成，看上面原因。',
   }
 }
 
@@ -1585,9 +1642,13 @@ function doApplyRename(args, guard, store) {
     }
   }
   let manifest = ''
+  let manifestError = ''
   if (records.length > 0) {
-    manifest = writeManifest(store, 'rename', { at: new Date().toISOString(), moves: records })
+    const written = tryWriteManifest(store, 'rename', { at: new Date().toISOString(), moves: records })
+    manifest = written.file
+    manifestError = written.error
   }
+  if (manifestError !== '') errors.push(`清单写失败：${manifestError}`)
   appendLog(store.logFile, { at: new Date().toISOString(), kind: 'rename', moved, errors: errors.length })
   return {
     ...base,
@@ -1597,7 +1658,13 @@ function doApplyRename(args, guard, store) {
     skipped,
     errors,
     manifest,
-    hint: manifest ? '名字已改好，可 tidy_undo 撤回。' : '一个都没改成，看上面原因。',
+    ...(manifestError !== '' ? { code: 'MANIFEST_WRITE_FAILED' } : {}),
+    hint:
+      manifestError !== ''
+        ? `名字已改好 ${moved} 个，但清单写失败（${manifestError}）→ 这次无法用 tidy_undo 撤销，请人工核对。`
+        : manifest
+          ? '名字已改好，可 tidy_undo 撤回。'
+          : '一个都没改成，看上面原因。',
   }
 }
 
@@ -1625,8 +1692,27 @@ function doApply(config, args, guard, store) {
         hint: '清理不可撤销。请先把结果给用户看，得到明确同意后传 confirm:true 再执行。',
       }
     }
-    const wanted = Array.isArray(args && args.targets) && args.targets.length > 0 ? args.targets : undefined
-    const catalog = junkCatalog()
+    // 2026-11-03 审计 T6：``targets:[]`` 不能等价于「全删」。区分「没传」与「传了空数组」：
+    // - 没传 targets：按默认策略（policy=safe）清理；
+    // - 传了空数组：什么都不选 → EMPTY_TARGETS，不执行任何删除。
+    const rawTargets = args && args.targets
+    if (Array.isArray(rawTargets) && rawTargets.length === 0) {
+      return {
+        applied: false,
+        kind,
+        moved: 0,
+        deletedFiles: 0,
+        freedBytes: 0,
+        skipped: 0,
+        errors: [],
+        manifest: '',
+        remaining: 0,
+        code: 'EMPTY_TARGETS',
+        hint: 'targets 是空数组：这次一个都不删（空数组 ≠ 全选）。要清默认安全项就别传 targets；要清指定项请传具体 id。',
+      }
+    }
+    const wanted = Array.isArray(rawTargets) ? rawTargets : undefined
+    const catalog = junkCatalog(config?.junkDirs)
     const targets = catalog.deletable.filter((item) => {
       if (wanted) return wanted.includes(item.id) && item.policy !== 'admin'
       return item.policy === 'safe'
@@ -1635,8 +1721,16 @@ function doApply(config, args, guard, store) {
     let freedBytes = 0
     let skipped = 0
     const errors = []
+    // 2026-11-03 审计 T4：clean 原来不受 maxFiles 约束（实测一次 2321 个文件 / 675 MB，
+    // README 却承诺 300）。这里把「条目数」也纳入上限：超过就截断，并如实回报剩余条数。
+    const pending = []
     for (const item of targets) {
       if (!existsSync(item.path)) continue
+      if (isProtected(item.path, guard)) {
+        skipped += 1
+        errors.push(`${item.label}：在红线目录内，不清`)
+        continue
+      }
       let entries
       try {
         entries = readdirSync(item.path, { withFileTypes: true })
@@ -1645,20 +1739,26 @@ function doApply(config, args, guard, store) {
         errors.push(`${item.label}：${lockHint(error)}`)
         continue
       }
-      for (const entry of entries) {
-        const full = path.join(item.path, entry.name)
-        const before = entry.isDirectory() ? measureDir(full) : { bytes: safeSize(full), files: 1 }
-        try {
-          rmSync(full, { recursive: true, force: true })
-          deletedFiles += before.files
-          freedBytes += before.bytes
-        } catch (error) {
-          skipped += 1
-          if (errors.length < 8) errors.push(`${entry.name}：${lockHint(error)}`)
-        }
+      for (const entry of entries) pending.push({ item, entry })
+    }
+    let processed = 0
+    for (let index = 0; index < pending.length; index += 1) {
+      if (processed >= maxFiles) break
+      const { item, entry } = pending[index]
+      const full = path.join(item.path, entry.name)
+      const before = entry.isDirectory() ? measureDir(full) : { bytes: safeSize(full), files: 1 }
+      processed += 1
+      try {
+        rmSync(full, { recursive: true, force: true })
+        deletedFiles += before.files
+        freedBytes += before.bytes
+      } catch (error) {
+        skipped += 1
+        if (errors.length < 8) errors.push(`${entry.name}：${lockHint(error)}`)
       }
     }
-    appendLog(store.logFile, { at: new Date().toISOString(), kind, deletedFiles, freedBytes, skipped })
+    const remaining = Math.max(0, pending.length - processed)
+    appendLog(store.logFile, { at: new Date().toISOString(), kind, deletedFiles, freedBytes, skipped, remaining })
     return {
       applied: true,
       kind,
@@ -1668,8 +1768,13 @@ function doApply(config, args, guard, store) {
       skipped,
       errors,
       manifest: '',
-      remaining: 0,
-      hint: skipped > 0 ? '部分文件正被占用（多为正在运行的程序），关掉程序后可再清一次。' : '清理完成。',
+      remaining,
+      hint:
+        remaining > 0
+          ? `本次处理到上限 ${maxFiles} 条（删了 ${deletedFiles} 个文件），还有 ${remaining} 条未处理；再执行一次继续。`
+          : skipped > 0
+            ? '部分文件正被占用（多为正在运行的程序），关掉程序后可再清一次。'
+            : '清理完成。',
     }
   }
 
@@ -1727,14 +1832,18 @@ function doApply(config, args, guard, store) {
     }
   }
   let manifest = ''
+  let manifestError = ''
   if (records.length > 0) {
-    manifest = writeManifest(store, 'organize', {
+    const written = tryWriteManifest(store, 'organize', {
       at: new Date().toISOString(),
       target: checked.resolved,
       rule,
       moves: records,
     })
+    manifest = written.file
+    manifestError = written.error
   }
+  if (manifestError !== '') errors.push(`清单写失败：${manifestError}`)
   appendLog(store.logFile, { at: new Date().toISOString(), kind, target: checked.resolved, moved, bytes: Math.round(bytes), errors: errors.length })
   const remaining = Math.max(0, plan.totalFiles - moved)
   return {
@@ -1747,10 +1856,13 @@ function doApply(config, args, guard, store) {
     errors,
     manifest,
     remaining,
+    ...(manifestError !== '' ? { code: 'MANIFEST_WRITE_FAILED' } : {}),
     hint:
-      remaining > 0
-        ? `还有 ${remaining} 个文件没动（单次上限 ${maxFiles}）。可再执行一次补齐。`
-        : '整理完成。想还原可用 tidy_undo。',
+      manifestError !== ''
+        ? `已移动 ${moved} 个文件，但清单写失败（${manifestError}）→ 这次无法用 tidy_undo 撤销，请人工核对。`
+        : remaining > 0
+          ? `还有 ${remaining} 个文件没动（单次上限 ${maxFiles}）。可再执行一次补齐。`
+          : '整理完成。想还原可用 tidy_undo。',
   }
 }
 
@@ -2080,9 +2192,13 @@ function doApplyDupes(args, guard, store) {
     }
   }
   let manifest = ''
+  let manifestError = ''
   if (records.length > 0) {
-    manifest = writeManifest(store, 'dupes', { at: new Date().toISOString(), moves: records })
+    const written = tryWriteManifest(store, 'dupes', { at: new Date().toISOString(), moves: records })
+    manifest = written.file
+    manifestError = written.error
   }
+  if (manifestError !== '') errors.push(`清单写失败：${manifestError}`)
   appendLog(store.logFile, { at: new Date().toISOString(), kind: 'dupes', moved, bytes: Math.round(bytes), errors: errors.length })
   return {
     ...base,
@@ -2092,10 +2208,13 @@ function doApplyDupes(args, guard, store) {
     skipped,
     errors,
     manifest,
+    ...(manifestError !== '' ? { code: 'MANIFEST_WRITE_FAILED' } : {}),
     hint:
-      records.length > 0
-        ? `已把 ${moved} 份多余副本移入隔离区：${quarantine}。确认没用再删该目录；想反悔可 tidy_undo。`
-        : '没有可隔离的重复文件。',
+      manifestError !== ''
+        ? `已把 ${moved} 份副本移入隔离区 ${quarantine}，但清单写失败（${manifestError}）→ 这次无法用 tidy_undo 撤销，请人工核对。`
+        : records.length > 0
+          ? `已把 ${moved} 份多余副本移入隔离区：${quarantine}。确认没用再删该目录；想反悔可 tidy_undo。`
+          : '没有可隔离的重复文件。',
   }
 }
 
@@ -2298,7 +2417,13 @@ foreach ($name in $wantedRun) {
   for (const item of removedRun) records.push({ type: 'run', name: String(item.name || ''), oldValue: String(item.value || '') })
 
   let manifest = ''
-  if (records.length > 0) manifest = writeManifest(store, 'residue', { at: new Date().toISOString(), records })
+  let manifestError = ''
+  if (records.length > 0) {
+    const written = tryWriteManifest(store, 'residue', { at: new Date().toISOString(), records })
+    manifest = written.file
+    manifestError = written.error
+  }
+  if (manifestError !== '') base.errors = [...(base.errors || []), `清单写失败：${manifestError}`]
   appendLog(store.logFile, { at: new Date().toISOString(), kind: 'residue', removedPath: removedPath.length, removedRun: removedRun.length })
   const total = removedPath.length + removedRun.length
   return {
@@ -2306,10 +2431,13 @@ foreach ($name in $wantedRun) {
     applied: true,
     moved: total,
     manifest,
+    ...(manifestError !== '' ? { code: 'MANIFEST_WRITE_FAILED' } : {}),
     hint:
-      total > 0
-        ? `已移除用户级残留 ${total} 条（PATH ${removedPath.length} · 自启 ${removedRun.length}），清单可 tidy_undo 恢复${backupFile ? `；改前已备份注册表到 ${backupFile}` : ''}。`
-        : '没有可移除的用户级残留。',
+      manifestError !== ''
+        ? `已移除用户级残留 ${total} 条，但清单写失败（${manifestError}）→ 这次无法用 tidy_undo 恢复${backupFile ? `；注册表备份在 ${backupFile}` : ''}，请人工核对。`
+        : total > 0
+          ? `已移除用户级残留 ${total} 条（PATH ${removedPath.length} · 自启 ${removedRun.length}），清单可 tidy_undo 恢复${backupFile ? `；改前已备份注册表到 ${backupFile}` : ''}。`
+          : '没有可移除的用户级残留。',
   }
 }
 

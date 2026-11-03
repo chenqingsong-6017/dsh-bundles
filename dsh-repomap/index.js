@@ -29,7 +29,8 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 
 export const name = 'dsh-repomap'
-export const inject = ['tools']
+// workingDirectory 必须声明：不声明就拿不到会话工作目录，默认根会落到插件进程 cwd（profile 目录）。
+export const inject = ['tools', 'workingDirectory']
 
 const MAX_FILE_BYTES = 512 * 1024
 const MAX_SYMBOLS_PER_FILE = 60
@@ -409,6 +410,36 @@ function rankFiles(files) {
 
 const text = (value) => ({ type: 'text', text: value })
 
+function strValue(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * 工作区兜底：优先 config.workspaceDir，其次读 DSH 最近使用的 workspace
+ * （<DSH_HOME>/storages/workspace.json）。插件进程 cwd 是 profile 目录，绝不能拿它当默认根。
+ */
+export function readActiveWorkspace(env) {
+  try {
+    const home = strValue(env?.DSH_HOME) || (strValue(env?.USERPROFILE) !== '' ? path.join(strValue(env.USERPROFILE), '.dsh') : '')
+    if (home === '') return ''
+    const file = path.join(home, 'storages', 'workspace.json')
+    if (!existsSync(file)) return ''
+    const parsed = JSON.parse(readFileSync(file, 'utf8'))
+    const workspaces = (parsed && parsed.tables && parsed.tables.workspaces) || {}
+    let best = null
+    for (const key of Object.keys(workspaces)) {
+      const entry = workspaces[key]
+      if (!entry || typeof entry.path !== 'string') continue
+      const stamp = Date.parse(String(entry.updatedAt || entry.createdAt || ''))
+      const score = Number.isFinite(stamp) ? stamp : 0
+      if (!best || score > best.score) best = { score, path: entry.path }
+    }
+    return best ? String(best.path) : ''
+  } catch {
+    return ''
+  }
+}
+
 /** 统一错误契约：所有抛出的错误都带 code（UPPER_SNAKE），调用方据此分支，不必解析中文文案。 */
 function fail(code, message) {
   const error = new Error(message)
@@ -425,7 +456,14 @@ export function apply(ctx, config) {
       ? Math.min(config.maxCacheEntries, MAX_CACHE_ENTRIES_LIMIT)
       : DEFAULT_MAX_CACHE_ENTRIES
   const tools = ctx.tools
-  const workingDirectory = ctx.get('workingDirectory')
+  const workingDirectory = (typeof ctx.get === 'function' ? ctx.get('workingDirectory') : undefined) ?? ctx.workingDirectory
+  // 兜底工作区：config.workspaceDir → DSH 最近工作区。都拿不到时交给 resolveRoot 报错，
+  // 绝不回落到 process.cwd()（那是 profile 目录，扫出来的 0 文件是假绿）。
+  const configuredWorkspaceDir = (() => {
+    const fromConfig = strValue(config?.workspaceDir)
+    if (fromConfig !== '') return path.resolve(fromConfig)
+    return readActiveWorkspace(process.env)
+  })()
   // 一个插件实例一份缓存：同一会话里 repo_map / repo_find_symbol 共享扫描结果
   const scanner = createScanCache({ maxFiles, maxBytes: MAX_SCAN_BYTES, maxCacheEntries })
   // repo_outline 只涉及单个文件，用"文件路径 + mtimeMs + size"做 key 的小 LRU
@@ -461,10 +499,33 @@ export function apply(ctx, config) {
     return value
   }
 
+  /**
+   * 解析扫描根：显式 path 优先；否则用会话工作目录 → workspaceDir 兜底。
+   * 返回 { root, source }，source 让 repo_status 能说清「这个根是哪来的」。
+   * 两者都拿不到时抛 REPO_NO_WORKSPACE（不再静默用 process.cwd()）。
+   */
   async function resolveRoot(exec, wantedPath) {
     const raw = typeof wantedPath === 'string' && wantedPath.trim() !== '' ? wantedPath.trim() : undefined
-    const cwd = workingDirectory && exec?.agent ? await workingDirectory.ensure(exec.agent, exec.signal).catch(() => undefined) : undefined
-    return raw === undefined ? cwd ?? process.cwd() : path.resolve(cwd ?? process.cwd(), raw)
+    let base = ''
+    let source = ''
+    if (workingDirectory !== undefined && workingDirectory !== null && typeof workingDirectory.ensure === 'function' && exec?.agent) {
+      const ensured = await workingDirectory.ensure(exec.agent, exec.signal).catch(() => undefined)
+      if (typeof ensured === 'string' && ensured.trim() !== '') {
+        base = path.resolve(ensured.trim())
+        source = 'workingDirectory'
+      }
+    }
+    if (base === '' && configuredWorkspaceDir !== '') {
+      base = configuredWorkspaceDir
+      source = 'workspaceDir'
+    }
+    if (raw === undefined) {
+      if (base === '') throw fail('REPO_NO_WORKSPACE', '拿不到会话工作目录，也没有配置 workspaceDir。请显式传 path，或在配置里设 workspaceDir（不会再回落到插件进程 cwd）。')
+      return { root: base, source }
+    }
+    if (path.isAbsolute(raw)) return { root: path.resolve(raw), source: 'path' }
+    if (base === '') throw fail('REPO_NO_WORKSPACE', '给的是相对路径但拿不到会话工作目录。请传绝对 path，或在配置里设 workspaceDir。')
+    return { root: path.resolve(base, raw), source: 'relative' }
   }
 
   function buildMap(root, maxChars) {
@@ -552,7 +613,7 @@ export function apply(ctx, config) {
         },
       },
       async execute(args, exec) {
-        const root = await resolveRoot(exec, args?.path)
+        const { root } = await resolveRoot(exec, args?.path)
         const budget = Number.isInteger(args?.maxChars) && args.maxChars > 0 ? Math.min(args.maxChars, 64000) : defaultMaxChars
         return buildMap(root, budget)
       },
@@ -599,8 +660,8 @@ export function apply(ctx, config) {
       async execute(args, exec) {
         const raw = typeof args?.path === 'string' ? args.path.trim() : ''
         if (raw === '') throw fail('REPO_ARG_MISSING', 'repo_outline 需要 path。')
-        const cwd = workingDirectory && exec?.agent ? await workingDirectory.ensure(exec.agent, exec.signal).catch(() => undefined) : undefined
-        return outlineFor(path.resolve(cwd ?? process.cwd(), raw))
+        const { root } = await resolveRoot(exec, raw)
+        return outlineFor(root)
       },
     }),
   )
@@ -650,7 +711,7 @@ export function apply(ctx, config) {
         const wanted = typeof args?.name === 'string' ? args.name.trim() : ''
         if (wanted === '') throw fail('REPO_ARG_MISSING', 'repo_find_symbol 需要 name。')
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 100) : 20
-        const root = await resolveRoot(exec, args?.path)
+        const { root } = await resolveRoot(exec, args?.path)
         const { files } = scanner.scan(root)
         const matches = []
         for (const file of files) {
@@ -688,6 +749,7 @@ export function apply(ctx, config) {
             unavailableReason: { type: 'string' },
             code: { type: 'string' },
             root: { type: 'string' },
+            rootSource: { type: 'string' },
             exists: { type: 'boolean' },
             isDirectory: { type: 'boolean' },
             readable: { type: 'boolean' },
@@ -704,8 +766,9 @@ export function apply(ctx, config) {
             maxFiles: { type: 'integer' },
             maxCacheEntries: { type: 'integer' },
             configWarning: { type: 'string' },
+            warning: { type: 'string' },
           },
-          required: ['ready', 'root', 'exists', 'isDirectory', 'readable', 'sources', 'cache', 'maxChars', 'maxFiles', 'maxCacheEntries'],
+          required: ['ready', 'root', 'rootSource', 'exists', 'isDirectory', 'readable', 'sources', 'cache', 'maxChars', 'maxFiles', 'maxCacheEntries'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -713,16 +776,18 @@ export function apply(ctx, config) {
           const cache = value?.cache ?? {}
           return [
             text(
-              `代码库地图可用：扫描根 ${value?.root ?? '?'}，识别 ${value?.sources ?? 0} 个源文件` +
+              `代码库地图可用：扫描根 ${value?.root ?? '?'}（来源 ${value?.rootSource ?? '?'}），识别 ${value?.sources ?? 0} 个源文件` +
                 `（跳过超大 ${value?.skippedLarge ?? 0}、不支持 ${value?.skippedUnsupported ?? 0}），` +
                 `扫描缓存 ${cache.size ?? 0} 份（命中 ${cache.hits ?? 0} / 未命中 ${cache.misses ?? 0}），` +
                 `预算 ${value?.maxChars ?? 0} 字符 / 上限 ${value?.maxFiles ?? 0} 个文件。`,
+              (value?.warning ? `\n⚠ ${value.warning}` : ''),
             ),
           ]
         },
       },
       async execute(args, exec) {
-        const root = await resolveRoot(exec, args?.path)
+        const resolved = await resolveRoot(exec, args?.path)
+        const root = resolved.root
         const problems = []
         let code = ''
         const note = (nextCode, reason) => {
@@ -785,11 +850,16 @@ export function apply(ctx, config) {
         }
 
         const ready = problems.length === 0
+        const warning =
+          ready && sources === 0 && resolved.source !== 'path'
+            ? `默认扫描根（来源 ${resolved.source}）没有识别到源文件：${root}。若这不是你想要的目录，请显式传 path。`
+            : ''
         return {
           ready,
           unavailableReason: problems.join('；'),
           ...(ready ? {} : { code }),
           root,
+          rootSource: resolved.source,
           exists,
           isDirectory,
           readable,
@@ -801,6 +871,7 @@ export function apply(ctx, config) {
           maxFiles,
           maxCacheEntries,
           ...(configWarnings.length > 0 ? { configWarning: configWarnings.join('；') } : {}),
+          ...(warning !== '' ? { warning } : {}),
         }
       },
     }),

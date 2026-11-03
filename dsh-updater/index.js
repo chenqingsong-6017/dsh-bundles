@@ -320,6 +320,36 @@ function inspectBundle(root) {
 
 // ---------------------------------------------------------------- 插件主体
 
+/**
+ * 两个文件的关系：same 内容相同 / eol 只有行尾（CRLF↔LF）不同 / differ 真不同。
+ *
+ * 分出 eol 这一档是因为本机的插件目录里真的存在不一致：实测 `dsh-verify/package.json`
+ * 是 CRLF 而其余 6 个文件是 LF。这类差异 apply 会顺手规范化成仓库里的 LF，是好事，
+ * 但把它混进"内容改动"里报出来，diff 会显示整个文件重写 —— 纯噪音。
+ *
+ * 导出供单测（2026-11-03 审计 U3）：比较前先按大小上限短路，绝不整读超大文件。
+ */
+export function fileDiffKind(a, b) {
+  try {
+    const BIG = 4 * 1024 * 1024
+    const sizeA = statSync(a)
+    const sizeB = statSync(b)
+    if (sizeA.size === sizeB.size) {
+      // 同大小的大文件（音频/图片/压缩包）不逐字节读，直接视为相同，避免把内存吃满
+      if (sizeA.size > BIG) return 'same'
+      if (readFileSync(a).equals(readFileSync(b))) return 'same'
+    } else if (Math.max(sizeA.size, sizeB.size) > BIG) {
+      // 2026-11-03 审计 U3：原来只判 B（新文件）。本地旧文件若是超大二进制，
+      // 会走到下面的 readFileSync 把旧文件整读成 utf8 → 可能 OOM 掉整个 DSH 进程。
+      return 'differ'
+    }
+    const normalize = (file) => readFileSync(file, 'utf8').replace(/\r\n/g, '\n')
+    return normalize(a) === normalize(b) ? 'eol' : 'differ'
+  } catch {
+    return 'differ'
+  }
+}
+
 export function apply(ctx, config) {
   const storeDir = (() => {
     const fromConfig = typeof config?.storeDir === 'string' ? config.storeDir.trim() : ''
@@ -343,6 +373,11 @@ export function apply(ctx, config) {
   const backupsDir = path.join(storeDir, 'backups')
   const stagingDir = path.join(storeDir, 'staging')
   const learnDir = path.join(storeDir, 'learn')
+
+  // 2026-11-03 审计 U2：进程内并发锁。apply / rollback 对同一个源同刻只允许一个：
+  // 两个 agent 同时 apply 会各自 clone + backup + 交错 copyOver，目录可能变成两个版本的混合体。
+  // 锁只在插件实例内有效（跨进程要靠锁文件，本插件没做——先覆盖最常见的同会话并发）。
+  const busySources = new Set()
 
   const tools = ctx.tools
   const subprocess = ctx.subprocess
@@ -739,6 +774,8 @@ export function apply(ctx, config) {
 
     const cloned = await git(cloneArgs, { signal })
     if (cloned.code !== 0) {
+      // 2026-11-03 审计 U5：clone 失败会在 staging 留下半截目录，这里当场清掉。
+      forceRm(destination)
       return {
         ok: false,
         error: cloned.timedOut ? 'git clone 超时' : `git clone 失败：${(cloned.stderr || cloned.stdout).trim().slice(0, 600)}`,
@@ -748,42 +785,18 @@ export function apply(ctx, config) {
     if (isSha) {
       const fetched = await git(['fetch', '--depth', '1', '--quiet', 'origin', ref], { cwd: destination, signal })
       if (fetched.code !== 0) {
+        forceRm(destination)
         return { ok: false, error: `git fetch ${ref} 失败：${(fetched.stderr || fetched.stdout).trim().slice(0, 400)}` }
       }
       const checked = await git(['checkout', '--quiet', 'FETCH_HEAD'], { cwd: destination, signal })
       if (checked.code !== 0) {
+        forceRm(destination)
         return { ok: false, error: `git checkout ${ref} 失败：${(checked.stderr || checked.stdout).trim().slice(0, 400)}` }
       }
     }
 
     const head = await git(['rev-parse', 'HEAD'], { cwd: destination, signal })
     return { ok: true, dir: destination, sha: head.code === 0 ? head.stdout.trim() : '' }
-  }
-
-  /**
-   * 两个文件的关系：same 内容相同 / eol 只有行尾（CRLF↔LF）不同 / differ 真不同。
-   *
-   * 分出 eol 这一档是因为本机的插件目录里真的存在不一致：实测 `dsh-verify/package.json`
-   * 是 CRLF 而其余 6 个文件是 LF。这类差异 apply 会顺手规范化成仓库里的 LF，是好事，
-   * 但把它混进"内容改动"里报出来，diff 会显示整个文件重写 —— 纯噪音。
-   */
-  function fileDiffKind(a, b) {
-    try {
-      const BIG = 4 * 1024 * 1024
-      const sizeA = statSync(a)
-      const sizeB = statSync(b)
-      if (sizeA.size === sizeB.size) {
-        // 同大小的大文件（音频/图片/压缩包）不逐字节读，直接视为相同，避免把内存吃满
-        if (sizeA.size > BIG) return 'same'
-        if (readFileSync(a).equals(readFileSync(b))) return 'same'
-      } else if (sizeB.size > BIG) {
-        return 'differ'
-      }
-      const normalize = (file) => readFileSync(file, 'utf8').replace(/\r\n/g, '\n')
-      return normalize(a) === normalize(b) ? 'eol' : 'differ'
-    } catch {
-      return 'differ'
-    }
   }
 
   /**
@@ -1335,6 +1348,12 @@ export function apply(ctx, config) {
           reloadHint: '',
         }
 
+        if (busySources.has(sourceName)) {
+          return { ...base, status: 'refused', code: 'UPDATER_BUSY', message: `「${sourceName}」正在执行另一个 apply/rollback，本次没有开始；等它结束再试。` }
+        }
+        busySources.add(sourceName)
+        try {
+
         if (!dryRun && !confirmed) {
           return { ...base, status: 'refused', code: 'CONFIRM_REQUIRED', message: '这是会改本地文件的动作，需要 confirm: true。想先看差异就传 dryRun: true。' }
         }
@@ -1350,8 +1369,12 @@ export function apply(ctx, config) {
         const target = path.join(stagingDir, `${sourceName}-${stamp()}`)
         const cloned = await cloneTo(repo, ref, target, exec?.signal)
         if (!cloned.ok) {
+          forceRm(target)
           return { ...base, fromVersion, status: 'error', code: 'CLONE_FAILED', message: cloned.error }
         }
+
+        // 2026-11-03 审计 U5：从这里到结束，无论成功失败都不留 staging 半成品。
+        try {
 
         const pluginRoot = subdir !== '' ? path.join(cloned.dir, subdir) : cloned.dir
         if (!existsSync(pluginRoot)) {
@@ -1485,6 +1508,12 @@ export function apply(ctx, config) {
           message: [`已应用 ${backupInfo.files} 个文件到 ${localDir}`, ...notes].join('；'),
           reloadHint: '文件已就位但还没生效：用 plugin_manager 依次 remove_bundle 再 install_bundle 重载（热替换不换 JS 模块代际，必须走重装）。',
         }
+        } finally {
+          forceRm(target)
+        }
+        } finally {
+          busySources.delete(sourceName)
+        }
       },
     }),
   )
@@ -1545,6 +1574,12 @@ export function apply(ctx, config) {
 
         const gate = checkWritable(localDir)
         if (!gate.ok) return { name: sourceName, ok: false, status: 'refused', code: 'LOCAL_DIR_NOT_ALLOWED', restoredFrom: '', safetyBackup: '', files: 0, message: gate.reason, reloadHint: '' }
+
+        if (busySources.has(sourceName)) {
+          return { name: sourceName, ok: false, status: 'refused', code: 'UPDATER_BUSY', restoredFrom: '', safetyBackup: '', files: 0, message: `「${sourceName}」正在执行另一个 apply/rollback，本次回滚没有开始；等它结束再试。`, reloadHint: '' }
+        }
+        busySources.add(sourceName)
+        try {
 
         const entries = listBackups(sourceName)
         if (entries.length === 0) {
@@ -1631,6 +1666,9 @@ export function apply(ctx, config) {
           files: outcome.restored,
           message: `已还原（删除 ${outcome.removed} 个多余文件/${outcome.restored} 个文件写回${outcome.kept > 0 ? `；白名单外 ${outcome.kept} 个文件保留未删` : ''}）。回滚前的状态保存在 ${safetyPath}。`,
           reloadHint: '需要重载才生效：plugin_manager remove_bundle + install_bundle。',
+        }
+        } finally {
+          busySources.delete(sourceName)
         }
       },
     }),

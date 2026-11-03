@@ -34,7 +34,7 @@ D:\AI\dsh-data\research\
 └── store.json          # 版本化 JSON：{version, tasks:[{id, question, decision, tags, status, evidence[]}]}
 ```
 
-报告默认写到 `<workspace>\_research\research-<id>.md`；用 `outPath` 可指定别处（例如 vault 的 `30-Build/33-Research/`）。
+报告默认写到 `<workspace>\_research\research-<id>.md`（即配置的 `outDir`）。`outPath` 默认也**只能**落在这个目录内：绝对路径或 `..` 越界会返回 `RESEARCH_OUTPATH_INVALID`，不覆盖任何文件；确实要写到外部目录（例如 vault 的 `30-Build/33-Research/`）必须显式传 `allowOutsideWorkspace:true`（默认 false）。
 
 ## 配置（cordis.patch.yml 或 profile 层）
 
@@ -42,7 +42,7 @@ D:\AI\dsh-data\research\
 config:
   storeDir: D:\AI\dsh-data\research
   outDir: D:\AI-date\dsh-date\dsh-创建\_research
-  workspaceDir: D:\AI-date\dsh-date\dsh-创建   # 相对文件引用的解析根（默认 cwd）
+  workspaceDir: D:\AI-date\dsh-date\dsh-创建   # 相对文件引用的解析根（默认取 DSH 最近工作区，最后才回落 cwd）
 ```
 
 ## 典型流程
@@ -77,6 +77,7 @@ config:
 
 - **不联网**：`url` 只校验格式，不通就核不到内容；「链接未核对」会在返回值与报告里说明。
 - **不判断结论对错**：只检查「有没有落点、落点能不能核」，逻辑对不对仍由人/agent 负责。
-- **文件引用按 `workspaceDir`（默认 cwd）解析**：跨工作区引用要给绝对路径。
+- **文件引用按 `workspaceDir`（默认取 DSH 最近工作区）解析**：跨工作区引用要给绝对路径。
+- **`outPath` 默认受白名单约束**（2026-11-03 审计 M6）：只允许写进 `outDir`（默认 `<workspace>/_research`），越界报 `RESEARCH_OUTPATH_INVALID`；写外部目录要显式 `allowOutsideWorkspace:true`。
 - **没有任务删除/合并**：`status: closed` 只做收尾，历史保留在 store（可手工编辑）。
 
