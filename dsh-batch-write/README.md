@@ -29,7 +29,7 @@
 ] }
 ```
 
-先不带 `apply` 跑一次看预演，确认后再带 `apply: true`。
+**write gate（0.2.0）**：`apply:true` 之前必须先用**完全相同的 ops** 跑过一次 dry-run，否则拒绝（`BATCH_NO_PREVIEW`）。这是写前确认的机制化——预演即确认，跳过预演的直接写一律不放行。
 
 ## 验证
 

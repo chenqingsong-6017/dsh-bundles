@@ -40,7 +40,15 @@ try {
   assert.equal(readFileSync(fileA, 'utf8'), 'alpha', 'dry-run 必须不落盘')
   ok('dry-run：报 would-write 但文件未变')
 
-  // 2) apply 落盘 + 备份
+  // 2) write gate：未 dry-run 直接 apply 必须拒绝（用 a 之外的新 ops，a 在用例 1 已 dry-run）
+  await assert.rejects(
+    () => tool.execute({ ops: [{ path: 'b.txt', mode: 'append', content: ' gamma' }], apply: true }, {}),
+    (error) => error.code === 'BATCH_NO_PREVIEW',
+  )
+  assert.equal(readFileSync(fileB, 'utf8'), 'beta', 'gate 拒绝后文件不得被改')
+  // 2b) 先 dry-run 同 ops，再 apply → 放行并备份
+  const dry2 = await tool.execute({ ops: [{ path: 'a.txt', mode: 'replace', old: 'alpha', new: 'ALPHA' }] }, {})
+  assert.equal(dry2.failed, 0)
   const applied = await tool.execute({ ops: [{ path: 'a.txt', mode: 'replace', old: 'alpha', new: 'ALPHA' }], apply: true }, {})
   assert.equal(applied.applied, true)
   assert.equal(readFileSync(fileA, 'utf8'), 'ALPHA')
@@ -60,10 +68,19 @@ try {
   const amb = await tool.execute({ ops: [{ path: 'b.txt', mode: 'replace', old: 'x', new: 'y' }] }, {})
   assert.equal(amb.failed, 1)
   assert.match(amb.results[0].error, /BATCH_OLD_AMBIGUOUS/)
+  await tool.execute({ ops: [{ path: 'b.txt', mode: 'replace', old: 'x', new: 'y', all: true }] }, {}) // dry-run 过闸
   const all = await tool.execute({ ops: [{ path: 'b.txt', mode: 'replace', old: 'x', new: 'y', all: true }], apply: true }, {})
   assert.equal(all.changed, 1)
   assert.equal(readFileSync(fileB, 'utf8'), 'y y')
   ok('replace 歧义：默认拒绝，all:true 才替换全部')
+
+  // 4b) dry-run 过的 ops 改动内容后再 apply → 重新拒绝
+  writeFileSync(fileB, 'y y', 'utf8')
+  await assert.rejects(
+    () => tool.execute({ ops: [{ path: 'b.txt', mode: 'replace', old: 'y', new: 'z', all: true }], apply: true }, {}),
+    (error) => error.code === 'BATCH_NO_PREVIEW',
+  )
+  ok('write gate：ops 内容变了要重新 dry-run')
 
   // 5) 保护路径拒绝
   const denied = await tool.execute({ ops: [{ path: path.join(dir, '.dsh/rules/core.md'), mode: 'write', content: 'x' }] }, {})

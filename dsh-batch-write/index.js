@@ -6,6 +6,7 @@
  *
  * 与 _ops/bulk-write.mjs 同一份口径，但不再需要模型「记得」去调脚本。
  */
+import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
@@ -30,6 +31,15 @@ export function apply(ctx, config) {
   const configuredWorkspaceDir = typeof cfg.workspaceDir === 'string' ? cfg.workspaceDir : ''
   const wd = typeof ctx.get === 'function' ? ctx.get('workingDirectory') : undefined
   let last = null
+  let lastDryKey = '' // B4 write gate：apply 前必须用完全相同的 ops 跑过 dry-run
+
+  function opsKey(ops) {
+    try {
+      return createHash('sha256').update(JSON.stringify(ops)).digest('hex').slice(0, 16)
+    } catch {
+      return ''
+    }
+  }
 
   async function baseOf(exec) {
     if (wd && typeof wd.ensure === 'function' && exec && exec.agent) {
@@ -155,7 +165,12 @@ export function apply(ctx, config) {
       if (!ops.length) throw fail('BATCH_NO_OPS', 'ops 为空')
       const willApply = args?.apply === true
       const { base, source } = await baseOf(exec)
+      const key = opsKey(ops)
+      if (willApply && key !== lastDryKey) {
+        throw fail('BATCH_NO_PREVIEW', 'write gate：apply 前必须先用完全相同的 ops 跑一次 dry-run 预览。先不带 apply 调一次、确认 would-write 结果无误，再原样传 apply:true。')
+      }
       const r = runOps(ops, willApply, base)
+      if (!willApply && r.failed === 0) lastDryKey = key
       last = { at: new Date().toISOString(), applied: willApply, changed: r.changed, failed: r.failed, base }
       return { applied: willApply, base, baseSource: source, ...r }
     },
