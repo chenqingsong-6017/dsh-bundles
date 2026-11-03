@@ -135,7 +135,7 @@ try {
   const updated = await sqHost.defs.get('memory_update').execute({ id: added.entry.id, text: 'SQLite 后端更新后的记忆条目' })
   assert.equal(updated.entry.text, 'SQLite 后端更新后的记忆条目')
   const older = await sqHost.defs.get('memory_add').execute({ text: '临时条目，稍后删除', tag: 'smoke', kind: 'fact', inject: false })
-  const removed = await sqHost.defs.get('memory_remove').execute({ id: older.entry.id })
+  const removed = await sqHost.defs.get('memory_remove').execute({ id: older.entry.id, confirm: true })
   assert.equal(removed.removed, true)
   const restored = await sqHost.defs.get('memory_restore').execute({ id: 'm10' })
   assert.equal(restored.restored, true)
@@ -228,6 +228,93 @@ try {
   assert.equal(new Set([a1.entry.id, a2.entry.id, a3.entry.id]).size, 3, '三个 id 必须互不重复')
   cleanup(dirMulti)
   ok('双实例并发写：3 条全部保留且 id 不冲突（WAL + write_seq 合并）')
+
+  // ---- 10) v4.2.2（H2）：子进程双写者并发写 —— 16 条全在、id 不撞、两进程 search 非 0、meta 与行数一致 ----
+  // 为什么必须用子进程：旧实现的两个实例在同一个进程里会被同步代码串行化，看不出 TOCTOU；
+  // 审计 H2 的原始复现就是两个 node 进程同时加载同一个库、同时发号（各拿到 m1，后者 ON CONFLICT 覆盖前者）。
+  {
+    const { spawn } = await import('node:child_process')
+    const root = tmp('h2-concurrent')
+    const dir = path.join(root, 'store')
+    const syncDir = path.join(root, 'sync')
+    mkdirSync(dir, { recursive: true })
+    mkdirSync(syncDir, { recursive: true })
+    const workerFile = path.join(root, 'concurrent-worker.mjs')
+    writeFileSync(workerFile, [
+      'import { existsSync, writeFileSync } from "node:fs"',
+      'import path from "node:path"',
+      'const dir = process.argv[2]',
+      'const tag = process.argv[3]',
+      'const syncDir = process.argv[4]',
+      'const N = 8',
+      'const mem = await import(' + JSON.stringify(new URL('../../dsh-memory/index.js', import.meta.url).href) + ')',
+      'const defs = new Map()',
+      'mem.apply({ tools: { register: (d) => { defs.set(d.name, d); return () => {} } }, effect: (f) => { f(); return () => {} }, on: () => () => {}, get: (name) => (name === "workingDirectory" ? { get: () => "" } : undefined), systemPrompt: { context: () => () => {} } }, { storeDir: dir, storage: "sqlite", maxBytes: 200000, captureCandidates: false, captureRuleFiles: false })',
+      'const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch (error) { const until = Date.now() + ms; while (Date.now() < until) {} } }',
+      'const waitFile = (file, timeoutMs) => { const until = Date.now() + timeoutMs; while (!existsSync(file)) { if (Date.now() > until) throw new Error("timeout " + file); sleep(2) } }',
+      'writeFileSync(path.join(syncDir, "ready-" + tag), "")',
+      'waitFile(path.join(syncDir, "go"), 15000)',
+      'const ids = []',
+      'const errors = []',
+      'for (let i = 0; i < N; i += 1) {',
+      '  writeFileSync(path.join(syncDir, "tick-" + i + "-" + tag), "")',
+      '  waitFile(path.join(syncDir, "tick-" + i + "-A"), 15000)',
+      '  waitFile(path.join(syncDir, "tick-" + i + "-B"), 15000)',
+      '  try { const out = await defs.get("memory_add").execute({ text: "并发回归条目 " + tag + " #" + i + " marker " + tag + "-" + i }); ids.push(out.entry?.id) } catch (error) { errors.push({ i, code: error?.code ?? "", message: String(error?.message ?? error) }) }',
+      '  sleep(20)',
+      '}',
+      'let search = null',
+      'try { const out = await defs.get("memory_search").execute({ query: "并发回归条目", limit: 20 }); search = { matched: out.matched, total: out.total } } catch (error) { search = { error: String(error?.message ?? error) } }',
+      'console.log("RESULT " + JSON.stringify({ tag, ids, errors, search }))',
+      'process.exit(0)',
+      '',
+    ].join('\n'), 'utf8')
+    // 先建好空库（schema + meta），再让两个进程同时加载、每轮同时开始写 —— 这是审计 H2 的原始时序。
+    host(dir, { storage: 'sqlite', maxBytes: 200000 })
+    const runWorker = (tag) => new Promise((resolve) => {
+      const child = spawn(process.execPath, [workerFile, dir, tag, syncDir], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', (chunk) => { stdout += chunk })
+      child.stderr.on('data', (chunk) => { stderr += chunk })
+      child.on('exit', (code) => resolve({ tag, code, stdout, stderr }))
+    })
+    const pending = [runWorker('A'), runWorker('B')]
+    const readyDeadline = Date.now() + 20000
+    while (!(existsSync(path.join(syncDir, 'ready-A')) && existsSync(path.join(syncDir, 'ready-B')))) {
+      if (Date.now() > readyDeadline) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    writeFileSync(path.join(syncDir, 'go'), '', 'utf8')
+    const runs = await Promise.all(pending)
+    const parsed = runs.map((run) => {
+      const line = String(run.stdout).split('\n').find((item) => item.startsWith('RESULT ')) ?? ''
+      try { return line === '' ? null : JSON.parse(line.slice('RESULT '.length)) } catch (error) { return null }
+    })
+    const summary = runs.map((run, index) => run.tag + ':exit=' + run.code + ',payload=' + (parsed[index] === null ? 'null' : 'ok') + ',stderr=' + String(run.stderr).slice(-200)).join(' | ')
+    assert.deepEqual(runs.map((run) => run.code), [0, 0], '两个子进程必须正常退出（' + summary + '）')
+    parsed.forEach((payload, index) => assert.notEqual(payload, null, 'worker ' + runs[index].tag + ' 必须输出 RESULT 行（' + summary + '）'))
+    const allIds = parsed.flatMap((payload) => payload.ids)
+    const errors = parsed.flatMap((payload) => payload.errors)
+    assert.equal(errors.length, 0, '并发写入不能报错：' + JSON.stringify(errors))
+    assert.equal(allIds.length, 16, '两个进程各写 8 条都必须返回 id：' + JSON.stringify(allIds))
+    assert.equal(new Set(allIds).size, 16, '16 个 id 必须互不重复：' + JSON.stringify(allIds))
+    parsed.forEach((payload) => assert.ok(payload.search !== null && payload.search.matched > 0, 'worker ' + payload.tag + ' 的 memory_search 必须非 0：' + JSON.stringify(payload.search)))
+    const db = new DatabaseSync(path.join(dir, 'memory.db'), { readOnly: true })
+    const rows = db.prepare('SELECT id, payload FROM entries').all()
+    const meta = Object.fromEntries(db.prepare('SELECT key, value FROM meta').all().map((row) => [row.key, row.value]))
+    db.close()
+    assert.equal(rows.length, 16, '库里必须 16 行（16 次写入一条都不能丢），实际 ' + rows.length + '：' + JSON.stringify(rows.map((row) => row.id)))
+    assert.equal(new Set(rows.map((row) => row.id)).size, 16, '库里 id 不能重复')
+    assert.equal(new Set(rows.map((row) => String(JSON.parse(row.payload).text))).size, 16, '16 条正文必须全在（没有同 id 覆盖）')
+    assert.equal(Number(meta.sort_doc_count), rows.length, 'meta.sort_doc_count 必须等于 entries 行数（实际 ' + meta.sort_doc_count + ' vs ' + rows.length + '）')
+    assert.equal(Number(meta.unit_doc_count), rows.length, 'meta.unit_doc_count 必须等于 entries 行数（实际 ' + meta.unit_doc_count + ' vs ' + rows.length + '）')
+    const maxRowId = Math.max(...rows.map((row) => Number(String(row.id).replace(/^m/, ''))))
+    assert.ok(Number(meta.next_id) > maxRowId, 'next_id 必须大于库里最大 id（实际 ' + meta.next_id + ' vs ' + maxRowId + '）')
+    assert.ok(Number(meta.next_seq) >= rows.length, 'next_seq 必须 ≥ 行数（实际 ' + meta.next_seq + ' vs ' + rows.length + '）')
+    cleanup(root)
+    ok('v4.2.2 H2：子进程双写者各写 8 条 → 16 条全在、id 不撞、两进程 search 非 0、meta 与行数一致')
+  }
 } finally {
   cleanup(dirA)
 }

@@ -7,7 +7,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
 - **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
-- **版本 / 引擎**：v4.2.0（2026-11-02）。v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+- **版本 / 引擎**：v4.2.2（2026-11-03）。v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
 ## 工具
 
@@ -20,7 +20,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 | `memory_merge` | 多条合并成一条原子事实，被合并的留档失效；**v4.2：合并成 procedure 需来源已有 `verifiedCount ≥ 2` 证据** |
 | `memory_audit` | 只读审计（给模型）：重复候选（bigram 相似度）、过期候选（从未使用且 >N 天）、使用排行、scope 分布、预算 |
 | `memory_review` | 记忆概览（给人看，v2.8）：已过期 / 未证实 / 从未引用 / 硬规则四段 + scope 分布 + 容量，写入 `review-latest.md` |
-| `memory_remove` | 删某条（物理删除；要留历史用 `memory_update` 的 supersede） |
+| `memory_remove` | 删某条（物理删除，**必须 `confirm: true`**；不带 confirm 只返回将删清单：id / 字符数 / 是否 pinned，不删。要留历史用 `memory_update` 的 supersede） |
 | `memory_restore` | 把归档条目恢复为生效（只接受预算保护挤掉的、未被取代的条目）；库满时拒绝 |
 | `memory_history` | 只读 append-only 变更日志 `history.jsonl`（add / update / remove，含时间戳与被删正文），可按 id / event 过滤 |
 | `memory_purge` | 物理删除**归档**条目，必须 `confirm: true`；生效记忆不动，支持 `ids` / `olderThanDays` |
@@ -46,7 +46,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
    - 实测：25 条 / 3320 正文字符时，全量注入 3488 字符 → 分层后 1387 字符（**省 60%**）。`maxInjectChars` 约束的是正文行，头部/索引/页脚另有约 150–200 字符固定开销。
 
 2. **不做会话内冻结快照**（和 Hermes 不同）：Hermes 冻结是为了缓存稳定，但 DSH 本来就每步重新装配 context，记忆又只在显式增删改时变化，频率极低。牺牲这点缓存换"刚记住的下一步就生效"，更符合实际用法。
-3. **超预算拒绝写入**，不自动淘汰：上限 12000 字符（可配 `maxBytes`），超了就让 agent 先看 `memory_list` 再 `memory_remove`，避免悄悄丢用户信息。
+3. **超预算拒绝写入**，不自动淘汰：上限 12000 字符（可配 `maxBytes`），超了就让 agent 先看 `memory_list` 再 `memory_remove {id, confirm:true}`，避免悄悄丢用户信息。
 4. **存储后端（v4.1）**：默认 SQLite 单文件 `memory.db`（WAL，只写脏行），`storage: json` 保留为回滚开关；迁移、备份、回滚见下文「存储后端（v4.1）」「迁移与回滚」。不写会话日志、不新增事件类型。
 
 ## v4.2（2026-11-02）：集百家所长 —— 四个写入侧长板
@@ -67,7 +67,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 ### 5.3 预算见顶主动精简（Anthropic A2）
 - `maxBytes` 满且自动归档腾不出空间时，`MEMORY_BUDGET_EXCEEDED` 不再只说「超预算」，而是给出**具体条目**：
   - ① 合并建议：两两相似度 ≥0.62 的条目对（点 id、相似度、合计字符数 → 建议 `memory_merge`）；
-  - ② drop 建议：已过复核期的 stale 条目、从未被检索且 >7 天未更新的条目（点 id、原因、字符数 → 建议 `memory_remove`）；
+  - ② drop 建议：已过复核期的 stale 条目、从未被检索且 >7 天未更新的条目（点 id、原因、字符数 → 建议 `memory_remove {id, confirm:true}`）；
   - ③ 没有候选时明确说「只能 memory_update 精简或调大 maxBytes」，不假装有办法。
 - 只读计算（上限扫最近 120 条做 O(n²) 相似度），不改库；真正的合并/删除仍由显式工具执行。
 
@@ -79,6 +79,24 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - 普通条目不能无证据升级成 procedure（update/merge 同样过门槛）。
 
 > 依据：Anthropic write-path filtering / 四类笔记、Anthropic「索引硬预算超了报错强制精简」、Google ADK 四层记忆的 Procedural、Voyager 的 skill 入库规则；调研见工作区 `_research/memory-synthesis-2026-11-02.md`、`_research/memory-classic-ideas.md`。
+
+## v4.2.2（2026-11-03）：SQLite 多进程并发写 + 删除确认门槛
+
+### H2 多进程并发写不再静默丢条目
+
+审计 `_reports/global-audit-memory-2026-11-03.md` §H2 的原始复现：两个 node 进程各 `memory_add` 8 条都报成功，库里只剩 11 条（6 条被同 id 覆盖），伴随 `meta.sort_doc_count=1` 导致 `memory_search` 静默返回 0。根因三条，全部堵住：
+
+- **发号进写事务**：新增 `newEntryId()`——`BEGIN IMMEDIATE` 内读 `meta.next_id` → +1 写回 → COMMIT 再返回 id（JSON 后端仍是内存自增）。所有条目创建点（add / update-supersede / merge / candidates-accept / 规则自动入库）统一走它，两个进程不可能发到同一个号。
+- **撞号不再 DO UPDATE**：新增只 `INSERT`、既有只 `UPDATE`；本进程刚发号的 id 若库里已存在 → 抛 `MEMORY_ID_CONFLICT`（可读、含 id）并整体回滚，内存态回退到磁盘版本，绝不覆盖别人的条目。
+- **统计与缓存对齐**：`refreshSqliteState()` 后清空 meta 统计键缓存（原来只刷 `next_id/write_seq/data_version`，计数键拿旧值写回）；每次写事务末尾按 `entries` 实际行数对账 `sort_doc_count` / `unit_doc_count` / `next_seq`（`next_id` 只增不减）；`memory_search` 前按 `write_seq` 刷新（未变只多一条单行查询，不全表重扫）。
+
+回归：`_selftest/tests/memory-sqlite.test.mjs` 第 10 组——两个子进程各写 8 条（真实 `apply()` + `memory_add`/`memory_search`），断言 16 条全在、id 不撞、两进程检索非 0、meta 计数与行数一致。修复前该用例在 id 唯一性断言失败（实测 16 次写入只剩 12 个不同 id）。
+
+### B4 memory_remove 需要 confirm:true
+
+- 不带 `confirm:true`：**不删**，返回 `{ removed:false, confirmRequired:true, preview:{ id, chars, pinned, kind, usedCount, text } , hint }`，提示先 `memory_list` 按删除三查（过时 / 以后还有用 / 还有价值）核对；
+- 带 `confirm:true`：物理删除（与 `memory_purge` 门槛口径一致；原来单条删比批量删还宽松）；
+- 契约变化：`memory_remove` 新增可选参数 `confirm`（不传 = 预览），返回值新增可选字段 `confirmRequired` / `preview` / `hint`。旧调用方（只传 id）会从「真删」变成「拿到预览」，需要显式补 `confirm:true`。
 
 ## 配置
 

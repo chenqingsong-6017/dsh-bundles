@@ -1161,7 +1161,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const h = host(tmp)
   const a = await h.defs.get('memory_add').execute({ text: '第一条' })
   const b = await h.defs.get('memory_add').execute({ text: '第二条' })
-  await h.defs.get('memory_remove').execute({ id: b.entry.id })
+  await h.defs.get('memory_remove').execute({ id: b.entry.id, confirm: true })
   const reloaded = host(tmp)
   const c = await reloaded.defs.get('memory_add').execute({ text: '第三条' })
   assert.notEqual(c.entry.id, b.entry.id, 'nextId 回退导致复用已删 id')
@@ -1671,7 +1671,7 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
 
   const added = await h.defs.get('memory_add').execute({ text: '历史用例：先加一条', kind: 'fact' })
   await h.defs.get('memory_update').execute({ id: added.entry.id, text: '历史用例：改一下' })
-  await h.defs.get('memory_remove').execute({ id: added.entry.id })
+  await h.defs.get('memory_remove').execute({ id: added.entry.id, confirm: true })
   const hist = await h.defs.get('memory_history').execute({ limit: 50 })
   const events = hist.entries.map((e) => e.event)
   assert.ok(events.includes('add'), '历史里应有 add，实际 ' + events.join(','))
@@ -1850,6 +1850,36 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(cards.some((card) => card.includes('sources:')), '导出卡片要带来源')
   ok('v4.0 导出卡片补全 entities/sources/invalidAt 且可回读')
   rmSync(d, { recursive: true, force: true })
+}
+
+// ---- v4.2.2（B4）：memory_remove 无 confirm → 只返回待删清单、不删；confirm:true 才物理删 ----
+// 为什么：单条物理删原来比批量 memory_purge（必须 confirm:true）还宽松，用户的「删除三查」
+// 在工具层完全没兜。现在缺省只摊开「将删什么」（id / 字符数 / 是否 pinned）并要求先核对 memory_list。
+{
+  const dir = makeTmp('dsh-memory-remove-confirm')
+  const h = host(dir)
+  const added = await h.defs.get('memory_add').execute({ text: '删除确认门槛用例：这条先别真删', kind: 'fact' })
+  const pinned = await h.defs.get('memory_add').execute({ text: '删除确认门槛用例：pinned 条目', kind: 'fact', pinned: true })
+  const refused = await h.defs.get('memory_remove').execute({ id: added.entry.id })
+  assert.equal(refused.removed, false, '没有 confirm 时不能删')
+  assert.equal(refused.confirmRequired, true, '要返回 confirmRequired 让调用方知道被门槛拦住')
+  assert.equal(refused.preview.id, added.entry.id, '清单要列出将删的 id')
+  assert.equal(refused.preview.chars, added.entry.text.length, '清单要给字符数')
+  assert.equal(refused.preview.pinned, false, '清单要标出是否 pinned')
+  assert.match(String(refused.hint), /memory_list/, '提示要先 memory_list 核对')
+  assert.match(String(refused.hint), /confirm:true/, '提示要给出 confirm:true 的重试方式')
+  const stillThere = await h.defs.get('memory_list').execute({})
+  assert.ok(stillThere.entries.some((item) => item.id === added.entry.id), '拒绝后条目必须还在库里')
+  const pinnedRefused = await h.defs.get('memory_remove').execute({ id: pinned.entry.id })
+  assert.equal(pinnedRefused.removed, false, 'pinned 条目同样先拒删')
+  assert.equal(pinnedRefused.preview.pinned, true, '清单要标出 pinned 条目')
+  const removedOk = await h.defs.get('memory_remove').execute({ id: added.entry.id, confirm: true })
+  assert.equal(removedOk.removed, true, 'confirm:true 才真删')
+  const afterList = await h.defs.get('memory_list').execute({})
+  assert.ok(!afterList.entries.some((item) => item.id === added.entry.id), 'confirm 后条目应从库里消失')
+  assert.ok(afterList.entries.some((item) => item.id === pinned.entry.id), '没 confirm 的那条不能被连带删掉')
+  rmSync(dir, { recursive: true, force: true })
+  ok('v4.2.2 B4：memory_remove 无 confirm 只给清单不删（含字符数/pinned），confirm:true 才物理删')
 }
 
 // ---- v4.2.1（H1）：storeDir 不存在/不可写时 memory_add 必须**快速**返回错误，不能同步死循环 ----

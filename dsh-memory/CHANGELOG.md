@@ -3,6 +3,19 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.2.2 — 2026-11-03
+
+标题：「修全局审计 H2 + B4」——SQLite 多进程并发写不再静默丢条目；`memory_remove` 加 `confirm:true` 门槛。新增错误码 `MEMORY_ID_CONFLICT`；`memory_remove` 新增可选参数 `confirm`、返回值新增预览字段。证据：`_reports/global-audit-memory-2026-11-03.md` §H2/§M5、`_reports/fix-backlog-2026-11-03.md` A1/B4。
+
+### Fixed（高危）
+- **H2 SQLite 双进程并发写丢条目**：旧实现 `persistSqlite()` 先 refresh、到写事务里才落盘，而 id 是在 `execute()` 里按 `m${state.nextId}` 发的 → 「读 nextId → 写」TOCTOU；主键冲突走 `ON CONFLICT(id) DO UPDATE` 静默覆盖。现在 ① 新增 `newEntryId()` 在 `BEGIN IMMEDIATE` 内原子发号（读 `meta.next_id` → +1 写回 → COMMIT），所有条目创建点统一走它；② 新条目只 `INSERT`、既有只 `UPDATE`，本进程新发的号撞上库内已有 id 时抛 `MEMORY_ID_CONFLICT`（含 id、提示重试）并回滚，内存态回退到磁盘版本；③ `refreshSqliteState()` 后清空 meta 统计键缓存（原只刷 `next_id/write_seq/data_version`，`sort_doc_count` 等拿旧值写回 → `docCount` 偏小 → idf 变负 → 检索静默 0）；④ 每次写事务末尾按 `entries` 实际行数对账 `sort_doc_count` / `unit_doc_count` / `next_seq`，`next_id` 只增不减；⑤ `memory_search` 前按 `write_seq` 刷新（未变只多一条单行查询）。
+- **B4 `memory_remove` 无确认门槛**：原来直接 `filter` + persist，单条物理删比批量 `memory_purge`（必须 `confirm:true`）还宽松。现在不带 `confirm:true` 不删，返回 `{ removed:false, confirmRequired:true, preview:{id,chars,pinned,kind,usedCount,text}, hint }`（提示先 `memory_list` 核对删除三查）；`confirm:true` 才物理删。
+
+### 测试
+- `_selftest/tests/memory-sqlite.test.mjs` 新增第 10 组：两个 node 子进程在同一临时库上各 `memory_add` 8 条（真实 `apply()` + 工具调用，带「同时加载 / 每轮同时开写」屏障），断言 16 条全在、16 个 id 互不重复、两进程 `memory_search` 都非 0、`meta.sort_doc_count/unit_doc_count` 与 `entries` 行数一致、`next_id`/`next_seq` 自洽。修复前该用例失败（distinct ids 12/16），修复后通过（连跑 4 次稳定）。
+- `_selftest/tests/memory.test.mjs` 新增 B4 用例：无 confirm 只给预览不删（字符数 / pinned / hint 含 memory_list 与 confirm:true）、`confirm:true` 才删、未确认的另一条不被连带删；既有 `memory_remove` 调用点补 `confirm:true`。
+- `_ops/memory-diff-search.mjs` 的 memory_remove 差分步骤同步补 `confirm:true`（旧版本副本忽略多余参数，差分口径不变）。
+
 ## v4.2.1 — 2026-11-03
 
 标题：「修全局审计 H1 + M1/M2/M3」——JSON 后端不再同步死循环；procedure 复用门槛的三条绕过路径全部堵住。工具名与既有参数集不变（`memory_merge` 只新增可选 `verifiedCount`；新增错误码 `MEMORY_VERIFIEDCOUNT_INVALID`）。证据：`_reports/global-audit-memory-2026-11-03.md` §1 H1、§2 M1–M3。

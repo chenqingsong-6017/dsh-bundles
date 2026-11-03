@@ -2069,6 +2069,8 @@ export function apply(ctx, config) {
   let db = null
   let dbApi = null
   const dbMetaCache = new Map()
+  /** v4.2.2（H2②）：本进程已发号、还没确认落盘的 id。撞号检测只认这批（别的进程写进来的条目不算）。 */
+  const localNewIds = new Set()
   /** 索引镜像：id -> { tokens, units, sortLen, unitLen }（增量维护 df 与自愈重建用；10k 条约 3-5MB）。 */
   const indexMirror = new Map()
   /** id -> 写入顺序 seq（SQLite 主键顺序；加载时按「生效在前、归档在后」重排，与 JSON 后端 memory.json+archive.json 的读取顺序一致）。 */
@@ -2617,10 +2619,49 @@ export function apply(ctx, config) {
     }, 0)
     state.nextId = Math.max(Number(metaGetOn(db, 'next_id') ?? state.nextId), maxIdNumber + 1)
     state.version = Math.max(state.version, Number(metaGetOn(db, 'data_version') ?? state.version))
+    // v4.2.2（H2③）：统计键缓存必须随刷新一起失效。别的进程已经改了 sort_doc_count / unit_doc_count /
+    // sort_len_sum（以及 df 表的维护基准），继续用本进程缓存里的旧值写回，会把计数改歪——
+    // 审计 H2 实测：entries 16 行而 sort_doc_count=1 → memory_search 的 idf 变负 → 静默返回 0 条。
+    // 整表清空最稳（DB 是权威源）：下面再放回本次已确认的三个键，其余键下次按需直读。
+    dbMetaCache.clear()
     dbMetaCache.set('next_id', String(state.nextId))
     dbMetaCache.set('write_seq', seq)
     dbMetaCache.set('data_version', String(state.version))
     lastDbSignature = seq
+  }
+
+  /**
+   * v4.2.2（H2①）：在 BEGIN IMMEDIATE 内原子发号。
+   * 旧实现是「execute() 先 refresh，再读 state.nextId 发号，最后 persist 里才开写事务」——
+   * 读号与写号之间存在 TOCTOU：两个进程同窗口各自拿到 m1，主键冲突被
+   * `ON CONFLICT(id) DO UPDATE` 静默吃掉（审计 H2：16 次写入报成功、库里只剩 10 条）。
+   * 现在发号本身就是一个短写事务：读 meta.next_id → +1 写回 → COMMIT，拿到的号不会被别人重复发。
+   * JSON 后端没有跨进程并发（锁文件串行），保持原语义：内存自增。
+   */
+  function newEntryId() {
+    if (backend !== 'sqlite' || db === null) {
+      const id = `m${state.nextId}`
+      state.nextId += 1
+      return id
+    }
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const stored = Number(metaGetOn(db, 'next_id') ?? 1)
+      // state.nextId 是刷新后的下限（含库内最大 id + 1），两者取大——只增不减。
+      const floor = Math.max(Number.isFinite(stored) && stored > 0 ? stored : 1, state.nextId)
+      metaSetOn(db, 'next_id', floor + 1)
+      db.exec('COMMIT')
+      state.nextId = floor + 1
+      localNewIds.add('m' + floor)
+      dbMetaCache.set('next_id', String(state.nextId))
+      return `m${floor}`
+    } catch (error) {
+      try { db.exec('ROLLBACK') } catch (inner) {}
+      if (String(error?.message ?? '').includes('SQLITE_BUSY')) {
+        throw fail('MEMORY_STORE_WRITE_FAILED', '记忆库正被另一个进程写入（SQLITE_BUSY），本次没有分配 id、没有写入任何数据；稍等重试一次即可。')
+      }
+      throw error
+    }
   }
 
   function persistSqlite() {
@@ -2631,13 +2672,53 @@ export function apply(ctx, config) {
       refreshSqliteState()
       const payloads = new Map()
       for (const entry of state.entries) payloads.set(entry.id, JSON.stringify(entry))
+      // v4.2.2（H2②）：只把「本进程发号、还没落盘」的 id 当新条目。
+      // 不能用「快照前没见过的 id」判断——refresh 会把别的进程刚写的条目并进来，那样会把别人的条目误判成撞号。
+      const freshLocalIds = []
+      for (const id of localNewIds) if (payloads.has(id)) freshLocalIds.push(id)
       const upserts = []
       for (const [id, payload] of payloads) if (persistedPayloads.get(id) !== payload) upserts.push([id, payload])
       const deletes = []
       for (const id of persistedPayloads.keys()) if (!payloads.has(id)) deletes.push(id)
       db.exec('BEGIN IMMEDIATE')
       try {
-        const insert = db.prepare('INSERT INTO entries(id, payload, updated_at, seq, tokens, units, sort_len, unit_len) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, tokens = excluded.tokens, units = excluded.units, sort_len = excluded.sort_len, unit_len = excluded.unit_len')
+        // v4.2.2（H2②）：新条目撞主键不再 DO UPDATE 静默覆盖。
+        // 本进程刚发号（freshLocalIds）而库里已有同一 id = 被别的进程占了：把内存态回退到磁盘版本，
+        // 然后抛 MEMORY_ID_CONFLICT 让本次事务整体回滚（调用方重试会拿到新号）。
+        const existingRow = db.prepare('SELECT payload, tokens, units, sort_len, unit_len, seq FROM entries WHERE id = ?')
+        const conflicts = []
+        for (const id of freshLocalIds) {
+          if (!payloads.has(id)) continue
+          const row = existingRow.get(id)
+          if (row !== undefined) conflicts.push({ id, row })
+        }
+        if (conflicts.length > 0) {
+          for (const item of conflicts) {
+            localNewIds.delete(item.id)
+            let diskEntry = null
+            try { diskEntry = normalizeEntry(JSON.parse(item.row.payload)) } catch (error) { diskEntry = null }
+            const at = state.entries.findIndex((entry) => entry.id === item.id)
+            if (diskEntry === null) {
+              if (at >= 0) state.entries.splice(at, 1)
+              persistedPayloads.delete(item.id)
+              indexMirror.delete(item.id)
+              seqOf.delete(item.id)
+              continue
+            }
+            if (at >= 0) state.entries[at] = diskEntry
+            else state.entries.push(diskEntry)
+            persistedPayloads.set(item.id, String(item.row.payload))
+            indexMirror.set(item.id, { tokens: String(item.row.tokens ?? ''), units: String(item.row.units ?? ''), sortLen: Number(item.row.sort_len ?? 0), unitLen: Number(item.row.unit_len ?? 0) })
+            seqOf.set(item.id, Number(item.row.seq ?? 0))
+          }
+          throw fail(
+            'MEMORY_ID_CONFLICT',
+            '新增条目 id 冲突（' + conflicts.slice(0, 3).map((item) => item.id).join('、') + (conflicts.length > 3 ? ' 等 ' + conflicts.length + ' 条' : '') + '）：库里已被另一进程占用。' +
+              '本次写入已整体回滚、没有覆盖任何数据；直接重试一次即可（会自动分配新的 id）。',
+          )
+        }
+        const insert = db.prepare('INSERT INTO entries(id, payload, updated_at, seq, tokens, units, sort_len, unit_len) VALUES(?,?,?,?,?,?,?,?)')
+        const update = db.prepare('UPDATE entries SET payload = ?, updated_at = ?, tokens = ?, units = ?, sort_len = ?, unit_len = ? WHERE id = ?')
         let nextSeq = Number(metaGet('next_seq') ?? state.entries.length)
         for (const [id, payload] of upserts) {
           const entry = state.entries.find((item) => item.id === id)
@@ -2651,7 +2732,9 @@ export function apply(ctx, config) {
           const unitLen = countsLength(units)
           const seqRow = db.prepare('SELECT seq FROM entries WHERE id = ?').get(id)
           const seq = seqRow === undefined ? nextSeq++ : Number(seqRow.seq)
-          insert.run(id, payload, String(entry.updatedAt ?? ''), seq, tokensText, unitsText, sortLen, unitLen)
+          // v4.2.2（H2②）：新增走 INSERT、已存在走 UPDATE —— 没有任何覆盖别人新条目的路径。
+          if (seqRow === undefined) insert.run(id, payload, String(entry.updatedAt ?? ''), seq, tokensText, unitsText, sortLen, unitLen)
+          else update.run(payload, String(entry.updatedAt ?? ''), tokensText, unitsText, sortLen, unitLen, id)
           seqOf.set(id, seq)
           applyIndexEntry(entry, oldMirror)
           persistedPayloads.set(id, payload)
@@ -2662,12 +2745,26 @@ export function apply(ctx, config) {
           seqOf.delete(id)
           persistedPayloads.delete(id)
         }
-        metaSet('next_seq', nextSeq)
+        // v4.2.2（H2③）：写后对账 —— 统计键以 entries 实际行数为准。
+        // 并发写会把计数写歪；旧实现里 sort_doc_count 一旦偏小，memory_search 的 idf 会变负、
+        // 分数被 score > 0.0001 全部滤掉 → 检索静默返回 0 条（审计 H2 连带后果）。
+        const rowCount = Number(db.prepare('SELECT count(*) AS n FROM entries').get().n)
+        metaSet('sort_doc_count', rowCount)
+        metaSet('unit_doc_count', rowCount)
+        const maxSeqRow = db.prepare('SELECT MAX(seq) AS n FROM entries').get()
+        const maxSeq = maxSeqRow === undefined || maxSeqRow.n === null ? -1 : Number(maxSeqRow.n)
+        metaSet('next_seq', Math.max(nextSeq, maxSeq + 1))
+        // v4.2.2（H2①）：next_id 只增不减 —— 别的进程可能已经发到更大的号，不能拿本进程的旧值写回去。
+        const storedNextId = Number(metaGetOn(db, 'next_id') ?? 0) || 0
+        state.nextId = Math.max(state.nextId, storedNextId)
         metaSet('next_id', state.nextId)
         metaSet('data_version', state.version)
         const writeSeq = Number(metaGet('write_seq') ?? 0) + 1
         metaSet('write_seq', writeSeq)
         db.exec('COMMIT')
+        for (const id of freshLocalIds) localNewIds.delete(id)
+        // 发号后没进内存的 id（校验阶段就抛错）也清掉，避免集合无限增长。
+        for (const id of [...localNewIds]) if (!payloads.has(id)) localNewIds.delete(id)
         lastDbSignature = String(writeSeq)
       } catch (error) {
         try { db.exec('ROLLBACK') } catch (inner) {}
@@ -2677,7 +2774,8 @@ export function apply(ctx, config) {
       recordHistoryDiff()
       return true
     } catch (error) {
-      if (error instanceof Error && (error.message.startsWith('SQLite 存储写入失败') || error.message.includes('SQLITE_BUSY'))) throw error
+      // v4.2.2（H2②）：id 冲突是可重试的并发错误，不是存储损坏 —— 原样上抛，别降级成只读。
+      if (error instanceof Error && (error.code === 'MEMORY_ID_CONFLICT' || error.message.startsWith('SQLite 存储写入失败') || error.message.includes('SQLITE_BUSY'))) throw error
       storeHealth = 'readonly'
       throw fail('MEMORY_STORE_WRITE_FAILED', 'SQLite 存储写入失败（' + (error?.message ?? 'unknown') + '）。本次写入没有生效，别当成已保存；可用 storage: json 回滚后重试。')
     }
@@ -2898,7 +2996,7 @@ export function apply(ctx, config) {
       }
     }
     if (plan.drops.length > 0) {
-      lines.push('  ② drop（memory_remove {id}，每条都可先 memory_list 确认）：')
+      lines.push('  ② drop（memory_remove {id, confirm:true}；先 memory_list 按删除三查核对，不带 confirm 只返回将删清单）：')
       for (const item of plan.drops) {
         lines.push('     - ' + item.id + '（' + item.reason + '，' + item.chars + ' 字符）')
       }
@@ -2919,7 +3017,7 @@ export function apply(ctx, config) {
     if (!room.ok) return null
     const now = new Date().toISOString()
     const entry = normalizeEntry({
-      id: `m${state.nextId}`,
+      id: newEntryId(),
       text: raw,
       kind: 'rule',
       status: 'draft',
@@ -2928,7 +3026,6 @@ export function apply(ctx, config) {
       updatedAt: now,
       sources: [candidate.reason ?? 'rule-file'],
     })
-    state.nextId += 1
     state.entries.push(entry)
     persist()
     return { entry, archived: room.archived }
@@ -3815,6 +3912,9 @@ export function apply(ctx, config) {
         },
       },
       async execute(args) {
+        // v4.2.2（H2④）：读路径也要看到别的进程的写。refreshSqliteState 自己按 meta.write_seq 判重，
+        // 没变时只多一条单行查询（不重扫全表）；变了才合并对方条目并让统计键缓存失效。
+        if (backend === 'sqlite' && db !== null) refreshSqliteState()
         const query = typeof args?.query === 'string' ? args.query.trim() : ''
         if (query === '') throw fail('MEMORY_ARG_MISSING', 'memory_search 需要 query。')
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 20) : 5
@@ -4230,7 +4330,7 @@ export function apply(ctx, config) {
             ? ''
             : deriveStaleAfter(typeof args?.kind === 'string' ? args.kind.trim() : '')
         const entry = normalizeEntry({
-          id: `m${state.nextId}`,
+          id: newEntryId(),
           text: raw,
           ...(typeof args?.tag === 'string' && args.tag.trim() !== '' ? { tag: args.tag.trim() } : {}),
           ...(Array.isArray(args?.tags) ? { tags: args.tags } : {}),
@@ -4293,7 +4393,6 @@ export function apply(ctx, config) {
               String(resolvedConflict.entry.text).slice(0, 80),
           )
         }
-        state.nextId += 1
         state.entries.push(entry)
         // v4.0：supersede 把被推翻的旧条标记失效（留档不删，可 memory_restore / memory_history 反查）。
         if (args?.supersede === true && resolvedConflict) {
@@ -4412,7 +4511,7 @@ export function apply(ctx, config) {
         if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要 id。')
         // v4.2：允许 verifiedCount-only 更新（procedure 每复用成功一次只累加证据，不必重发正文）。
         if (next === '' && !Number.isInteger(args?.verifiedCount)) {
-          throw fail('MEMORY_ARG_MISSING', 'memory_update 需要新的 text；要删除请用 memory_remove。')
+          throw fail('MEMORY_ARG_MISSING', 'memory_update 需要新的 text；要删除请用 memory_remove {id, confirm:true}。')
         }
         if (next.length > MAX_TEXT_CHARS) throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${next.length}。${TEXT_TOO_LONG_HINT}`)
         const entry = state.entries.find((item) => item.id === id)
@@ -4458,7 +4557,7 @@ export function apply(ctx, config) {
           // 时序失效（Graphiti 式）：新条目生效，旧条目留档不删、不再注入。
           const now = new Date().toISOString()
           const replacement = normalizeEntry({
-            id: `m${state.nextId}`,
+            id: newEntryId(),
             text: next,
             ...(entry.tag ? { tag: entry.tag } : {}),
             ...(Array.isArray(entry.tags) ? { tags: entry.tags } : {}),
@@ -4481,7 +4580,6 @@ export function apply(ctx, config) {
             addedAt: now,
             updatedAt: now,
           })
-          state.nextId += 1
           entry.supersededBy = replacement.id
           entry.status = 'deprecated'
           entry.updatedAt = now
@@ -4577,28 +4675,61 @@ export function apply(ctx, config) {
   ctx.effect(() =>
     tools.register({
       name: 'memory_remove',
-      description: 'Delete one memory entry by id. Use it to prune stale or wrong facts.',
+      description:
+        'Delete one memory entry by id. Requires confirm:true — without it this only returns a preview (id, chars, pinned) and deletes nothing, so check the delete criteria against memory_list first.',
       parameters: {
         type: 'object',
-        properties: { id: { type: 'string', description: 'Entry id from memory_list.' } },
+        properties: {
+          id: { type: 'string', description: 'Entry id from memory_list.' },
+          confirm: { type: 'boolean', description: 'Must be true to actually delete. Omitted/false returns a preview and deletes nothing.' },
+        },
         required: ['id'],
         additionalProperties: false,
       },
       output: {
         schema: {
           type: 'object',
-          properties: { id: { type: 'string' }, removed: { type: 'boolean' }, total: { type: 'integer' } },
+          properties: {
+            id: { type: 'string' },
+            removed: { type: 'boolean' },
+            total: { type: 'integer' },
+            confirmRequired: { type: 'boolean' },
+            preview: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                chars: { type: 'integer' },
+                pinned: { type: 'boolean' },
+                kind: { type: 'string' },
+                usedCount: { type: 'integer' },
+                text: { type: 'string' },
+              },
+              required: ['id', 'chars', 'pinned'],
+              additionalProperties: false,
+            },
+            hint: { type: 'string' },
+          },
           required: ['id', 'removed', 'total'],
           additionalProperties: false,
         },
         render(_args, value) {
-          return [
-            text(
-              value?.removed
-                ? `已删除 ${value?.id}（剩余 ${value?.total ?? 0} 条，下一条模型请求起生效）`
-                : `没有这条记忆：${value?.id}`,
-            ),
-          ]
+          if (value?.removed) {
+            return [text(`已删除 ${value?.id}（剩余 ${value?.total ?? 0} 条，下一条模型请求起生效）`)]
+          }
+          if (value?.confirmRequired === true) {
+            const preview = value?.preview ?? {}
+            return [
+              text(
+                [
+                  `未删除 ${value?.id}：物理删除不可恢复，需要 confirm:true。`,
+                  `将删除：${preview.id}（${preview.chars ?? 0} 字符，${preview.pinned ? 'pinned 置顶条目' : '非 pinned'}）${preview.kind ? '，kind=' + preview.kind : ''}`,
+                  `正文：${preview.text ?? ''}`,
+                  `先 memory_list 核对删除三查：① 是否已过时？② 以后还有用吗？③ 还有价值吗（history 只留 400 字前缀）？三条全中再用 memory_remove {id:"${value?.id}", confirm:true}。`,
+                ].join('\n'),
+              ),
+            ]
+          }
+          return [text(`没有这条记忆：${value?.id}`)]
         },
       },
       async execute(args) {
@@ -4606,11 +4737,30 @@ export function apply(ctx, config) {
         refreshBeforeWrite()
         const id = typeof args?.id === 'string' ? args.id.trim() : ''
         if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_remove 需要 id。')
-        const before = state.entries.length
-        state.entries = state.entries.filter((entry) => entry.id !== id)
-        const removed = state.entries.length !== before
-        if (removed) persist()
-        return { id, removed, total: state.entries.length }
+        const entry = state.entries.find((item) => item.id === id)
+        if (entry === undefined) return { id, removed: false, total: state.entries.length }
+        // v4.2.2（B4）：未传 confirm:true → 不删，只把「将删什么」摊开（id / 字符数 / 是否 pinned），
+        // 把删除三查交回调用方核对。原来直接 filter + persist，单条物理删比 memory_purge（要 confirm）还宽松。
+        if (args?.confirm !== true) {
+          return {
+            id,
+            removed: false,
+            total: state.entries.length,
+            confirmRequired: true,
+            preview: {
+              id: entry.id,
+              chars: entry.text.length,
+              pinned: entry.pinned === true,
+              ...(typeof entry.kind === 'string' && entry.kind !== '' ? { kind: entry.kind } : {}),
+              ...(Number.isInteger(entry.usedCount) ? { usedCount: entry.usedCount } : {}),
+              text: entry.text.length > 120 ? entry.text.slice(0, 120) + '…' : entry.text,
+            },
+            hint: '未删除：物理删除不可恢复。先 memory_list 核对删除三查（过时 / 以后还有用 / 还有价值），确认后 memory_remove {id:"' + id + '", confirm:true}。',
+          }
+        }
+        state.entries = state.entries.filter((item) => item.id !== id)
+        persist()
+        return { id, removed: true, total: state.entries.length }
       },
     }),
   )
@@ -4664,7 +4814,7 @@ export function apply(ctx, config) {
         }
         if (usedChars() + entry.text.length > maxBytes) {
           throw fail('MEMORY_BUDGET_EXCEEDED', 
-            `恢复后会到 ${usedChars() + entry.text.length} / ${maxBytes} 字符，超预算。先用 memory_remove 删掉别的，或调大 maxBytes。`,
+            `恢复后会到 ${usedChars() + entry.text.length} / ${maxBytes} 字符，超预算。先用 memory_remove {id, confirm:true} 删掉别的，或调大 maxBytes。`,
           )
         }
         delete entry.status
@@ -4926,7 +5076,7 @@ export function apply(ctx, config) {
         const importanceValues = sources.map((item) => item.importance).filter((value) => Number.isFinite(value))
         const staleValues = sources.map((item) => item.staleAfter).filter((value) => typeof value === 'string' && DATE_ONLY.test(value)).sort()
         const merged = normalizeEntry({
-          id: `m${state.nextId}`,
+          id: newEntryId(),
           text: mergedText,
           ...(unionAliases.length > 0 ? { aliases: unionAliases } : {}),
           ...(typeof args?.tag === 'string' && args.tag.trim() !== '' ? { tag: args.tag.trim() } : first.tag ? { tag: first.tag } : {}),
@@ -4943,7 +5093,6 @@ export function apply(ctx, config) {
           addedAt: now,
           updatedAt: now,
         })
-        state.nextId += 1
         for (const source of sources) {
           source.supersededBy = merged.id
           source.updatedAt = now
@@ -5226,7 +5375,7 @@ export function apply(ctx, config) {
       '',
       ...section('⏰ 已过期待重验', overdue, 'memory_update 重验，或 supersede 推倒'),
       ...section('❓ 未证实', unverified, 'memory_update 加 verified:true 确认'),
-      ...section('🕸 从未被引用', unused, '考虑 memory_remove 或 memory_merge'),
+      ...section('🕸 从未被引用', unused, '考虑 memory_remove {id, confirm:true} 或 memory_merge'),
       ...section('📌 硬规则', pinned, '永远全文注入，改动需谨慎'),
       ...section('⭐ 该升级', consolidate, '被引用 ≥3 次：考虑 memory_update pinned:true 或调高 importance'),
       ...section('📉 衰减中', decaying, '长期未被引用，注入优先级已自动降低（存储值不变）'),
@@ -5533,7 +5682,7 @@ export function apply(ctx, config) {
           }
           const now = new Date().toISOString()
           const entry = normalizeEntry({
-            id: `m${state.nextId}`,
+            id: newEntryId(),
             text: item.text,
             ...(typeof item.scope === 'string' ? { scope: item.scope } : {}),
             ...(typeof item.kind === 'string' ? { kind: item.kind } : {}),
@@ -5541,7 +5690,6 @@ export function apply(ctx, config) {
             addedAt: now,
             updatedAt: now,
           })
-          state.nextId += 1
           state.entries.push(entry)
           item.status = 'accepted'
           persist()
