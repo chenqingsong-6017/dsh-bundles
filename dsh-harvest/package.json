@@ -1,0 +1,29 @@
+{
+  "name": "@local/dsh-harvest",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "type": "module",
+  "description": "把会话榨成带证据的候选记忆（先榨后删），数据落 D 盘；v0 规则抽取、零依赖、不自动写入 memory。",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "bin/",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

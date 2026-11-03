@@ -1,0 +1,7 @@
+# dsh-harvest：本 bundle 自带插件代码，name 用相对路径即按本 patch 所在目录解析。
+- insert:
+    - id: harvest
+      name: './index.js'
+      # 需要改配置时取消注释（默认即推荐值）：
+      # config:
+      #   storeDir: D:\AI\dsh-data\harvest
