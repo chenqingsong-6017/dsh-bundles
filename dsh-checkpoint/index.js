@@ -366,12 +366,17 @@ export function apply(ctx, config) {
     lastSkip: null,
   }
 
+  // ---------- 任务级检查点标记（B2 · 2026-11-03） ----------
+  const marks = []
+  const MAX_MARKS = 50
+
   // ---------- 持久化 ----------
   function serialize() {
     return JSON.stringify({
-      version: 3,
+      version: 4,
       savedAt: new Date().toISOString(),
       records: [...records.values()],
+      marks: marks,
     })
   }
 
@@ -406,6 +411,13 @@ export function apply(ctx, config) {
       const raw = readFileSync(storeFile, 'utf8')
       const parsed = JSON.parse(raw)
       if (!parsed || !Array.isArray(parsed.records)) return
+      if (Array.isArray(parsed.marks)) {
+        for (const m of parsed.marks) {
+          if (m && typeof m.id === 'string' && typeof m.label === 'string' && typeof m.at === 'string') {
+            marks.push({ id: m.id, label: m.label, at: m.at, snapshots: typeof m.snapshots === 'number' ? m.snapshots : 0 })
+          }
+        }
+      }
       for (const item of parsed.records) {
         if (!item || typeof item.path !== 'string') continue
         const created = item.created === true
@@ -671,6 +683,20 @@ export function apply(ctx, config) {
                 additionalProperties: false,
               },
             },
+            marks: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  label: { type: 'string' },
+                  at: { type: 'string' },
+                  snapshots: { type: 'integer' },
+                },
+                required: ['id', 'label', 'at', 'snapshots'],
+                additionalProperties: false,
+              },
+            },
           },
           required: ['total', 'files'],
           additionalProperties: false,
@@ -686,8 +712,9 @@ export function apply(ctx, config) {
             return `${index + 1}. ${file.path}  ${tag}  ${time}`
           })
           const more = files.length > shown.length ? `\n… 还有 ${files.length - shown.length} 个（用 path 指定目标即可操作）` : ''
+          const marksShown = Array.isArray(value?.marks) && value.marks.length > 0 ? `\n任务标记：${value.marks.map((m) => `${m.label}(${m.id})@${String(m.at).slice(11, 19)}`).join(' · ')}` : ''
           return [
-            text(`共 ${files.length} 个可回滚目标（修改 ${files.length - created} / 新建 ${created}）：\n${lines.join('\n')}${more}`),
+            text(`共 ${files.length} 个可回滚目标（修改 ${files.length - created} / 新建 ${created}）：\n${lines.join('\n')}${more}${marksShown}`),
           ]
         },
       },
@@ -700,7 +727,7 @@ export function apply(ctx, config) {
             bytes: record.bytes,
             capturedAt: record.capturedAt,
           }))
-        return { total: files.length, files }
+        return { total: files.length, files, marks: marks.slice(-20).reverse() }
       },
     }),
   )
@@ -719,6 +746,7 @@ export function apply(ctx, config) {
               'Absolute or display path to restore. Exact match or a unique path suffix; an ambiguous suffix is rejected with the candidate list.',
           },
           all: { type: 'boolean', description: 'Restore/delete every captured target. Requires confirm: true.' },
+          mark: { type: 'string', description: 'Restore everything captured AFTER this task mark (label or id from checkpoint_mark / checkpoint_list marks). Requires confirm: true. Mutually exclusive with path.' },
           confirm: {
             type: 'boolean',
             description:
@@ -753,11 +781,13 @@ export function apply(ctx, config) {
                 additionalProperties: false,
               },
             },
+            mark: { type: 'string' },
           },
           required: ['restored', 'failed'],
           additionalProperties: false,
         },
         render(_args, value) {
+          const markLine = typeof value?.mark === 'string' && value.mark !== '' ? [`已回滚到标记 ${value.mark} 之后的改动。`] : []
           const restored = Array.isArray(value?.restored) ? value.restored : []
           const failed = Array.isArray(value?.failed) ? value.failed : []
           const lines = []
@@ -771,14 +801,25 @@ export function apply(ctx, config) {
             lines.push(`失败 ${failed.length} 个：`)
             for (const item of failed) lines.push(`  ✗ ${item.path} — ${item.reason}`)
           }
-          return [text(lines.length > 0 ? lines.join('\n') : '没有可回滚的快照。')]
+          return [text(markLine.concat(lines.length > 0 ? lines : ['没有可回滚的快照。']).join('\n'))]
         },
       },
       async execute(args, exec) {
         const all = args?.all === true
         const wanted = typeof args?.path === 'string' && args.path.trim() !== '' ? args.path.trim() : undefined
-        if (!all && wanted === undefined) {
-          throw failure('MISSING_TARGET', 'checkpoint_restore 需要 path（回滚单个目标），或传 all: true + confirm: true（回滚全部）。')
+        const markWanted = typeof args?.mark === 'string' && args.mark.trim() !== '' ? args.mark.trim() : undefined
+        if (markWanted !== undefined && (all || wanted !== undefined)) {
+          throw failure('CONFLICTING_TARGETS', 'mark 与 path / all 互斥：mark 只负责「回到标记点之后的全部改动」。')
+        }
+        if (!all && wanted === undefined && markWanted === undefined) {
+          throw failure('MISSING_TARGET', 'checkpoint_restore 需要 path（回滚单个目标），all: true + confirm: true（回滚全部），或 mark + confirm: true（回到任务标记点）。')
+        }
+        const mark = markWanted !== undefined ? marks.find((m) => m.id === markWanted || m.label === markWanted) : undefined
+        if (markWanted !== undefined && mark === undefined) {
+          throw failure('MARK_NOT_FOUND', `没有标记 ${markWanted}。先用 checkpoint_list 查看已有 marks，或 checkpoint_mark 打一个。`)
+        }
+        if (markWanted !== undefined && args?.confirm !== true) {
+          throw failure('CONFIRM_REQUIRED', `回到标记点 ${mark.label} 会恢复其后捕获的全部快照。确认请显式传 confirm: true。`)
         }
         if (all && args?.confirm !== true) {
           throw failure(
@@ -788,7 +829,9 @@ export function apply(ctx, config) {
         }
 
         let targets = [...records.entries()]
-        if (!all) {
+        if (mark !== undefined) {
+          targets = targets.filter(([, record]) => record.capturedAt > mark.at)
+        } else if (!all) {
           // 严格匹配：歧义时 strictTargets 直接抛错并列候选，绝不逐个恢复
           targets = strictTargets(records, wanted)
           if (targets.length === 0) {
@@ -854,7 +897,49 @@ export function apply(ctx, config) {
           }
         }
         schedulePersist()
-        return { restored, failed }
+        return { restored, failed, mark: mark !== undefined ? mark.label : '' }
+      },
+    }),
+  )
+
+  // ---- checkpoint_mark：任务级检查点（B2 · 2026-11-03） ----
+  ctx.effect(() =>
+    tools.register({
+      name: 'checkpoint_mark',
+      description:
+        'Mark the current point as a named task checkpoint. Use it before a risky multi-file change: if it goes wrong, checkpoint_restore {mark: "<label>", confirm: true} rolls back exactly the files changed after this mark. The mark itself never touches files.',
+      parameters: {
+        type: 'object',
+        properties: {
+          label: { type: 'string', description: 'Short label for the checkpoint, e.g. "before-b2-change".' },
+        },
+        required: ['label'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            label: { type: 'string' },
+            at: { type: 'string' },
+            snapshots: { type: 'integer' },
+          },
+          required: ['id', 'label', 'at', 'snapshots'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          return [text('已打标记 ' + value.label + '（' + value.id + '）。之后改动的文件可用 checkpoint_restore {mark: "' + value.label + '", confirm: true} 一键回到此点。')]
+        },
+      },
+      async execute(args) {
+        const label = typeof args?.label === 'string' ? args.label.trim() : ''
+        if (label === '') throw failure('MISSING_LABEL', 'checkpoint_mark 需要 label。')
+        if (marks.some((m) => m.id === label || m.label === label)) throw failure('MARK_EXISTS', '标记 ' + label + ' 已存在。换个 label，或先 checkpoint_list 看已有标记。')
+        marks.push({ id: 'mk' + (marks.length + 1), label, at: new Date().toISOString(), snapshots: records.size })
+        while (marks.length > MAX_MARKS) marks.shift()
+        schedulePersist()
+        return { id: 'mk' + (marks.length), label, at: marks[marks.length - 1].at, snapshots: records.size }
       },
     }),
   )

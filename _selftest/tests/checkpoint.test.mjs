@@ -160,7 +160,7 @@ try {
   const list = () => call(harness, 'checkpoint_list', {})
 
   const tools = [...harness.registered.keys()]
-  assert.equal(tools.length, 6)
+  assert.equal(tools.length, 7)  // v1.6：+ checkpoint_mark（任务级检查点）
   for (const name of ['checkpoint_list', 'checkpoint_diff', 'checkpoint_restore', 'checkpoint_forget', 'checkpoint_status', 'checkpoint_prune']) {
     assert.ok(tools.includes(name), `缺少工具 ${name}`)
   }
@@ -296,8 +296,8 @@ try {
   assert.equal(captured.records.length, 1)
   assert.equal(captured.records[0].sessionId, 'sess-x')
   assert.ok(Number.isFinite(Date.parse(captured.records[0].capturedAt)), 'capturedAt 必须是可解析时间戳')
-  assert.equal(captured.version, 3)
-  ok('新快照记录写入 sessionId（exec.agent.id）与可解析时间戳，存档 version=3')
+  assert.equal(captured.version, 4)
+  ok('新快照记录写入 sessionId（exec.agent.id）与可解析时间戳，存档 version=4')
 
   // ---------- 严格匹配：restore / forget / diff 歧义必须拒绝，restore 只动一个目标 ----------
   const ambRoot = path.join(root, 'ambiguous')
@@ -511,4 +511,53 @@ try {
   console.log(`checkpoint: ${passed} 项通过`)
 } finally {
   rmSync(root, { recursive: true, force: true })
+}
+
+// ---------- 任务级检查点（B2 · checkpoint_mark / restore {mark}） ----------
+{
+  const markRoot = path.join(root, 'marks')
+  const markWork = path.join(markRoot, 'work')
+  const markStore = path.join(markRoot, 'store')
+  mkdirSync(markWork, { recursive: true })
+  const pre = path.join(markWork, 'pre.txt') // 标记前已有的快照，不该被 mark 恢复
+  const f = path.join(markWork, 'task.txt')
+  writeFileSync(pre, 'live pre', 'utf8')
+  writeFileSync(f, 'v1', 'utf8')
+  seedStore(markStore, [{ path: pre, content: 'snap pre', capturedAt: isoDaysAgo(1), created: false }])
+  const diskFiles = new Map()
+  const diskFs = {
+    resolve: async (raw) => ({ displayPath: String(raw) }),
+    stat: async (target) => (existsSync(target.displayPath) ? { type: "file", size: 1 } : null),
+    readText: async (target) => readFileSync(target.displayPath, "utf8"),
+    processPath: (target) => target.displayPath,
+    writeText: async (target, content) => { diskFiles.set(target.displayPath, content) },
+  }
+  const mh = makeHarness({ storeDir: markStore, protectDirs: [protectedDir] }, { fs: diskFs, workingDirectory: { ensure: async () => markWork } })
+  const mk = await call(mh, 'checkpoint_mark', { label: 'before-task' })
+  assert.equal(mk.label, 'before-task')
+  assert.ok(mk.id.startsWith('mk'), '返回 id')
+  ok('checkpoint_mark：打标记返回 id/label')
+
+  await sleep(5) // 确保标记之后的 capture 时间戳严格晚于 mark.at
+  const preExec = mh.handlers.get('tools/pre-execute')
+  await preExec({ name: 'write', arguments: { file_path: f }, agent: { id: 'sess-m' }, signal: undefined }, async () => {})
+  mh.flush()
+  writeFileSync(f, 'v2', 'utf8') // 模拟任务改坏
+  const back = await mh.registered.get('checkpoint_restore').execute({ mark: 'before-task', confirm: true }, { agent: { id: 'sess-m' } })
+  assert.equal(back.mark, 'before-task')
+  assert.equal(back.restored.length, 1, '只恢复标记后的 1 个快照')
+  assert.equal(diskFiles.get(f), 'v1', '任务文件回到标记时内容 v1')
+  assert.equal(diskFiles.has(pre), false, '标记前的快照不得被恢复')
+  ok('checkpoint_restore {mark}：只回标记后的改动，标记前不动')
+
+  const list = await call(mh, 'checkpoint_list', {})
+  assert.equal(list.marks.length, 1)
+  assert.equal(list.marks[0].label, 'before-task')
+  ok('checkpoint_list 报出任务标记')
+
+  await assert.rejects(
+    () => mh.registered.get('checkpoint_restore').execute({ mark: 'nope', confirm: true }, { agent: { id: 'sess-m' } }),
+    (error) => error.code === 'MARK_NOT_FOUND',
+  )
+  ok('未知标记：MARK_NOT_FOUND 拒绝')
 }

@@ -2,7 +2,17 @@
 
 本文件于 2026-10-31 按「改到谁补谁」的规则建立；当前版本为存量版本，本节为补记。
 
-## v1.5.2 — 2026-11-03
+## v1.6.0 — 2026-11-03
+
+### Added（B2 任务级检查点：`_research/harness-patterns/synthesis-2026-11-03.md`）
+- **`checkpoint_mark`**：打命名任务标记（label → id），记录标记时刻的快照基数；标记本身不碰文件。
+- **`checkpoint_restore {mark, confirm:true}`**：回到标记点——只恢复标记**之后**捕获的快照（按 capturedAt 过滤），标记之前的快照原样不动；与 path / all 互斥，未知标记报 `MARK_NOT_FOUND`。
+- **`checkpoint_list`** 新增 `marks` 字段（最近 20 个标记，label/id/时间/快照基数）；存档 version 3 → 4（向后兼容，旧存档无 marks 按空处理）。
+
+### Verification
+- `checkpoint.test.mjs` 34 → 38 组：mark 打点、mark 恢复只动标记后、list 报标记、未知标记拒绝。
+- 真机：`checkpoint_mark {label:"smoke-b2-batch"}` → mk1；`checkpoint_list.marks` 报出。
+
 
 ### Fixed（安全，来源：`_reports/global-audit-ops-2026-11-03.md` C1/C4）
 - **红线目录硬拒绝**：新增内置红线 `C:\Windows` / `Program Files` / `ProgramData` / `%USERPROFILE%\AppData` / `D:\AI-date\workbuddy-date\学习` / DSH 安装目录（`path.dirname(process.execPath)`）/ `%USERPROFILE%\.dsh`（凭据目录），并支持 `config.redlineDirs` 追加。**命中红线的 restore/delete 一律拒绝，`confirm: true` 也不放行**；UNC / `\\?\` 等无法判定真实位置的路径按红线处理。此前 `学习` 不在 protectDirs，红线文件的旧内容会被直接写回，且 `created` 记录会被直接删除。
