@@ -1,5 +1,12 @@
 # CHANGELOG — dsh-path-rules
 
+## 1.0.2 — 2026-11-02
+
+- **Windows 大小写不敏感匹配**：`ruleMatches` 归一化为小写后再匹配——`paths: "D:/AI/Dsh-Bundles/**"` 与实际路径 `D:/AI/dsh-bundles/...` 能命中，路径规则不再靠大小写运气（误报扫描 #16）。
+- **cwd 外绝对路径命中**：绝对路径不再先 `path.relative(cwd, …)` 变成 `../../x` 再匹配，跨目录操作时规则照常激活（#17）。
+- **被跳过的规则不再静默**：`always` 认不出的布尔值、以及 >32KB / stat 失败 / 读失败的规则文件进 `path_rules_status.warnings`（#18 #19）。
+- 依据 `_reports/plugin-falsepositive-scan-2026-11-01.md`；`_selftest/tests/path-rules.test.mjs` 补 53 行回归（先红后绿）。
+
 ## 1.0.1 — 2026-11-01
 
 - **统一状态契约**：`path_rules_status` 新增 `ready` / `unavailableReason`（两者都进 `required`，`unavailableReason` 为空串表示可用）。`ready` 是真判断——至少一个规则目录 `readdirSync` 成功（`exists` 字段即「读得动」）。`ready:false` 时渲染只输出「不可用：<原因>」。

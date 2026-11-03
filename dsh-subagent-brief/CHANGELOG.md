@@ -1,5 +1,11 @@
 # CHANGELOG — dsh-subagent-brief
 
+## 0.2.2 — 2026-11-02
+
+- **清单类交付放宽额度**：文件清单 / 证据表类结算消息的额度放宽到 3000 字符，不再一律截成摘要逼父 agent 再问一次（误报扫描 #39）。
+- **幂等只认尾注形态**：子 agent 自己输出同款文案时不再误判「已截过」而跳过截断（#40）。
+- 依据 `_reports/plugin-falsepositive-scan-2026-11-01.md`；`_selftest/tests/subagent-brief.test.mjs` 补 22 行回归（先红后绿）；README「2026-11-02 升级记录」。
+
 ## 0.2.1 — 2026-11-01
 
 - **统一状态契约**：`subagent_brief_status` 新增 `ready` / `unavailableReason`（两者都进 `required`，`unavailableReason` 为空串表示可用）。`ready` 判的是「配置阈值有效」：没配 = 用默认值算有效；配了就必须是 ≥1 的数字，否则 `ready:false` 并在原因里写明实际回落的阈值。`ready:false` 时渲染只输出「不可用：<原因>」。
