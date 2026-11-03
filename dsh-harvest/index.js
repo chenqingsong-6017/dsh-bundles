@@ -10,6 +10,7 @@
  * 设计主见见 lib/core.js 顶部注释；数据默认落 D:\AI\dsh-data\harvest。
  */
 import { DEFAULT_STORE, defaultSessionsRoot, gate, readCandidates, scan, status } from './lib/core.js'
+import { workspaceStatus } from './lib/workspace.js'
 
 export const name = 'dsh-harvest'
 export const inject = ['tools']
@@ -20,6 +21,7 @@ export function apply(ctx, config) {
   const cfg = config || {}
   const storeDir = String(cfg.storeDir || DEFAULT_STORE)
   const sessionsRoot = String(cfg.sessionsRoot || defaultSessionsRoot())
+  const workspaceFile = String(cfg.workspaceFile || '')
   let lastError = ''
 
   const options = () => ({ storeDir: storeDir, sessionsRoot: sessionsRoot })
@@ -208,6 +210,69 @@ export function apply(ctx, config) {
         } catch (error) {
           lastError = String((error && error.message) || error)
           return { matched: 0, total: 0, items: [] }
+        }
+      },
+    }),
+  )
+
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'workspace_status',
+      description:
+        'Audit DSH workspaces against disk and harvest coverage: per-workspace session counts, stale references, orphaned sessions, sizes, archived count. Read-only; run before deleting any session or workspace.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ready: { type: 'boolean' },
+            unavailableReason: { type: 'string' },
+            workspaceFile: { type: 'string' },
+            workspaces: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  title: { type: 'string' },
+                  path: { type: 'string' },
+                  sessions: { type: 'integer' },
+                  present: { type: 'integer' },
+                  missing: { type: 'integer' },
+                  harvested: { type: 'integer' },
+                  archived: { type: 'integer' },
+                  bytes: { type: 'integer' },
+                },
+              },
+            },
+            drift: {
+              type: 'object',
+              properties: {
+                missingTotal: { type: 'integer' },
+                missingByWorkspace: { type: 'object', additionalProperties: true },
+                orphanSessions: { type: 'array', items: { type: 'string' } },
+              },
+            },
+            totals: { type: 'object', additionalProperties: true },
+            lastError: { type: 'string' },
+          },
+          required: ['ready'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          if (!value || value.ready !== true) return [text('工作区审计未就绪：' + String((value && value.unavailableReason) || '未知原因'))]
+          const drift = value.drift || {}
+          const totals = value.totals || {}
+          return [text('工作区 ' + (totals.workspaces || 0) + ' 个，磁盘会话 ' + (totals.onDisk || 0) + ' 个；引用缺失 ' + (drift.missingTotal || 0) + ' 个，未登记会话 ' + ((drift.orphanSessions || []).length) + ' 个')]
+        },
+      },
+      async execute() {
+        try {
+          return workspaceStatus({ storeDir: storeDir, sessionsRoot: sessionsRoot, workspaceFile: workspaceFile })
+        } catch (error) {
+          lastError = String((error && error.message) || error)
+          return { ready: false, unavailableReason: 'workspace_status 失败: ' + lastError, workspaceFile: '', workspaces: [], drift: { missingTotal: 0, missingByWorkspace: {}, orphanSessions: [] }, totals: {}, lastError: lastError }
         }
       },
     }),

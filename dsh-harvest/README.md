@@ -24,6 +24,7 @@
 | harvest_run | 扫会话→抽候选（可限定 workspace / session / limit / redo） |
 | harvest_candidates | 看待审候选（带 session / seq / time 证据） |
 | harvest_gate | 删除闸门：没被 harvest 覆盖的会话不许删 |
+| workspace_status | 工作区审计：账本 vs 磁盘（引用缺失/未登记会话/是否已榨） |
 
 ## 数据
 
@@ -35,6 +36,7 @@
 ## CLI（开发与验收）
 
     node bin/harvest.mjs --status
+    node bin/harvest.mjs --workspaces
     node bin/harvest.mjs --all
     node bin/harvest.mjs --workspace D:\AI-date\dsh-date\dsh-亲爱的管家
     node bin/harvest.mjs --session <会话id> --redo
@@ -45,6 +47,11 @@
 - node tests/harvest.test.mjs 全绿。
 - 同一会话跑两次：第二次 skipped = 1、candidatesAdded = 0。
 - 删除闸门：未 harvest 的会话 id 必须 allowed = false。
+
+## 工作区审计（v0.2.0）
+
+DSH 的工作区/会话有账本（.dsh/storages/workspace.json）。删会话/删工作区必须走 DSH 的 API，
+直接删磁盘会让账本与磁盘对不上。workspace_status 只读地报出这种漂移，删除动作仍由 DSH 完成。
 
 ## 下一步
 

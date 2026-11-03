@@ -40,11 +40,13 @@ const fakeCtx = {
   },
 }
 
-apply(fakeCtx, { storeDir: storeDir, sessionsRoot: sessionsRoot })
+const workspaceFile = path.join(root, 'workspace.json')
+writeFileSync(workspaceFile, JSON.stringify({ global: { archivedSessionIds: [] }, tables: { workspaces: { 'w-1': { path: 'D:\\AI-date\\demo', title: 'demo', sessionIds: [SESSION_ID] } } } }))
+apply(fakeCtx, { storeDir: storeDir, sessionsRoot: sessionsRoot, workspaceFile: workspaceFile })
 
 // 1) 四个工具都注册了，描述与 schema 齐全
 const names = [...tools.keys()].sort()
-assert.deepEqual(names, ['harvest_candidates', 'harvest_gate', 'harvest_run', 'harvest_status'])
+assert.deepEqual(names, ['harvest_candidates', 'harvest_gate', 'harvest_run', 'harvest_status', 'workspace_status'])
 for (const name of names) {
   const tool = tools.get(name)
   assert.equal(typeof tool.description, 'string')
@@ -91,13 +93,22 @@ assert.equal(again.skipped, 1)
 assert.equal(again.candidatesAdded, 0)
 console.log('ok 6 idempotent')
 
-// 7) render 不炸
+// 7) workspace_status 只读审计
+const wsResult = await tools.get('workspace_status').execute({})
+assert.equal(wsResult.ready, true)
+assert.equal(wsResult.totals.workspaces, 1)
+assert.equal(wsResult.totals.onDisk, 1)
+assert.equal(wsResult.totals.missing, 0)
+assert.equal(wsResult.workspaces[0].present, 1)
+console.log('ok 7 workspace audit')
+
+// 8) render 不炸
 for (const name of names) {
   const tool = tools.get(name)
-  const result = name === 'harvest_status' ? statusResult : name === 'harvest_run' ? runResult : name === 'harvest_candidates' ? candidateResult : pass
+  const result = name === 'harvest_status' ? statusResult : name === 'harvest_run' ? runResult : name === 'harvest_candidates' ? candidateResult : name === 'workspace_status' ? wsResult : pass
   assert.equal(Array.isArray(tool.output.render({}, result)), true)
 }
-console.log('ok 7 render')
+console.log('ok 8 render')
 
 rmSync(root, { recursive: true, force: true })
 console.log('ALL PLUGIN TESTS PASSED')

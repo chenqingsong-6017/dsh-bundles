@@ -1,5 +1,10 @@
 # CHANGELOG
 
+## 0.2.0 — 2026-11-03
+
+- 新增 workspace_status：工作区账本 vs 磁盘审计（引用缺失 / 未登记会话 / harvest 覆盖 / 归档数）。
+- CLI 新增 --workspaces。只读，不做删除。
+
 ## 0.1.0 — 2026-11-03
 
 - 首个版本：读本机会话（session.v4.jsonl.zstd）→ 规则抽取候选（规则/纠正/偏好）→ 带证据写 JSONL。

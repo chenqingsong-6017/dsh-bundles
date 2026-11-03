@@ -10,6 +10,7 @@
  *   node bin/harvest.mjs --gate <会话id1,会话id2>
  */
 import { gate, scan, status } from '../lib/core.js'
+import { workspaceStatus } from '../lib/workspace.js'
 
 const argv = process.argv.slice(2)
 
@@ -26,6 +27,11 @@ const storeDir = valueOf('--store')
 const sessionsRoot = valueOf('--root')
 if (storeDir !== '') options.storeDir = storeDir
 if (sessionsRoot !== '') options.sessionsRoot = sessionsRoot
+
+if (argv.includes('--workspaces')) {
+  console.log(JSON.stringify(workspaceStatus(options), null, 2))
+  process.exit(0)
+}
 
 if (argv.includes('--status')) {
   console.log(JSON.stringify(status(options), null, 2))
