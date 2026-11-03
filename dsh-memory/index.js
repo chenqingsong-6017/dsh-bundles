@@ -4433,7 +4433,7 @@ export function apply(ctx, config) {
   ctx.effect(() =>
     tools.register({
       name: 'memory_update',
-      description: 'Replace the text, the tag, or the pinned flag of one existing memory entry.',
+      description: 'Replace the text, the tag, or the pinned flag of one existing memory entry — get its id from memory_list first. A call with no new text (and no verifiedCount-only update) is rejected with MEMORY_ARG_MISSING; to delete use memory_remove {id, confirm:true} instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -4977,7 +4977,7 @@ export function apply(ctx, config) {
     tools.register({
       name: 'memory_merge',
       description:
-        'Merge two or more active memories into one atomic entry. Originals are kept as superseded history and stop being injected.',
+        'Merge two or more active memories into one atomic entry — get their ids from memory_list first. Originals are kept as superseded history and stop being injected; the merge is atomic, so a failed merge changes nothing.',
       parameters: {
         type: 'object',
         properties: {
