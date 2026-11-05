@@ -5,7 +5,7 @@ import path from 'node:path'
 import * as mod from '../../dsh-skill-usage/index.js'
 import { makeMockContext } from '../plugin-smoke.mjs'
 
-const { classifyUsage, normalizeSkillKey, resolveSkillName } = mod
+const { classifyUsage, normalizeSkillKey, resolveSkillName, decideCuration } = mod
 
 let passed = 0
 const ok = (label) => {
@@ -28,6 +28,19 @@ assert.equal(classifyUsage({ uses: 0, firstSeenAt: ago(2) }, now, thresholds).st
 ok('登记 2 天且从未用过 = 新')
 assert.equal(classifyUsage({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), reviewedAt: ago(1) }, now, thresholds).state, 'active')
 ok('刚复核过的旧技能 = 提醒已续期')
+
+// Curator 自动归档判据（纯函数）：只动账本、只在自己看得准的时候动手
+const seenNow = ago(0)
+assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), catalogSeenAt: seenNow }, now, thresholds, seenNow).reason, 'unused-30d')
+ok('curator：目录内 40 天没用 → 归档（unused-30d）')
+assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), catalogSeenAt: ago(3) }, now, thresholds, seenNow).reason, 'not-in-catalog')
+ok('curator：本次目录里没看见（上次是 3 天前）→ 归档（not-in-catalog）')
+assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), catalogSeenAt: seenNow }, now, thresholds, null).action, 'none')
+ok('curator：目录名单不可信（catalogAt 缺失）→ 不归档，宁可漏不误伤')
+assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(20), catalogSeenAt: seenNow }, now, thresholds, seenNow).action, 'none')
+ok('curator：20 天没用（未到 30）→ 不归档')
+assert.equal(decideCuration({ uses: 1, lastUsedAt: ago(40), catalogSeenAt: seenNow, archivedAt: ago(1) }, now, thresholds, seenNow).action, 'none')
+ok('curator：已归档条目不再重复处理')
 assert.equal(classifyUsage({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), reviewedAt: ago(20) }, now, thresholds).state, 'stale')
 ok('复核过期后回到陈旧')
 assert.equal(classifyUsage({ uses: 0 }, now, thresholds).state, 'unknown')
@@ -79,16 +92,29 @@ ok('无任何时间锚点 = unknown')
   const toolOf = (name) => registered.find((tool) => tool.name === name)
   const usageTool = toolOf('skill_usage')
   const markTool = toolOf('skill_usage_mark')
-  assert.ok(usageTool && markTool, '应注册 skill_usage / skill_usage_mark')
+  const restoreTool = toolOf('skill_usage_restore')
+  assert.ok(usageTool && markTool && restoreTool, '应注册 skill_usage / skill_usage_mark / skill_usage_restore')
 
   const before = await usageTool.execute({})
-  const alphaBefore = before.rows.find((row) => row.name === 'Alpha')
+  // 新语义（2026-11-05 Curator）：Alpha 40 天没用且仍在目录里 → 自动归档，默认列表不再显示；
+  // Gamma 从未用过（new）不参与归档。
+  assert.equal(before.counts.archived, 1, '目录内 40 天没用的 Alpha 应被 curator 自动归档')
+  assert.equal(before.rows.find((row) => row.name === 'Alpha'), undefined, '默认列表不显示已归档条目')
   const gammaBefore = before.rows.find((row) => row.name === 'Gamma')
-  assert.equal(alphaBefore.state, 'archive-candidate', '40 天没用的 Alpha 仍该进 attention')
   assert.equal(gammaBefore.state, 'new', 'Gamma 登记 60 天、从未用过：仍报 new，不报 archive-candidate')
   assert.equal(gammaBefore.firstSeenDays, 60)
-  assert.equal(before.counts.archiveCandidates, 1, 'attention 区不该混进从未用过的历史技能')
-  ok('skill_usage 端到端：从未用过的历史技能不再被算成陈旧')
+  assert.equal(before.counts.archiveCandidates, 0, '已归档的不再计入 attention')
+  ok('curator 自动归档：目录内 40 天未用 → archived，默认列表隐藏')
+
+  const archivedView = await usageTool.execute({ filter: 'archived' })
+  const alphaArchived = archivedView.rows.find((row) => row.name === 'Alpha')
+  assert.ok(alphaArchived, 'filter=archived 应能看到已归档条目')
+  assert.equal(alphaArchived.archivedReason, 'unused-30d', '归档原因应写明阈值')
+  ok('skill_usage filter=archived：归档条目可查，带归档原因')
+
+  const restored = await restoreTool.execute({ name: '  alpha ' })
+  assert.equal(restored.restored, true, 'restore 应命中并恢复 Alpha')
+  ok('skill_usage_restore：归档条目可恢复（并刷新复核时间，避免立刻再归档）')
 
   const marked = await markTool.execute({ name: '  alpha ' })
   assert.equal(marked.name, 'Alpha', '带空白/小写输入应命中原名 Alpha')

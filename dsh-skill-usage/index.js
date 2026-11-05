@@ -39,6 +39,8 @@ const DAY_MS = 24 * 60 * 60 * 1000
  * 否则「体检说陈旧、插件说不陈旧」这种两份口径迟早出事（_ops/metric-probes.mjs 直接 import 本模块）。
  */
 export const DEFAULT_THRESHOLDS = Object.freeze({ staleAfterDays: 14, archiveAfterDays: 30 })
+/** 自动归档节拍：每 6 小时。Hermes 有 gateway housekeeping 定时器，DSH 没有，就在插件里自己跑。 */
+const CURATOR_INTERVAL_MS = 6 * 60 * 60 * 1000
 const MAX_NOTE = 200
 
 const text = (value) => ({ type: 'text', text: value })
@@ -102,6 +104,35 @@ export function classifyUsage(record, now, thresholds) {
           ? 'active'
           : 'new'
   return { state, days: Math.round(days * 10) / 10, anchoredAt: new Date(anchor).toISOString(), firstSeenDays }
+}
+
+/**
+ * 纯函数：账本条目该不该被自动归档（Curator 动作的唯一判据，导出以便单测）。
+ *
+ * 与 Hermes Curator 对齐的部分：14/30 天阈值、从不删除（只打 archivedAt，可 restore）、只动自己的账本
+ * （技能文件是只读视图，一个字都不碰）。
+ * 多出来的两条（因为 DSH 没有 gateway 定时器，必须自己判断得更稳）：
+ *   - 目录里已经没了的技能直接归档（not-in-catalog）——它永远等不到使用记录，留着只会干扰判断；
+ *   - 目录名单不可信（catalogAt 缺失）时**不归档**，宁可漏也不误伤。
+ *
+ * @param {{uses?:number,firstSeenAt?:string,lastUsedAt?:string,reviewedAt?:string,catalogSeenAt?:string,archivedAt?:string}} record
+ * @param {number} now epoch ms
+ * @param {{staleAfterDays:number,archiveAfterDays:number}} thresholds
+ * @param {string|null} catalogAtIso 账本级目录刷新时间
+ * @returns {{action:'archive'|'none', reason?:string}}
+ */
+export function decideCuration(record, now, thresholds, catalogAtIso) {
+  if (record === null || typeof record !== 'object') return { action: 'none' }
+  if (typeof record.archivedAt === 'string' && record.archivedAt !== '') return { action: 'none' }
+  const catAt = typeof catalogAtIso === 'string' ? Date.parse(catalogAtIso) : NaN
+  const seenAt = typeof record.catalogSeenAt === 'string' ? Date.parse(record.catalogSeenAt) : NaN
+  const inCatalog = Number.isFinite(catAt) && Number.isFinite(seenAt) ? seenAt >= catAt : null
+  if (inCatalog === false) return { action: 'archive', reason: 'not-in-catalog' }
+  const state = classifyUsage(record, now, thresholds)
+  if (state.state !== 'archive-candidate') return { action: 'none' }
+  if (inCatalog === true) return { action: 'archive', reason: 'unused-' + thresholds.archiveAfterDays + 'd' }
+  // inCatalog === null：目录名单不可信，不归档（宁可漏，不误伤）
+  return { action: 'none' }
 }
 
 /** 技能名归一化：去首尾空白 + 大小写折叠（用于宽容匹配，不改存储里的原名）。 */
@@ -195,6 +226,9 @@ export function apply(ctx, config) {
           ...(typeof value.reviewedAt === 'string' ? { reviewedAt: value.reviewedAt } : {}),
           ...(typeof value.note === 'string' ? { note: value.note } : {}),
           ...(typeof value.catalogSeenAt === 'string' ? { catalogSeenAt: value.catalogSeenAt } : {}),
+          ...(typeof value.archivedAt === 'string' ? { archivedAt: value.archivedAt } : {}),
+          ...(typeof value.archivedReason === 'string' ? { archivedReason: value.archivedReason } : {}),
+          ...(Number.isInteger(value.patchCount) && value.patchCount > 0 ? { patchCount: value.patchCount } : {}),
         })
       }
     } catch (error) {
@@ -268,6 +302,8 @@ export function apply(ctx, config) {
           note: record.note ?? null,
           source: info.source ?? null,
           provider: info.provider ?? null,
+          archivedAt: record.archivedAt ?? null,
+          archivedReason: record.archivedReason ?? null,
         }
       })
       .sort((a, b) => {
@@ -306,10 +342,49 @@ export function apply(ctx, config) {
     }),
   )
 
-  // 挂载后先刷一次目录，把现有技能登记进账本（不等待）
-  void refreshCatalog()
+  // ---------- 自动归档（Curator） ----------
+  /**
+   * 自动推进账本生命周期：30 天没动、或目录里已经没了的技能，在这里落 archivedAt。
+   * 为什么放在插件里而不是外部脚本：账本活在进程内存里，外部脚本直接改文件会被下一次 persist
+   * 覆盖（TOCTOU，2026-11-05 对抗性检查）；同一进程内改内存 + 原子落盘才安全。
+   * 从不删除：只打 archivedAt/archivedReason，skill_usage_restore 可恢复。技能文件一个字不碰。
+   */
+  let curatorTimer = null
+  const curatorLog = []
+  let lastCuration = null
+  function runCurator(now = Date.now()) {
+    const archived = []
+    for (const [skillName, record] of records) {
+      const decision = decideCuration(record, now, thresholds, catalogAt)
+      if (decision.action !== 'archive') continue
+      record.archivedAt = new Date(now).toISOString()
+      record.archivedReason = decision.reason
+      archived.push({ name: skillName, reason: decision.reason })
+    }
+    lastCuration = { at: new Date(now).toISOString(), archived: archived.length, names: archived.map((item) => item.name) }
+    if (archived.length > 0) {
+      curatorLog.push({ at: lastCuration.at, archived })
+      if (curatorLog.length > 20) curatorLog.shift()
+      schedulePersist()
+    }
+    return lastCuration
+  }
+
+  // 挂载后先刷一次目录，把现有技能登记进账本（不等待）；随后跑一次 curator
+  void refreshCatalog().then(() => runCurator()).catch(() => {})
+  // 自动归档节拍：每 6 小时一次（不依赖外部计划任务；unref 保证不拖住宿主退出）
+  try {
+    curatorTimer = setInterval(() => runCurator(), CURATOR_INTERVAL_MS)
+    if (typeof curatorTimer === 'object' && curatorTimer !== null && 'unref' in curatorTimer) curatorTimer.unref()
+  } catch {
+    // 环境不支持定时器：只靠挂载时那一次，报告里会说清
+  }
 
   ctx.effect(() => () => {
+    if (curatorTimer !== null) {
+      clearInterval(curatorTimer)
+      curatorTimer = null
+    }
     if (persistTimer !== null) {
       clearTimeout(persistTimer)
       persistTimer = null
@@ -328,8 +403,8 @@ export function apply(ctx, config) {
         properties: {
           filter: {
             type: 'string',
-            enum: ['all', 'used', 'unused', 'attention'],
-            description: 'all (default) | used (uses > 0) | unused (never loaded) | attention (stale or archive-candidate)',
+            enum: ['all', 'used', 'unused', 'attention', 'archived'],
+            description: 'all (default) | used (uses > 0) | unused (never loaded) | attention (stale or archive-candidate) | archived (curator 已归档，可 restore)',
           },
           limit: { type: 'integer', description: 'Max rows to return (default 40).' },
         },
@@ -347,8 +422,9 @@ export function apply(ctx, config) {
                 unused: { type: 'integer' },
                 stale: { type: 'integer' },
                 archiveCandidates: { type: 'integer' },
+                archived: { type: 'integer' },
               },
-              required: ['used', 'unused', 'stale', 'archiveCandidates'],
+              required: ['used', 'unused', 'stale', 'archiveCandidates', 'archived'],
               additionalProperties: false,
             },
             thresholds: {
@@ -374,6 +450,8 @@ export function apply(ctx, config) {
                   reviewedAt: { type: 'string' },
                   note: { type: 'string' },
                   source: { type: 'string' },
+                  archivedAt: { type: 'string' },
+                  archivedReason: { type: 'string' },
                 },
                 required: ['name', 'state', 'uses'],
                 additionalProperties: false,
@@ -393,7 +471,7 @@ export function apply(ctx, config) {
             if (state === 'archive-candidate') return '建议归档'
             return '未知'
           }
-          const head = `技能 ${value?.total ?? 0} 个：常用 ${counts.used ?? 0}，从未用过 ${counts.unused ?? 0}，陈旧 ${counts.stale ?? 0}，建议归档 ${counts.archiveCandidates ?? 0}（阈值 ${value?.thresholds?.staleAfterDays ?? '?'} 天 / ${value?.thresholds?.archiveAfterDays ?? '?'} 天）`
+          const head = `技能 ${value?.total ?? 0} 个：常用 ${counts.used ?? 0}，从未用过 ${counts.unused ?? 0}，陈旧 ${counts.stale ?? 0}，建议归档 ${counts.archiveCandidates ?? 0}，已归档 ${counts.archived ?? 0}（阈值 ${value?.thresholds?.staleAfterDays ?? '?'} 天 / ${value?.thresholds?.archiveAfterDays ?? '?'} 天）`
           if (rows.length === 0) return [text(`${head}\n没有符合条件的技能。`)]
           const lines = rows.map((row) => {
             const bits = [`【${label(row.state)}】${row.name}`]
@@ -409,23 +487,28 @@ export function apply(ctx, config) {
       async execute(args, exec) {
         await refreshCatalog(exec?.agent ? { scope: exec.agent } : {})
         const now = Date.now()
+        runCurator(now)
         const all = classifyAll(now)
+        const activeRows = all.filter((row) => !row.archivedAt)
+        const archivedRows = all.filter((row) => row.archivedAt)
         const filter = typeof args?.filter === 'string' ? args.filter : 'all'
         const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 200) : 40
         const counts = {
-          used: all.filter((row) => row.uses > 0).length,
-          unused: all.filter((row) => row.uses === 0).length,
-          stale: all.filter((row) => row.state === 'stale').length,
-          archiveCandidates: all.filter((row) => row.state === 'archive-candidate').length,
+          used: activeRows.filter((row) => row.uses > 0).length,
+          unused: activeRows.filter((row) => row.uses === 0).length,
+          stale: activeRows.filter((row) => row.state === 'stale').length,
+          archiveCandidates: activeRows.filter((row) => row.state === 'archive-candidate').length,
+          archived: archivedRows.length,
         }
-        const filtered = all.filter((row) => {
+        const pool = filter === 'archived' ? archivedRows : activeRows
+        const filtered = pool.filter((row) => {
           if (filter === 'used') return row.uses > 0
           if (filter === 'unused') return row.uses === 0
           if (filter === 'attention') return row.state === 'stale' || row.state === 'archive-candidate'
           return true
         })
         return {
-          total: all.length,
+          total: activeRows.length,
           counts,
           thresholds,
           rows: filtered.slice(0, limit).map((row) => ({
@@ -438,6 +521,8 @@ export function apply(ctx, config) {
             ...(row.reviewedAt ? { reviewedAt: row.reviewedAt } : {}),
             ...(row.note ? { note: row.note } : {}),
             ...(row.source ? { source: row.source } : {}),
+            ...(row.archivedAt ? { archivedAt: row.archivedAt } : {}),
+            ...(row.archivedReason ? { archivedReason: row.archivedReason } : {}),
           })),
         }
       },
@@ -490,6 +575,7 @@ export function apply(ctx, config) {
         }
         const record = ensureRecord(resolved)
         record.reviewedAt = new Date().toISOString()
+        record.patchCount = (Number.isInteger(record.patchCount) ? record.patchCount : 0) + 1
         if (typeof args?.note === 'string' && args.note.trim() !== '') record.note = args.note.trim().slice(0, MAX_NOTE)
         schedulePersist()
         const result = classifyUsage(record, Date.now(), thresholds)
@@ -499,6 +585,67 @@ export function apply(ctx, config) {
           reviewedAt: record.reviewedAt,
           ...(record.note ? { note: record.note } : {}),
         }
+      },
+    }),
+  )
+
+  // ---- skill_usage_restore：把 curator 自动归档的条目放回 active（只动账本，绝不碰技能文件） ----
+  ctx.effect(() =>
+    tools.register({
+      name: 'skill_usage_restore',
+      description:
+        'Restore a curator-archived skill back to the active ledger (clears archivedAt). Only the ledger record is touched; the skill file is never modified.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Exact skill name (trimmed; case-insensitive lookup).' },
+        },
+        required: ['name'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            restored: { type: 'boolean' },
+            state: { type: 'string' },
+          },
+          required: ['name', 'restored', 'state'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          return [
+            text(
+              value?.restored
+                ? `已恢复：${value?.name}（状态 ${value?.state}）`
+                : `未恢复：${value?.name} 不在归档区（当前状态 ${value?.state}）`,
+            ),
+          ]
+        },
+      },
+      async execute(args, exec) {
+        const skillName = typeof args?.name === 'string' ? args.name.trim() : ''
+        if (skillName === '') throw fail('SKILL_USAGE_ARG_MISSING', 'skill_usage_restore 需要 name（技能名，首尾空白与大小写不敏感）。')
+        await refreshCatalog(exec?.agent ? { scope: exec.agent } : {})
+        const knownNames = [...new Set([...records.keys(), ...catalog.keys()])]
+        const resolved = resolveSkillName(skillName, knownNames)
+        if (resolved === '') {
+          const known = knownNames.sort().slice(0, 12)
+          throw fail('SKILL_USAGE_UNKNOWN_SKILL', `未知技能：${skillName}。可用的名字例如：${known.join(', ')}`)
+        }
+        const record = records.get(resolved)
+        const archived = typeof record?.archivedAt === 'string' && record.archivedAt !== ''
+        if (!archived) {
+          return { name: resolved, restored: false, state: classifyUsage(record ?? {}, Date.now(), thresholds).state }
+        }
+        delete record.archivedAt
+        delete record.archivedReason
+        // 人工恢复 = 明确要保留：同步刷新复核时间，否则下一次 curator 会立刻把它再归档（restore 等于没做）。
+        record.reviewedAt = new Date().toISOString()
+        record.patchCount = (Number.isInteger(record.patchCount) ? record.patchCount : 0) + 1
+        schedulePersist()
+        return { name: resolved, restored: true, state: classifyUsage(record, Date.now(), thresholds).state }
       },
     }),
   )

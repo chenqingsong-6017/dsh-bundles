@@ -93,3 +93,26 @@ plugin_manager action=remove_bundle target=@local/dsh-skill-usage
 - 体检接入：`node _ops/system-health.mjs` 新增 L6 段（技能陈旧 ≥14 天 = warn；技能负资产 ≥30 天 = FAIL 且 exit 1），该脚本已被 `npm run check` 串进收工流程，等于把 Hermes Curator 的「后台定时器」换成本地「收工必跑的门」。
 - 实测：正常路径 13 条账本全绿（13/6/7，陈旧 0、负资产 0）；造一份 46.6 天未用的假账本 → `[FAIL] L6 技能负资产` 且 `exit=1`，证明检查能失败。
 - 行为等价：`apply` 仍读同样的默认值，只是常量换成导出对象；`node --check` 与 `skill-usage.test.mjs` 均通过。
+
+## 2026-11-05 Curator 实装（对齐 Hermes 的自动归档）
+
+**为什么做**：上一版只有账本与判据，没有任何东西会「自动推进」——账本自己不会响。Hermes 靠 gateway housekeeping 定时器自动标 stale / 归档；DSH 没有插件级定时器，就在插件内自己跑。
+
+**怎么跑**：插件挂载时跑一次 + `setInterval` 每 6 小时一次（`unref`，不拖住宿主退出）；`skill_usage` 每次调用也顺手跑一次。不依赖外部计划任务，也不依赖模型记得来查。
+
+**判据**（`decideCuration` 纯函数，已导出并单测）：
+
+| 情况 | 动作 |
+|---|---|
+| 目录内（本次刷新看见）且 ≥30 天没动 | 归档，`archivedReason=unused-30d` |
+| 上次在目录里见过、本次没见（技能已移出） | 归档，`archivedReason=not-in-catalog` |
+| 目录名单不可信（`catalogAt` 缺失） | **不归档**（宁可漏，不误伤） |
+| 已归档 / 未到 30 天 | 不动 |
+
+**边界**：只写账本 `archivedAt/archivedReason`，**绝不碰技能文件**（目录是只读视图）。默认列表隐藏已归档，`skill_usage { filter: 'archived' }` 可查；`skill_usage_restore` 清标记并刷新复核时间（否则下一次 curator 会立刻再归档，restore 等于没做）。
+
+**计数**：`uses`（工具加载）+ `patchCount`（mark 复核）。**view 不做**——DSH 没有技能详情页，把「出现在列表里」当 view 会污染数据，宁可空着也不造假数。
+
+**与 Hermes 对照**：阈值 14/30、自动运行、自动推进、不删除可恢复、只动自己的数据——五项对齐；差一项：Hermes 能归档**技能文件**，我们只能归档**账本条目**（技能目录只读，这是 DSH 的能力边界，不是偷懒）。
+
+**验证**：`skill-usage.test.mjs` 20 项（新增 5 条纯函数判据 + 端到端自动归档/filter=archived/restore）；真机 `skill_usage` 输出「已归档 0」，13 条无异常归档。
