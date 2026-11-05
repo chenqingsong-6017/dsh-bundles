@@ -86,3 +86,10 @@ plugin_manager action=remove_bundle target=@local/dsh-skill-usage
 ## 2026-11-02 升级记录
 
 - 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：firstSeenAt 不再冒充 lastUsedAt 进 stale 判定；技能名归一化后再匹配（#43 #44）。
+
+## 2026-11-05 升级记录（体检接入：给淘汰机制装发条）
+
+- 导出 `DEFAULT_THRESHOLDS`（14/30 天）：`_ops/metric-probes.mjs` 的探针直接 import 本模块的 `classifyUsage` 与阈值，不在体检里重写一份判定——否则会出现「体检说陈旧、插件说不陈旧」的双口径。
+- 体检接入：`node _ops/system-health.mjs` 新增 L6 段（技能陈旧 ≥14 天 = warn；技能负资产 ≥30 天 = FAIL 且 exit 1），该脚本已被 `npm run check` 串进收工流程，等于把 Hermes Curator 的「后台定时器」换成本地「收工必跑的门」。
+- 实测：正常路径 13 条账本全绿（13/6/7，陈旧 0、负资产 0）；造一份 46.6 天未用的假账本 → `[FAIL] L6 技能负资产` 且 `exit=1`，证明检查能失败。
+- 行为等价：`apply` 仍读同样的默认值，只是常量换成导出对象；`node --check` 与 `skill-usage.test.mjs` 均通过。

@@ -34,8 +34,11 @@ export const name = 'dsh-skill-usage'
 export const inject = ['tools', 'skills']
 
 const DAY_MS = 24 * 60 * 60 * 1000
-const DEFAULT_STALE_DAYS = 14
-const DEFAULT_ARCHIVE_DAYS = 30
+/**
+ * 默认阈值（与 Hermes Curator 同值）。导出给体检脚本复用：判定状态机和阈值必须同一个源，
+ * 否则「体检说陈旧、插件说不陈旧」这种两份口径迟早出事（_ops/metric-probes.mjs 直接 import 本模块）。
+ */
+export const DEFAULT_THRESHOLDS = Object.freeze({ staleAfterDays: 14, archiveAfterDays: 30 })
 const MAX_NOTE = 200
 
 const text = (value) => ({ type: 'text', text: value })
@@ -125,9 +128,9 @@ export function resolveSkillName(input, knownNames) {
 
 export function apply(ctx, config) {
   const staleAfterDays =
-    Number.isFinite(config?.staleAfterDays) && config.staleAfterDays > 0 ? config.staleAfterDays : DEFAULT_STALE_DAYS
+    Number.isFinite(config?.staleAfterDays) && config.staleAfterDays > 0 ? config.staleAfterDays : DEFAULT_THRESHOLDS.staleAfterDays
   const archiveAfterDays =
-    Number.isFinite(config?.archiveAfterDays) && config.archiveAfterDays > 0 ? config.archiveAfterDays : DEFAULT_ARCHIVE_DAYS
+    Number.isFinite(config?.archiveAfterDays) && config.archiveAfterDays > 0 ? config.archiveAfterDays : DEFAULT_THRESHOLDS.archiveAfterDays
   const thresholds = { staleAfterDays, archiveAfterDays }
 
   const tools = ctx.tools
