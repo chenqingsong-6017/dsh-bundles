@@ -7,7 +7,7 @@
  * 所以工作区根目录挂一个只有 `check` 的 package.json，由本脚本按实际情况决定跑什么。
  *
  * 四道门，先快后慢：
- *   1. 语法门：`node --check` 每个插件入口（< 1 秒）
+ *   1. 语法门：`node --check` 每个插件入口与它的 lib/ 模块（< 1 秒）
  *   2. 结构门：manifest / patch / 入口导出合规（< 1 秒）
  *   3. 测试门：全量跑 _selftest/tests/*.test.mjs（实测约 8 秒）
  *   4. 标准门：report-only（规则见工作区 工业级标准.md）
@@ -94,23 +94,43 @@ if (bundles.length === 0) {
 // syntaxMs 只用于 --perf 的性能基线（默认路径下多一次 Date.now()，无副作用）。
 const syntaxStart = Date.now()
 let checked = 0
+// 语法失败信息的统一提取：node --check 输出形如「<路径>:<行>\n<源码行>\n  ^\n\nSyntaxError: …」，
+// 第一行只是路径，真正的错因在后面的 SyntaxError 行，所以要挑出来。
+const syntaxFailure = (label, result) => {
+  const outLines = result.output.split('\n').map((line) => line.trim()).filter((line) => line !== '')
+  const reason = outLines.find((line) => /Error|error:/i.test(line)) ?? outLines[outLines.length - 1] ?? '语法错误'
+  const where = outLines[0] ?? label
+  return '✗ ' + label + ' —— ' + reason + '\n  在 ' + where
+}
+// 递归收集 lib/ 下的 .js：2026-11-05 起 dsh-memory / dsh-butler-tidy 把代码拆进 lib/，
+// 只查入口会漏掉整个模块树，拆得越干净越查不到。
+const libFilesOf = (dir) => {
+  const libDir = path.join(dir, 'lib')
+  if (!existsSync(libDir)) return []
+  const found = []
+  const walk = (current) => {
+    for (const item of readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, item.name)
+      if (item.isDirectory()) walk(full)
+      else if (item.name.endsWith('.js')) found.push(full)
+    }
+  }
+  walk(libDir)
+  return found
+}
 for (const bundle of bundles) {
   const dir = path.join(BUNDLES_DIR, bundle)
   const entry = path.join(dir, 'index.js')
   if (!existsSync(entry)) continue
-  checked += 1
-  const result = run(['--check', entry], dir)
-  if (!result.ok) {
-    // node --check 的输出形如「<路径>:<行>\n<源码行>\n  ^\n\nSyntaxError: …」
-    // 第一行只是路径，真正的错因在后面的 SyntaxError 行，所以要挑出来。
-    const outLines = result.output.split('\n').map((line) => line.trim()).filter((line) => line !== '')
-    const reason = outLines.find((line) => /Error|error:/i.test(line)) ?? outLines[outLines.length - 1] ?? '语法错误'
-    const where = outLines[0] ?? bundle
-    failures.push('✗ ' + bundle + '/index.js —— ' + reason + '\n  在 ' + where)
+  const files = [entry, ...libFilesOf(dir)]
+  for (const file of files) {
+    checked += 1
+    const result = run(['--check', file], dir)
+    if (!result.ok) failures.push(syntaxFailure(bundle + '/' + path.relative(dir, file).split(path.sep).join('/'), result))
   }
 }
 const syntaxMs = Date.now() - syntaxStart
-lines.push('语法门：检查 ' + checked + ' 个插件入口')
+lines.push('语法门：检查 ' + checked + ' 个 JS 文件（插件入口 + lib/ 模块）')
 
 // ---- 阶段 2：结构门（manifest 合规，零依赖） ----
 //
