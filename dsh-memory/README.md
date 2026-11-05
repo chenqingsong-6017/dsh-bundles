@@ -7,7 +7,7 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
 - **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
-- **版本 / 引擎**：v4.3.0（2026-11-05）。v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+- **版本 / 引擎**：v4.4.0（2026-11-05）。v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
 ## 代码结构（v4.3.0 起）
 
@@ -114,6 +114,30 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - 不带 `confirm:true`：**不删**，返回 `{ removed:false, confirmRequired:true, preview:{ id, chars, pinned, kind, usedCount, text } , hint }`，提示先 `memory_list` 按删除三查（过时 / 以后还有用 / 还有价值）核对；
 - 带 `confirm:true`：物理删除（与 `memory_purge` 门槛口径一致；原来单条删比批量删还宽松）；
 - 契约变化：`memory_remove` 新增可选参数 `confirm`（不传 = 预览），返回值新增可选字段 `confirmRequired` / `preview` / `hint`。旧调用方（只传 id）会从「真删」变成「拿到预览」，需要显式补 `confirm:true`。
+
+## v4.4（2026-11-05）：维护循环 —— curator 过期归档 + consolidate 未证实巩固
+
+对齐 Hermes 自动生命周期（active→stale→archived，只归档不删、pinned 豁免），把「不过时」和「越用越好用」接成一条读路径上的确定性维护循环。
+
+### 机制（`lib/store.js` 的 `runMaintenance`，挂 `injectedBlock` 读路径，6h 节流）
+
+| 方向 | 判据 | 动作 | 可逆 |
+|---|---|---|---|
+| consolidate（上） | `status=draft` 且 `usedCount ≥ 3`（`CONSOLIDATE_MIN_USES`） | 升 `stable`（去❓未证实，越用越证实） | `memory_update` 改回 draft |
+| curate（下） | `staleAfter` 到期 + 超 30 天宽限「既没复核也没用」（`lib/entry.js` 的 `curationDecision`） | `status=deprecated` + `archivedAt` + `archiveReason`（不过时） | `memory_restore` 可恢复 |
+
+- **活跃豁免**：宽限期内 `lastUsedAt` 被刷新过（还在用）的条目不归档——stale 只是「该复核」，不是「该扔」，别误杀还在命中的事实。
+- **豁免**：pinned / `kind=rule` 永不自动迁移；draft 只走 consolidate、不自动归档（未证实该由人确认，不是时间淘汰）。
+- **只归档不删**、维护写失败吞掉不打断读路径；`memory_status` 的 `maintenance` 字段与代码指纹 `4.4.0-curator` 可观测。
+- 为什么是「读路径顺带跑 + 6h 节流」：DSH 无空闲钩子，用「调用即检查」替代 Hermes 的「空闲触发」（`hermes-memory-to-dsh.md` 落地 #3）。
+
+### 验证（2026-11-05）
+
+| 项 | 结果 |
+|---|---|
+| 单测 | `memory.test.mjs` 136 项全过（+2：curator 判据 / draft 巩固集成） |
+| 语法/结构/全量门 | `npm run check` 三门全绿 |
+| 真机 | HMR 零重启加载，`memory_status` 代码指纹 `4.4.0-curator`，维护循环已挂载（下次模型请求首次触发） |
 
 ## 配置
 

@@ -3,7 +3,7 @@
  *
  * 只管「一条记忆在某一刻算什么状态」，不碰存储与渲染。
  */
-import { DATE_ONLY, DEFAULT_SCOPE_ROOTS, IMPORTANCE_BASE, KIND_REFERENCE, RECENCY_DECAY_PER_HOUR, REFERENCE_STALE_DAYS } from './constants.js'
+import { CURATOR_STALE_GRACE_DAYS, DATE_ONLY, DEFAULT_SCOPE_ROOTS, IMPORTANCE_BASE, KIND_REFERENCE, RECENCY_DECAY_PER_HOUR, REFERENCE_STALE_DAYS } from './constants.js'
 
 /** 只写日期的字段（staleAfter / invalidAt）→ 本地日历日零点的毫秒时间戳；非法返回 NaN。 */
 function localDayStart(stamp) {
@@ -37,6 +37,26 @@ export function eliminationSignal(entry, today = localDateOf()) {
     return { signal: 'never-used', rank: 1, reason: '从未被检索命中（无证据，仅预算垫底）' }
   }
   return { signal: 'none', rank: 2, reason: '' }
+}
+
+/**
+ * v4.4 curator 归档判据（纯函数，供维护循环与单测复用）。
+ * 对齐 Hermes curator 的「active→stale→archived」确定性迁移，但只做「stale→archived」这一跳：
+ *   - active→stale 已由 deriveStaleAfter / isStaleEntry 表达（写入即设 staleAfter，到期即 stale）；
+ *   - 这里只判「已经 stale 的，过了宽限期还没人复核也没人用 → 归档」。
+ *
+ * 活跃豁免：宽限期（CURATOR_STALE_GRACE_DAYS）内 lastUsedAt 被刷新过的条目不归档。
+ *   理由：stale 只是「到期该复核」，不是「该扔」；还在被检索命中的事实大概率仍为真，误杀损失大。
+ *   没有 lastUsedAt 的（从未命中）回退到 updatedAt / addedAt。
+ */
+export function curationDecision(entry, today = localDateOf(), now = Date.now()) {
+  if (!isStaleEntry(entry, today)) return { archive: false, reason: '' }
+  const ref = entry?.lastUsedAt ?? entry?.updatedAt ?? entry?.addedAt
+  const stamp = Date.parse(String(ref ?? ''))
+  if (Number.isFinite(stamp) && now - stamp < CURATOR_STALE_GRACE_DAYS * 86400000) {
+    return { archive: false, reason: 'stale 但宽限期内仍被使用/更新，活跃豁免' }
+  }
+  return { archive: true, reason: `staleAfter ${entry.staleAfter} 已过且 ${CURATOR_STALE_GRACE_DAYS} 天未使用未复核` }
 }
 
 /**

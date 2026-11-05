@@ -8,8 +8,8 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSy
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { BACKUP_KEEP, BM25_ALIAS_WEIGHT, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
-import { detectScope, effectiveImportance, eliminationSignal, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
+import { BACKUP_KEEP, BM25_ALIAS_WEIGHT, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, CONSOLIDATE_MIN_USES, CURATOR_INTERVAL_MS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
+import { curationDecision, detectScope, effectiveImportance, eliminationSignal, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
 import { canonicalJson, migrateState, normalizeEntry, schemaTooNewError } from './schema.js'
 import { fail, text } from './util.js'
 import { contentUnitsOf, expandQuery, textSimilarity, tokenize } from './text.js'
@@ -1781,6 +1781,54 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     }
   }
 
+  // ── v4.4 维护循环（对齐 Hermes curator + 「越用越好用」）──
+  // 读路径顺带跑，CURATOR_INTERVAL_MS 节流。两件事：
+  //   1) consolidate（上）：draft 未证实条目被命中 ≥ CONSOLIDATE_MIN_USES 次 → 升 stable（越用越证实）。
+  //   2) curate（下）：staleAfter 到期 + 宽限期未复核未使用 → 归档（不过时；status=deprecated + archivedAt，可 memory_restore）。
+  // 不变量：只归档不删；pinned / kind=rule 豁免一切自动迁移；draft 只走 consolidate、不自动归档；
+  //   维护写失败 try/catch 吞掉，绝不打断读路径（系统提示装配 / memory_list 都要继续）。
+  let lastMaintenanceAt = 0
+  let maintenanceStats = { lastRunAt: '', archived: 0, promoted: 0 }
+  const runMaintenance = (force = false) => {
+    const now = Date.now()
+    if (!force && now - lastMaintenanceAt < CURATOR_INTERVAL_MS) {
+      return { ran: false, archived: 0, promoted: 0 }
+    }
+    lastMaintenanceAt = now
+    const today = localDateOf()
+    let archived = 0
+    let promoted = 0
+    for (const entry of state.entries) {
+      if (isArchivedEntry(entry)) continue
+      // draft（未证实）只走 consolidate：被命中够多次 → 升 stable；不参与 curate（该由人确认，不是时间淘汰）。
+      if (entry.status === 'draft') {
+        if ((entry.usedCount ?? 0) >= CONSOLIDATE_MIN_USES) {
+          entry.status = 'stable'
+          entry.updatedAt = new Date(now).toISOString()
+          promoted += 1
+        }
+        continue
+      }
+      // 硬规则 / 规则永不自动迁移（Hermes：pinned 豁免一切；rule 是「怎么做事」的长期约定）。
+      if (entry.pinned === true || entry.kind === 'rule') continue
+      const decision = curationDecision(entry, today, now)
+      if (!decision.archive) continue
+      entry.status = 'deprecated'
+      entry.archivedAt = new Date(now).toISOString()
+      entry.archiveReason = 'curator·' + decision.reason
+      archived += 1
+    }
+    if (archived > 0 || promoted > 0) {
+      maintenanceStats = { lastRunAt: new Date(now).toISOString(), archived, promoted }
+      try {
+        persist()
+      } catch (error) {
+        // 维护写失败绝不能打断读路径；本次迁移留到下次节流再试。
+      }
+    }
+    return { ran: true, archived, promoted }
+  }
+
   // 从运行期上下文取「本条用户消息」当检索查询：官方 AGENTS.md 也走 context.agent.session。
   // text() 必须同步且廉价，所以这里只做内存计算；拿不到会话就退化成「无 query」的纯索引模式。
   const currentQuery = (context) => {
@@ -1859,6 +1907,8 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   }
 
   const injectedBlock = (context) => {
+    // v4.4：读路径顺带跑维护（6h 节流，内部判）。写失败已被 runMaintenance 吞掉，不影响装配。
+    runMaintenance()
     const query = currentQuery(context)
     const scope = currentScopeOf(context)
     const stats = {}
@@ -1916,9 +1966,13 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     currentScopeOf,
     pendingCandidates,
     addCandidate,
+    runMaintenance,
     injectedBlock,
     get storeHealth() {
       return storeHealth
+    },
+    get maintenance() {
+      return maintenanceStats
     },
     get corruptCopy() {
       return corruptCopy

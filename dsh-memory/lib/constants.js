@@ -161,6 +161,16 @@ export const IMPORTANCE_BASE = { rule: 8, procedure: 7, preference: 6, reference
 // v2.9 学习进化：被引用够多就该升级（巩固），长期无人用就该降权（遗忘）
 export const CONSOLIDATE_MIN_USES = 3
 
+// ── v4.4 curator（对齐 Hermes 自动生命周期）：过期自动归档 + 未证实自动巩固 ──
+// CURATOR_STALE_GRACE_DAYS：staleAfter 到期后，再给这么多天「既没复核也没被使用」才归档。
+//   为什么不是到期立刻归档：stale 语义是「该复核了」，不是「该扔了」；给足宽限窗口等复核。
+//   活跃豁免：宽限期内 lastUsedAt 被刷新过的条目不归档（还在用 = 还有效，别误杀）。
+export const CURATOR_STALE_GRACE_DAYS = 30
+
+// CURATOR_INTERVAL_MS：维护循环（curate + consolidate）的节流间隔。DSH 无空闲钩子，
+//   用「读路径顺带跑 + 6h 节流」替代 Hermes 的「空闲触发」——每次读都扫全库写盘不可接受。
+export const CURATOR_INTERVAL_MS = 6 * 3600 * 1000
+
 export const MAX_CANDIDATES_PER_TURN = 2
 
 export const CANDIDATE_TTL_DAYS = 7

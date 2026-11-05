@@ -21,6 +21,7 @@ import {
   trustMark,
   memoryEntrySchema,
   deriveStaleAfter,
+  curationDecision,
   effectiveImportance,
   eliminationSignal,
   applicableAt,
@@ -1491,6 +1492,40 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   // 未来 staleAfter + 从未命中 → 不是 stale，只是 never-used 旁证
   assert.equal(eliminationSignal(futureStale, today).signal, 'never-used')
   ok('判断机制：stale(0) 优先于 never-used(1) 优先于 none(2)，use=0 不单独构成淘汰')
+}
+
+// ---- v4.4 curator 归档判据：stale 超宽限才归档，宽限期内活跃豁免 ----
+{
+  const today = '2026-10-30'
+  const now = Date.parse('2026-10-30T12:00:00')
+  const fresh = { id: 'c1', text: 'x', staleAfter: '2099-01-01' }
+  const staleLongUnused = { id: 'c2', text: 'x', staleAfter: '2026-01-01', updatedAt: new Date(now - 60 * 86400000).toISOString() }
+  const staleRecentUse = { id: 'c3', text: 'x', staleAfter: '2026-01-01', lastUsedAt: new Date(now - 5 * 86400000).toISOString() }
+  const staleRecentUpdate = { id: 'c4', text: 'x', staleAfter: '2026-01-01', updatedAt: new Date(now - 5 * 86400000).toISOString() }
+  const staleNoStamp = { id: 'c5', text: 'x', staleAfter: '2026-01-01' }
+
+  assert.equal(curationDecision(fresh, today, now).archive, false, '未到期不归档')
+  assert.equal(curationDecision(staleLongUnused, today, now).archive, true, '到期 + 60 天未动 → 归档')
+  assert.equal(curationDecision(staleRecentUse, today, now).archive, false, '到期但 5 天内用过 → 活跃豁免')
+  assert.equal(curationDecision(staleRecentUpdate, today, now).archive, false, '到期但 5 天内更新过 → 活跃豁免（回退 updatedAt）')
+  assert.equal(curationDecision(staleNoStamp, today, now).archive, true, '到期且无时间戳 → 归档（无法证明活跃）')
+  ok('curator 判据：stale 超宽限才归档，宽限期内使用/更新豁免')
+}
+
+// ---- v4.4 维护循环：draft 命中 ≥3 次自动升 stable（越用越好用） ----
+{
+  const mTmp = makeTmp('dsh-memory-maintain')
+  const m = host(mTmp)
+  const dAdd = await m.defs.get('memory_add').execute({ text: '反复被查的未证实事实', status: 'draft', kind: 'fact' })
+  for (let i = 0; i < 3; i += 1) {
+    await m.defs.get('memory_search').execute({ query: '未证实事实' })
+  }
+  // 触发注入层 → runMaintenance（首次调用，节流放行）
+  m.layers[0].text({})
+  const afterMaintain = (await m.defs.get('memory_list').execute({})).entries.find((entry) => entry.id === dAdd.entry.id)
+  assert.equal(afterMaintain.status, 'stable', 'draft 命中 ≥3 次应自动升 stable')
+  rmSync(mTmp, { recursive: true, force: true })
+  ok('维护循环：draft 被命中 ≥3 次自动巩固为 stable')
 }
 
 // ---- v3.19 自动入库 + 预算保护：真跑一遍 turn-stopping（闭包逻辑的集成测试） ----

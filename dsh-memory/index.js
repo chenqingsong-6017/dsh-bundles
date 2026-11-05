@@ -39,7 +39,7 @@ import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 
-export { isStaleEntry, isArchivedEntry, isInvalidEntry, applicableAt, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
+export { isStaleEntry, isArchivedEntry, isInvalidEntry, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
 export { bigramSet, textSimilarity, stripHarnessBlocks, tokenize, suggestAliases, expandQuery, contentUnitsOf, queryClauses } from './lib/text.js'
 export { queryIdfSum, scoreEntries, scoreEntriesStrict, gateDecision, relevanceCoverage, scoreMemory } from './lib/score.js'
 export { trustMark, renderMemory } from './lib/render.js'
@@ -2167,6 +2167,15 @@ export function apply(ctx, config) {
             maxInjectChars: { type: 'integer' },
             configWarning: { type: 'string' },
             codeFingerprint: { type: 'string' },
+            maintenance: {
+              type: 'object',
+              properties: {
+                lastRunAt: { type: 'string' },
+                archived: { type: 'integer' },
+                promoted: { type: 'integer' },
+              },
+              additionalProperties: false,
+            },
           },
           required: [
             'ready',
@@ -2186,9 +2195,14 @@ export function apply(ctx, config) {
         },
         render(_args, value) {
           if (value?.ready === false) return [text('不可用：' + (value?.unavailableReason || '未知原因'))]
+          const maint = value?.maintenance
+          const maintLine =
+            maint && typeof maint.lastRunAt === 'string' && maint.lastRunAt !== ''
+              ? `\n维护循环：上次 ${maint.lastRunAt.slice(0, 19).replace('T', ' ')} · 归档 ${maint.archived ?? 0} · 巩固 ${maint.promoted ?? 0}`
+              : '\n维护循环：尚未运行（读路径触发，6h 节流）'
           return [
             text(
-              `记忆库可用：${value?.active ?? 0} 条生效 / ${value?.archived ?? 0} 条归档，存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入预算 ${value?.maxInjectChars ?? 0} 字符，库文件 ${value?.storeFile ?? '?'}`,
+              `记忆库可用：${value?.active ?? 0} 条生效 / ${value?.archived ?? 0} 条归档，存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入预算 ${value?.maxInjectChars ?? 0} 字符，库文件 ${value?.storeFile ?? '?'}${maintLine}\n代码指纹 ${value?.codeFingerprint ?? '?'}`,
             ),
           ]
         },
@@ -2261,9 +2275,11 @@ export function apply(ctx, config) {
           maxBytes,
           maxInjectChars,
           ...(configWarning !== '' ? { configWarning } : {}),
+          // v4.4：维护循环（curate 过期归档 / consolidate draft→stable）的上一次运行结果，供诊断「自动生命周期有没有在跑」。
+          maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.3.1-cleanup',
+          codeFingerprint: '4.4.0-curator',
         }
       },
     }),
