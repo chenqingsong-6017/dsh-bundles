@@ -18,6 +18,28 @@ export function isStaleEntry(entry, today = localDateOf()) {
 }
 
 /**
+ * Hermes 判断机制（对齐 curator.py「use_count==0 是 absence of evidence」）：
+ * 一条生效记忆该不该被「自动淘汰」（预算腾挪时归档），给出一个**可排序的信号**，而不是拿「从未命中」一刀切。
+ *
+ * 信号按可辩护性降序（rank 越小越该先淘汰）：
+ *   rank 0  stale —— staleAfter 已过（该复核却没复核），是确定性「到期未验证」信号；
+ *   rank 1  never-used —— usedCount=0 只是「没证据」，不是「该淘汰」，只能垫底（且由调用方用 minAge 把关才准参与）；
+ *   rank 2  none —— 都不满足，本轮不该动它。
+ *
+ * 为什么：Hermes 明令「'use=0' is NOT a reason to PRUNE」（curator.py:334-338），
+ * 我们旧逻辑把 usedCount=0 当成唯一淘汰信号，正是这条反模式。改用 stale（确定性）优先、never-used（旁证）垫底。
+ */
+export function eliminationSignal(entry, today = localDateOf()) {
+  if (isStaleEntry(entry, today)) {
+    return { signal: 'stale', rank: 0, reason: 'staleAfter ' + entry.staleAfter + ' 已过（到期未复核）' }
+  }
+  if ((entry?.usedCount ?? 0) === 0) {
+    return { signal: 'never-used', rank: 1, reason: '从未被检索命中（无证据，仅预算垫底）' }
+  }
+  return { signal: 'none', rank: 2, reason: '' }
+}
+
+/**
  * v3.20：一条记忆算不算「归档」——被取代（supersededBy）或显式 deprecated。
  * 从 v3.3 起 activeEntries 就是这个口径，这里提成模块级函数，给「归档分文件冷存」复用，
  * 避免两处判断漂移（历史教训：只判 supersededBy 时 deprecated 条目仍算生效，预算虚高）。

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.0-vendored.3 (2026-11-05 23:58)
+
+- 仅验证记录，无代码改动：DSH 升级到 **0.2.2-rc.1** 后的复验结论写进 README 文末——单测 11/11、真机 `/state` 与 rc.1 的 archive/unarchive RPC 存在三项✅；**真机删除未执行**（归档集为空 + 当轮无法驱动 GUI），不记成已复验。
+
 ## 1.0.0-vendored.2 (2026-11-05 23:10)
 
 - **修「删了还在 / 回到未分组」**：宿主删除后显式 `emit('api-session/removed')`（两种 id 拼写），client 删除成功后调用 `sessions.refresh()` 重拉基线；新增 `POST /plugins/archived-purge/announce` 用于补播已删 id（清理客户端陈旧行）。

@@ -104,7 +104,7 @@ plugin_manager action=remove_bundle target=@local/dsh-skill-usage
 
 | 情况 | 动作 |
 |---|---|
-| 目录内（本次刷新看见）且 ≥30 天没动 | 归档，`archivedReason=unused-30d` |
+| 目录内（本次刷新看见）且 ≥30 天没动 | 归档，`archivedReason=stale-30d`（活动衰减，非「从未用过」） |
 | 上次在目录里见过、本次没见（技能已移出） | 归档，`archivedReason=not-in-catalog` |
 | 目录名单不可信（`catalogAt` 缺失） | **不归档**（宁可漏，不误伤） |
 | 已归档 / 未到 30 天 | 不动 |

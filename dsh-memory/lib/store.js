@@ -9,7 +9,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { BACKUP_KEEP, BM25_ALIAS_WEIGHT, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
-import { detectScope, effectiveImportance, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
+import { detectScope, effectiveImportance, eliminationSignal, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
 import { canonicalJson, migrateState, normalizeEntry, schemaTooNewError } from './schema.js'
 import { fail, text } from './util.js'
 import { contentUnitsOf, expandQuery, textSimilarity, tokenize } from './text.js'
@@ -1077,22 +1077,32 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   // 避免刚写进来的记忆立刻被后续写入挤掉。规则入库通道保持 minAgeDays=0（原行为）。
   function lowestValueCandidate(minAgeDays = 0) {
     const cutoff = minAgeDays > 0 ? Date.now() - minAgeDays * 86400000 : 0
+    const today = localDateOf()
+    // Hermes 判断机制：淘汰按「信号」排序，不再拿「从未命中」当唯一/优先判据。
+    // stale（到期未复核）是确定性信号，排最前；never-used 是「没证据」，只能垫底，且必须足够旧才准参与。
     const pool = activeEntries().filter(
-      (entry) =>
-        entry.pinned !== true &&
-        (entry.usedCount ?? 0) === 0 &&
-        entry.kind !== 'rule' &&
-        entry.status !== 'draft' &&
-        (cutoff === 0 || Date.parse(String(entry.updatedAt ?? entry.addedAt ?? '')) < cutoff),
+      (entry) => entry.pinned !== true && entry.kind !== 'rule' && entry.status !== 'draft',
     )
     if (pool.length === 0) return null
-    return pool
-      .map((entry) => ({ entry, imp: effectiveImportance(entry) }))
-      .sort((a, b) => a.imp - b.imp)[0].entry
+    const scored = pool.map((entry) => {
+      const sig = eliminationSignal(entry, today)
+      if (sig.rank === 1) {
+        // never-used 旁证：minAge 门槛只对它生效；stale（rank 0）不需要年龄门槛。
+        const updated = Date.parse(String(entry.updatedAt ?? entry.addedAt ?? ''))
+        if (cutoff > 0 && !(Number.isFinite(updated) && updated < cutoff)) {
+          return { entry, rank: 2, imp: effectiveImportance(entry) }
+        }
+      }
+      return { entry, rank: sig.rank, imp: effectiveImportance(entry) }
+    })
+    const eligible = scored.filter((s) => s.rank <= 1)
+    if (eligible.length === 0) return null
+    eligible.sort((a, b) => (a.rank - b.rank) || (a.imp - b.imp))
+    return eligible[0].entry
   }
 
   function makeRoom(size, opts) {
-    const reason = typeof opts?.reason === 'string' ? opts.reason : 'auto-archive: 为规则自动入库腾预算'
+    const fallbackReason = typeof opts?.reason === 'string' ? opts.reason : 'auto-archive: 为规则自动入库腾预算'
     const minAgeDays = Number.isFinite(opts?.minAgeDays) ? opts.minAgeDays : 0
     const archived = []
     let guard = 0
@@ -1100,9 +1110,11 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
       guard += 1
       const victim = lowestValueCandidate(minAgeDays)
       if (victim === null) return { ok: false, archived }
+      const sig = eliminationSignal(victim, localDateOf())
       victim.status = 'deprecated'
       victim.archivedAt = new Date().toISOString()
-      victim.archiveReason = reason
+      // 分类归档理由（对齐 Hermes「每条淘汰都必须带 why」）：有判断信号就写信号，没有才回退到调用方给的通用理由。
+      victim.archiveReason = sig.rank <= 1 ? '淘汰·' + sig.reason : fallbackReason
       archived.push(victim.id)
     }
     return { ok: usedChars() + size <= maxBytes, archived }

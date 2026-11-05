@@ -130,7 +130,7 @@ export function decideCuration(record, now, thresholds, catalogAtIso) {
   if (inCatalog === false) return { action: 'archive', reason: 'not-in-catalog' }
   const state = classifyUsage(record, now, thresholds)
   if (state.state !== 'archive-candidate') return { action: 'none' }
-  if (inCatalog === true) return { action: 'archive', reason: 'unused-' + thresholds.archiveAfterDays + 'd' }
+  if (inCatalog === true) return { action: 'archive', reason: 'stale-' + thresholds.archiveAfterDays + 'd' }
   // inCatalog === null：目录名单不可信，不归档（宁可漏，不误伤）
   return { action: 'none' }
 }

@@ -62,7 +62,7 @@ https://github.com/5D-artist/dsh-archived-purge
 
 ## 兼容性
 
-- 实测：**DSH 0.2.1-rc.5**（Desktop，Windows）。
+- 实测：**DSH 0.2.1-rc.5**（Desktop，Windows）全链路；**0.2.2-rc.1 仅部分复验**（见文末，删除链路未在 rc.1 上跑过）。
 - 需要 Host 服务：`webServer`、`workspaceRegistry`、`sessions`、`sessionPersistence`。
 - 存储布局：0.2.x 的 v4 会话日志、`workspace.json` schema v2、`session_projcache` 单记录文件。
 - 仅 Web 客户端（`dsh.client.platform = web`）。
@@ -153,3 +153,11 @@ MIT © 2026 5D-artist
 - **已知边界**：只处理归档集内的会话（未归档 id 一律拒绝）；运行中的会话先释放再删除，释放不掉则拒绝；不清理 `storages/session_projcache.json` 聚合表与 `storages/message_feedback.json`（上游未做，删除的 id 由宿主后续重建时自然消失）；来源为子代理（`origin: subagent`）的会话只在其父会话被删时级联清理。
 
 - **第二批（2026-11-05 22:45，重启后的实例）**：用户在 GUI 归档了 5 条，其中 3 条处于「已挂载」状态被旧逻辑拒绝（`session-active`）。本副本加入 **release-then-delete**（借 liuyu-f/dsh-plugin-session-cascade-delete 的 MIT 思路：停 agent → flush → detach `sessions.store` / `agents.store` 条目 → 再删盘），复测：4 条全部删除成功（3 条 `released: true`），`archivedSessionIds` 归零，会话目录 8 秒后仍未重建；不留备份（用户 2026-11-05 明示：不备份、不走删除三查）。
+
+- **0.2.2-rc.1 复验（2026-11-05 23:40–23:58，升级后）**：这一轮**没有跑通删除链路**，逐项如实记：
+  - ✅ Host 单测 `node --test test/host.test.mjs` **11/11 PASS**（含 release-then-delete、释放失败拒绝、subagent 级联、非法 id、announce 双拼写）。
+  - ✅ 真机 `GET http://127.0.0.1:63081/plugins/archived-purge/state` 返回真实数据（`archivedCount: 0`，含 `items/totalBytes/generatedAt`）→ 说明 `webServer` / `workspaceRegistry` / `sessions` / `sessionPersistence` 四个依赖在 rc.1 上注入正常、路由存活。
+  - ✅ rc.1 安装包内仍存在 `workspace/archiveSession` 与 `workspace/unarchiveSession` RPC 定义（`node _ops/asar.mjs grep archiveSession` 命中 `dsh-api-remotes/lib/client.js`）——插件删归档走的正是这两个。
+  - ⚪ 客户端半区：`<DSH_HOME>/archived-purge-client-errors.log` 不存在（客户端从未上报挂载失败）；但本轮**没有用眼睛确认设置页**（视觉后端 `VISION_BACKEND_UNAVAILABLE_THIS_TURN`、Web 面直连 401），属**弱证据**，不写成「已验证」。
+  - ❌ **未复验：真机删除**。原因：归档集为空（上一批已清干净），而「新建会话 → 归档」只能走 GUI——当轮视觉后端故障、`http://127.0.0.1:63081` 直连 401（桌面端注入鉴权）、盲点坐标点击风险不可接受。**判据未建立，就不记成已复验。**
+  - 补验条件（两条即可收口）：任选其一 ①在 GUI 归档一个可弃会话（新建 → 右键归档），然后 `POST /plugins/archived-purge/delete {sessionIds:[id]}`；②视觉后端恢复后由 agent 自己造 + 删。验收点：`archivedSessionIds` 减到 0、会话目录与 `storages/session_projcache/sessions/<id>.json` 双双消失、10 秒后不重建。

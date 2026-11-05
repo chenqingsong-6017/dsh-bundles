@@ -22,6 +22,7 @@ import {
   memoryEntrySchema,
   deriveStaleAfter,
   effectiveImportance,
+  eliminationSignal,
   applicableAt,
   suggestAliases,
   contentUnitsOf,
@@ -1468,6 +1469,28 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const ranked = scoreEntries([stale, fresh], '验证门 收工前').sort((a, b) => b.score - a.score)
   assert.equal(ranked[0].entry.id, 's2', '同样文本时未过期的排前面')
   ok('v3.19 时效降权：过期条目仍可检索，但排序压后')
+}
+
+// ---- Hermes 判断机制：eliminationSignal（use=0 是「没证据」不是「该淘汰」） ----
+{
+  const today = '2026-10-30'
+  const stale = { id: 'e1', text: 'x', staleAfter: '2026-01-01' }
+  const neverUsed = { id: 'e2', text: 'x', usedCount: 0 }
+  const used = { id: 'e3', text: 'x', usedCount: 3 }
+  const staleButUsed = { id: 'e4', text: 'x', staleAfter: '2026-01-01', usedCount: 2 }
+  const futureStale = { id: 'e5', text: 'x', staleAfter: '2099-01-01', usedCount: 0 }
+
+  assert.equal(eliminationSignal(stale, today).signal, 'stale')
+  assert.equal(eliminationSignal(stale, today).rank, 0)
+  assert.equal(eliminationSignal(neverUsed, today).signal, 'never-used')
+  assert.equal(eliminationSignal(neverUsed, today).rank, 1)
+  assert.equal(eliminationSignal(used, today).signal, 'none')
+  assert.equal(eliminationSignal(used, today).rank, 2)
+  // 确定性信号（到期未复核）优先于活动：用了但过期，仍判 stale（rank 0），不被 usedCount 救回
+  assert.equal(eliminationSignal(staleButUsed, today).rank, 0)
+  // 未来 staleAfter + 从未命中 → 不是 stale，只是 never-used 旁证
+  assert.equal(eliminationSignal(futureStale, today).signal, 'never-used')
+  ok('判断机制：stale(0) 优先于 never-used(1) 优先于 none(2)，use=0 不单独构成淘汰')
 }
 
 // ---- v3.19 自动入库 + 预算保护：真跑一遍 turn-stopping（闭包逻辑的集成测试） ----

@@ -39,7 +39,7 @@ import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 
-export { isStaleEntry, isArchivedEntry, isInvalidEntry, applicableAt, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, recencyOf, detectScope } from './lib/entry.js'
+export { isStaleEntry, isArchivedEntry, isInvalidEntry, applicableAt, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
 export { bigramSet, textSimilarity, stripHarnessBlocks, tokenize, suggestAliases, expandQuery, contentUnitsOf, queryClauses } from './lib/text.js'
 export { queryIdfSum, scoreEntries, scoreEntriesStrict, gateDecision, relevanceCoverage, scoreMemory } from './lib/score.js'
 export { trustMark, renderMemory } from './lib/render.js'
