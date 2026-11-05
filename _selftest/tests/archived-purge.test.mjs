@@ -151,6 +151,35 @@ test('releases a live session then deletes it', async () => {
   await assert.rejects(fsp.stat(alphaDir), /ENOENT/);
 });
 
+test('released live session projection cache is swept after the lifecycle commits it', async () => {
+  const { home, project, cache } = await makeHome();
+  await makeSession(project, 'session-alpha', 128);
+  await makeCache(cache, 'session-alpha', 'Alpha');
+  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+
+  let detached = false;
+  const store = new Map([
+    ['session-alpha', { id: 'session-alpha', detach: () => { detached = true; store.delete('session-alpha'); } }],
+  ]);
+  const live = { id: 'session-alpha', header: { id: 'session-alpha' } };
+  const handlers = createHandlers({
+    home,
+    sessions: {
+      get: (id) => (id === 'session-alpha' && store.size > 0 ? live : undefined),
+      store,
+      // A released live session commits one final projection row while draining.
+      flush: async () => { await makeCache(cache, 'session-alpha', 'Alpha final'); return true; },
+    },
+    agents: { list: () => [], store: new Map() },
+    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    sessionPersistence: undefined,
+  });
+  const result = await handlers.remove(['session-alpha']);
+  assert.equal(result.ok, true);
+  assert.equal(detached, true);
+  await assert.rejects(fsp.stat(path.join(cache, 'session-alpha.json')), /ENOENT/);
+});
+
 test('refuses a live session it cannot release and leaves its files alone', async () => {
   const { home, project, cache } = await makeHome();
   const alphaDir = await makeSession(project, 'session-alpha', 256);

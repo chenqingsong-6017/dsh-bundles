@@ -429,6 +429,28 @@ export function createHandlers(deps) {
         return { id, ok: false, code: 'unarchive-failed', message: formatError(error), removedBytes };
       }
     }
+    // A released live session commits one final projection row while its
+    // lifecycle drains (after the first cache removal above), so sweep the
+    // cache file once more after the registry calls settle.
+    const finalCache = path.join(cacheRoot, `${id}.json`);
+    if (isInside(cacheRoot, finalCache)) {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          await fsp.rm(finalCache, { force: true });
+        } catch {
+          /* reported by the presence check below */
+        }
+        let present = false;
+        try {
+          await fsp.stat(finalCache);
+          present = true;
+        } catch {
+          present = false;
+        }
+        if (!present) break;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+    }
     return { id, ok: true, removedBytes, released, cascade: Boolean(options?.cascade) };
   }
 
