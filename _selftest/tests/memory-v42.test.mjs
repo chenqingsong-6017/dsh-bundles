@@ -158,10 +158,9 @@ const priming = (h) => h.layers[0].text({ agent: { session: {} } })
   assert.match(message, /主动精简建议/, '报错要带精简建议段，实际：' + message)
   assert.match(message, /合并/, '要有合并建议')
   assert.match(message, /m1 \+ m2|m2 \+ m1/, '合并建议要点名相似的两条，实际：' + message)
-  assert.match(message, /drop/, '要有 drop 建议')
-  assert.match(message, /m3（staleAfter 2026-01-01 已过/, 'drop 建议要点名 stale 条目 m3，实际：' + message)
-  assert.ok(!/m4（/.test(message), '规则条目 m4 不能被列为 drop 候选（与 makeRoom 的 kind!==rule 同口径），实际：' + message)
-  ok('2.3 预算见顶：错误里带「建议合并 m1+m2 / drop m3（stale）」，且不把规则 m4 当 drop 候选')
+  assert.match(message, /本轮已自动归档：m3（可 memory_restore 恢复）/, '判断机制：stale m3 被优先自动归档（不是只建议 drop），实际：' + message)
+  assert.ok(!/m4/.test(message), '规则条目 m4 既不自动归档也不建议（kind=rule 豁免），实际：' + message)
+  ok('2.3 预算见顶：makeRoom 优先自动归档 stale m3，再建议合并 m1+m2，规则 m4 豁免')
   cleanup(dir)
 }
 
