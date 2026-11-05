@@ -3,6 +3,17 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.3.1 — 2026-11-05
+
+标题：「拆完扫尾」——清掉两处拆分后暴露的死代码，无行为变化。
+
+### Removed
+- `lib/constants.js` 的 `RELEVANT_CONFIDENCE`：全仓无引用（拆分前就是死常量，匿名覆盖时留下的）。
+- `lib/store.js` 的 `schemaUpgraded` 状态与 getter：只写不读（迁移信息实际由 `state.version` 与 `memory_status.schemaVersion` 承载）。
+
+### 测试
+- 五套回归仍全过（133 / 12 / 7 / 10 / 6）；`node --check` 全通过；拆分前后导出面 45 个名字逐一对齐（`_reports` 见 CHANGELOG v4.3.0）。
+
 ## v4.3.0 — 2026-11-05
 
 标题：「把 apply 拆成组装层」——存储层（状态 + 双后端持久化 + 备份 + 别名旁路 + 候选池 + 归档）搬进 `lib/store.js` 的 `createStore()` 工厂，`apply` 只负责组装与工具注册。工具名/参数/返回结构、检索与写入行为一行未变。承接同日的 v4.2.3（顶层辅助函数拆出 lib 九模块）。

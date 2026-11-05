@@ -79,8 +79,6 @@ export const RELEVANT_SHARE = 0.4
 
 export const MAX_RELEVANT = 2
 
-const RELEVANT_CONFIDENCE = 1.5
-
 export const MAX_QUERY_CHARS = 400
 
 export const SCOPE_BOOST = 1.4

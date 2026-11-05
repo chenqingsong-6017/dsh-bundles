@@ -177,8 +177,6 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   }
   // 数据安全：解析失败不覆盖，改名留证并进入只读保护态（P0-1）。
   let storeHealth = 'ok'
-  // v4.0：本次加载是否发生了 schema 迁移（from→to），给诊断用。
-  let schemaUpgraded = null
   let corruptCopy = ''
   // v3.9：加载时因字段不合法被丢弃的条目，原文件已另存到这里（只提示，不改数据）。
   let droppedCopyPath = ''
@@ -1670,7 +1668,6 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
       const migrated = migrateState(state)
       if (migrated.changed) {
         replaceState(migrated.state)
-        schemaUpgraded = { from: migrated.from, to: migrated.to }
       }
       // v3.10（B02）：记下这次的磁盘指纹，persist 据此判断「别的进程写过了没有」。
       lastSignature = storeSignature()
@@ -1913,9 +1910,6 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     },
     get corruptCopy() {
       return corruptCopy
-    },
-    get schemaUpgraded() {
-      return schemaUpgraded
     },
     get db() {
       return db
