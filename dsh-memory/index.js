@@ -5756,6 +5756,7 @@ export function apply(ctx, config) {
             maxBytes: { type: 'integer' },
             maxInjectChars: { type: 'integer' },
             configWarning: { type: 'string' },
+            codeFingerprint: { type: 'string' },
           },
           required: [
             'ready',
@@ -5850,6 +5851,9 @@ export function apply(ctx, config) {
           maxBytes,
           maxInjectChars,
           ...(configWarning !== '' ? { configWarning } : {}),
+          // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
+          // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
+          codeFingerprint: '4.2.2-seqfix',
         }
       },
     }),
