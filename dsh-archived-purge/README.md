@@ -147,8 +147,8 @@ MIT © 2026 5D-artist
 
 - **来源**：https://github.com/5D-artist/dsh-archived-purge ，commit `6c484e69`（2026-11-04，MIT）。本目录是 vendored 副本，改动请先在这里改并在 `CHANGELOG.md` 记一笔。
 - **为什么选它**：它删除归档标记走宿主公开 API `workspaceRegistry.unarchiveSession()`、删除工作区记账走 `Workspace.detachSession()`，不是直接改写 `workspace.json`——这正是 2026-11-03 事故的根因（外部改盘被宿主内存快照回写，13 个已删会话的归档标记「复活」）。
-- **验证记录（真机 2026-11-05 20:45–20:52，DSH 0.2.1-rc.5）**：通过插件自身 `POST /plugins/archived-purge/delete` 删除 18 个归档会话，结果 `deleted: 21`（含 4 个 `origin: subagent` 子会话级联），`removedBytes: 9,467,342`，`failed: 0`；复核 `workspace.json` → `archivedSessionIds` 18 → 0，5 个有数据的会话目录已不存在，投影缓存单文件 0 残留。删除前备份在 `D:\AI\dsh-data\backup\session-purge-20261105-2045`（7.55 MB）。
+- **验证记录（真机 2026-11-05 20:45–20:52，DSH 0.2.1-rc.5）**：通过插件自身 `POST /plugins/archived-purge/delete` 删除 18 个归档会话，结果 `deleted: 21`（含 4 个 `origin: subagent` 子会话级联），`removedBytes: 9,467,342`，`failed: 0`；复核 `workspace.json` → `archivedSessionIds` 18 → 0，5 个有数据的会话目录已不存在，投影缓存单文件 0 残留。删除前备份在 `D:\AI\dsh-data\backup\session-purge-20261105-2045`（7.55 MB；2026-11-05 用户要求不留备份，该目录已删）。
 - **测试**：`_selftest/tests/archived-purge.test.mjs`（映射测试，8 条）与本目录 `test/host.test.mjs` 一致。
 - **已知边界**：只处理归档集内的会话（未归档 id 一律拒绝）；运行中的会话先释放再删除，释放不掉则拒绝；不清理 `storages/session_projcache.json` 聚合表与 `storages/message_feedback.json`（上游未做，删除的 id 由宿主后续重建时自然消失）；来源为子代理（`origin: subagent`）的会话只在其父会话被删时级联清理。
 
-- **第二批（2026-11-05 22:45，重启后的实例）**：用户在 GUI 归档了 5 条，其中 3 条处于「已挂载」状态被旧逻辑拒绝（`session-active`）。本副本加入 **release-then-delete**（借 liuyu-f/dsh-plugin-session-cascade-delete 的 MIT 思路：停 agent → flush → detach `sessions.store` / `agents.store` 条目 → 再删盘），复测：4 条全部删除成功（3 条 `released: true`），`archivedSessionIds` 归零，会话目录 8 秒后仍未重建；备份 `D:\AI\dsh-data\backup\session-purge-20261105-2245`（0.63 MB）。
+- **第二批（2026-11-05 22:45，重启后的实例）**：用户在 GUI 归档了 5 条，其中 3 条处于「已挂载」状态被旧逻辑拒绝（`session-active`）。本副本加入 **release-then-delete**（借 liuyu-f/dsh-plugin-session-cascade-delete 的 MIT 思路：停 agent → flush → detach `sessions.store` / `agents.store` 条目 → 再删盘），复测：4 条全部删除成功（3 条 `released: true`），`archivedSessionIds` 归零，会话目录 8 秒后仍未重建；不留备份（用户 2026-11-05 明示：不备份、不走删除三查）。
