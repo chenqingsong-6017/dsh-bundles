@@ -19,7 +19,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 export const name = 'archived-purge';
-export const inject = ['webServer', 'workspaceRegistry', 'sessions', 'sessionPersistence'];
+export const inject = ['webServer', 'workspaceRegistry', 'sessions', 'sessionPersistence', 'agents'];
 
 const ROUTE = '/plugins/archived-purge';
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
@@ -181,18 +181,114 @@ export function createHandlers(deps) {
   const sessionsRoot = path.join(home, 'sessions');
   const cacheRoot = path.join(home, 'storages', 'session_projcache', 'sessions');
 
+  /** One session can appear under the raw uuid and the `session-<uuid>` spelling. */
+  function idVariants(id) {
+    const raw = id.startsWith('session-') ? id.slice(8) : id;
+    return [...new Set([id, raw, 'session-' + raw])];
+  }
+
+  function liveSessionFor(id) {
+    if (!sessions || typeof sessions.get !== 'function') return undefined;
+    for (const variant of idVariants(id)) {
+      try {
+        const session = sessions.get(variant);
+        if (session !== undefined) return session;
+      } catch {
+        /* store unavailable */
+      }
+    }
+    return undefined;
+  }
+
+  function liveAgentFor(id) {
+    if (!agents || typeof agents.list !== 'function') return undefined;
+    let all;
+    try {
+      all = agents.list();
+    } catch {
+      return undefined;
+    }
+    const wanted = new Set(idVariants(id));
+    for (const agent of Array.isArray(all) ? all : []) {
+      if (!agent || typeof agent !== 'object') continue;
+      const candidates = [agent.id, agent.session && agent.session.id];
+      if (candidates.some((candidate) => typeof candidate === 'string' && wanted.has(candidate))) return agent;
+    }
+    return undefined;
+  }
+
+  function storeEntry(service, id) {
+    const store = service && service.store;
+    if (!(store instanceof Map)) return undefined;
+    const wanted = new Set(idVariants(id));
+    for (const [key, entry] of store) {
+      const entryId = entry && typeof entry.id === 'string' ? entry.id : key;
+      if (typeof entryId === 'string' && wanted.has(entryId)) return entry;
+    }
+    return undefined;
+  }
+
   function isLive(id) {
-    try {
-      if (sessions && typeof sessions.get === 'function' && sessions.get(id)) return true;
-    } catch {
-      /* treat an unavailable store as not live */
+    return liveSessionFor(id) !== undefined || liveAgentFor(id) !== undefined;
+  }
+
+  /**
+   * Release a live session before its log disappears: stop its agent (cancel +
+   * bounded wait), flush the store, then detach the live session/agent entries.
+   * Without this the store keeps writing and can re-create the session directory
+   * after removal — the reason the upstream plugin refused live sessions.
+   */
+  async function releaseSession(id) {
+    const agent = liveAgentFor(id);
+    if (agent !== undefined) {
+      try {
+        if (typeof agent.cancel === 'function') agent.cancel({ kind: 'user' });
+      } catch {
+        /* already settling */
+      }
+      if (typeof agent.whenIdle === 'function') {
+        let timer;
+        try {
+          await Promise.race([
+            Promise.resolve(agent.whenIdle()).catch(() => false),
+            new Promise((resolve) => { timer = setTimeout(resolve, 15000); }),
+          ]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      }
     }
-    try {
-      if (agents && typeof agents.get === 'function' && agents.get(id)) return true;
-    } catch {
-      /* ignore */
+    const session = liveSessionFor(id);
+    if (session !== undefined && typeof sessions.flush === 'function') {
+      try {
+        await sessions.flush(session);
+      } catch {
+        /* deletion proceeds and removes the log anyway */
+      }
     }
-    return false;
+    const sessionEntry = storeEntry(sessions, id);
+    if (sessionEntry !== undefined) {
+      try {
+        if (typeof sessionEntry.detach === 'function') sessionEntry.detach();
+        else if (typeof sessions.detachEntered === 'function') sessions.detachEntered(sessionEntry);
+      } catch {
+        /* reported by the post-release liveness check */
+      }
+    }
+    const agentEntry = storeEntry(agents, id);
+    if (agentEntry !== undefined) {
+      try {
+        if (typeof agents.detachEntered === 'function') agents.detachEntered(agentEntry);
+        else if (typeof agentEntry.detach === 'function') agentEntry.detach();
+      } catch {
+        /* best effort: the session detach already removed it from every list */
+      }
+    }
+    return {
+      stopped: agent !== undefined,
+      detachedSession: sessionEntry !== undefined,
+      detachedAgent: agentEntry !== undefined,
+    };
   }
 
   async function state() {
@@ -279,8 +375,13 @@ export function createHandlers(deps) {
   }
 
   async function removeOne(id, dirs, options, workspaces) {
+    let released = false;
     if (isLive(id)) {
-      return { id, ok: false, code: 'session-active', message: '会话仍在运行，已跳过' };
+      const release = await releaseSession(id);
+      if (isLive(id)) {
+        return { id, ok: false, code: 'release-failed', message: '会话仍在运行且无法释放（可能被其他窗口占用）' };
+      }
+      released = Boolean(release.stopped || release.detachedSession || release.detachedAgent);
     }
     let removedBytes = 0;
     const failures = [];
@@ -328,7 +429,7 @@ export function createHandlers(deps) {
         return { id, ok: false, code: 'unarchive-failed', message: formatError(error), removedBytes };
       }
     }
-    return { id, ok: true, removedBytes, cascade: Boolean(options?.cascade) };
+    return { id, ok: true, removedBytes, released, cascade: Boolean(options?.cascade) };
   }
 
   function rawOwner(workspaces, id) {

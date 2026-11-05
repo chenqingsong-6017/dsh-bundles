@@ -121,22 +121,58 @@ test('delete removes log, cache, accounting and archive marker', async () => {
   assert.deepEqual(after.archived, ['session-alpha', 'session-beta'], 'host never rewrites workspace.json directly');
 });
 
-test('refuses a live session and leaves its files alone', async () => {
+test('releases a live session then deletes it', async () => {
   const { home, project, cache } = await makeHome();
   const alphaDir = await makeSession(project, 'session-alpha', 256);
   await makeCache(cache, 'session-alpha', 'Alpha');
   await writeRegistry(home, ['session-alpha'], ['session-alpha']);
 
+  let detached = false;
+  const store = new Map([
+    ['session-alpha', { id: 'session-alpha', detach: () => { detached = true; store.delete('session-alpha'); } }],
+  ]);
+  const live = { id: 'session-alpha', header: { id: 'session-alpha' } };
   const handlers = createHandlers({
     home,
-    sessions: { get: (id) => (id === 'session-alpha' ? { id } : undefined) },
+    sessions: {
+      get: (id) => (id === 'session-alpha' && store.size > 0 ? live : undefined),
+      store,
+      flush: async () => true,
+    },
+    agents: { list: () => [], store: new Map() },
+    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    sessionPersistence: undefined,
+  });
+  const result = await handlers.remove(['session-alpha']);
+  assert.equal(result.ok, true);
+  assert.equal(result.deleted, 1);
+  assert.equal(result.results[0].released, true);
+  assert.equal(detached, true, 'live session entry is detached before removal');
+  await assert.rejects(fsp.stat(alphaDir), /ENOENT/);
+});
+
+test('refuses a live session it cannot release and leaves its files alone', async () => {
+  const { home, project, cache } = await makeHome();
+  const alphaDir = await makeSession(project, 'session-alpha', 256);
+  await makeCache(cache, 'session-alpha', 'Alpha');
+  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+
+  // A store entry without a detach hook: the plugin must not delete a live
+  // session it cannot release, or the store would re-create it afterwards.
+  const handlers = createHandlers({
+    home,
+    sessions: {
+      get: (id) => (id === 'session-alpha' ? { id } : undefined),
+      store: new Map([['session-alpha', { id: 'session-alpha' }]]),
+    },
+    agents: { list: () => [], store: new Map() },
     workspaceRegistry: makeRegistry(['session-alpha']).registry,
     sessionPersistence: undefined,
   });
   const result = await handlers.remove(['session-alpha']);
   assert.equal(result.ok, false);
   assert.equal(result.failed, 1);
-  assert.equal(result.results[0].code, 'session-active');
+  assert.equal(result.results[0].code, 'release-failed');
   assert.ok((await fsp.stat(alphaDir)).isDirectory());
 });
 

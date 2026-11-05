@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0-vendored.1 (2026-11-05 22:45)
+
+- **release-then-delete**：归档会话处于「已挂载 / 运行中」时不再直接拒绝，而是先停 agent（cancel + 15s 有界等待）→ flush store → detach `sessions.store` / `agents.store` 条目，再删盘；释放不掉仍拒绝（避免存储层删后重建目录）。
+- 客户端文案：运行中徽标与确认弹窗改为「运行中（删除会先停止）」/「运行中的会话会先停止」。
+- 测试：8 条（新增「释放后删除」「释放失败拒绝」）。
+- 来源：release 顺序参考 liuyu-f/dsh-plugin-session-cascade-delete（MIT）的 delete 链路。
+
 ## 1.0.0 (vendored 2026-11-05)
 
 - 上游来源：https://github.com/5D-artist/dsh-archived-purge @ 6c484e695690b3ace35001fbbb6222e8f8a0ee58（2026-11-04，MIT）。

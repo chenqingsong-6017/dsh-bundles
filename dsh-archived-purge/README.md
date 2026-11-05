@@ -16,7 +16,7 @@ DSH 自带的「归档」只是把会话从侧边栏隐藏，磁盘上的日志�
   - 工作区记账（公开 API `Workspace.detachSession`）
   - 全局归档集合（`workspaceRegistry.unarchiveSession`）
 - **子代理级联**：仅删除 `origin: 'subagent'` 且挂在被删会话下的子会话日志；普通 fork 出来的会话不受影响。
-- **安全护栏**：运行中的会话直接拒绝；`sessionId` 白名单正则；删除路径必须落在 `sessions/` 与投影缓存根内；POST 校验同源；删除前二次确认并显示条数与体积。
+- **安全护栏**：运行中的会话先「释放」再删除（停 agent → flush → detach live 条目），释放不掉就拒绝；`sessionId` 白名单正则；删除路径必须落在 `sessions/` 与投影缓存根内；POST 校验同源；删除前二次确认并显示条数与体积。
 
 ## 安装
 
@@ -55,7 +55,7 @@ https://github.com/5D-artist/dsh-archived-purge
 
 ## 安全设计
 
-- **运行中拒绝**：`ctx.sessions` / `ctx.agents` 里还活着的会话不会被删。
+- **运行中先释放再删**：`ctx.sessions` / `ctx.agents` 里还活着的条目会先 stop → flush → detach。释放失败（例如被别的窗口占住）则拒绝删除——否则存储层会在删除后把目录重建出来。
 - **入口校验**：`sessionId` 必须匹配 `^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$`；请求必须同源、`application/json`、体大小受限。
 - **路径边界**：待删路径必须 `path.relative` 落在 `sessions/` 或投影缓存根内。
 - **不重写注册表**：归档集合与工作区记账都通过公开 service 方法修改，避免与运行中的注册表写入竞争。
@@ -81,7 +81,7 @@ https://github.com/5D-artist/dsh-archived-purge
 node --test test/host.test.mjs
 ```
 
-测试在临时目录构造完整存储结构，覆盖列表、删除、运行中拒绝、非法 ID、记账已从投影消失、subagent 级联，不触碰真实数据。
+测试在临时目录构造完整存储结构，覆盖列表、删除、运行中释放后删除、释放失败拒绝、非法 ID、记账已从投影消失、subagent 级联，不触碰真实数据。
 
 ```
 index.js            Host 半：列表 / 删除 / 路由 / 边界校验
@@ -93,7 +93,7 @@ test/host.test.mjs  Host 单测
 
 ## 已知限制
 
-- 只能删除归档集合中的会话；活动会话请先归档。
+- 只能删除归档集合中的会话；未归档 id 一律拒绝。运行中的会话会先停止/释放再删除。
 - 附件不随会话清理（内容寻址，可能共享）。
 - 归档时间不是 DSH 的持久字段，列表用最后活动时间排序。
 
@@ -148,5 +148,7 @@ MIT © 2026 5D-artist
 - **来源**：https://github.com/5D-artist/dsh-archived-purge ，commit `6c484e69`（2026-11-04，MIT）。本目录是 vendored 副本，改动请先在这里改并在 `CHANGELOG.md` 记一笔。
 - **为什么选它**：它删除归档标记走宿主公开 API `workspaceRegistry.unarchiveSession()`、删除工作区记账走 `Workspace.detachSession()`，不是直接改写 `workspace.json`——这正是 2026-11-03 事故的根因（外部改盘被宿主内存快照回写，13 个已删会话的归档标记「复活」）。
 - **验证记录（真机 2026-11-05 20:45–20:52，DSH 0.2.1-rc.5）**：通过插件自身 `POST /plugins/archived-purge/delete` 删除 18 个归档会话，结果 `deleted: 21`（含 4 个 `origin: subagent` 子会话级联），`removedBytes: 9,467,342`，`failed: 0`；复核 `workspace.json` → `archivedSessionIds` 18 → 0，5 个有数据的会话目录已不存在，投影缓存单文件 0 残留。删除前备份在 `D:\AI\dsh-data\backup\session-purge-20261105-2045`（7.55 MB）。
-- **测试**：`_selftest/tests/archived-purge.test.mjs`（映射测试，7 条）与上游 `test/host.test.mjs` 一致。
-- **已知边界**：只处理归档集内的会话（未归档 id 一律拒绝）；不清理 `storages/session_projcache.json` 聚合表与 `storages/message_feedback.json`（上游未做，删除的 id 由宿主后续重建时自然消失）；来源为子代理（`origin: subagent`）的会话只在其父会话被删时级联清理。
+- **测试**：`_selftest/tests/archived-purge.test.mjs`（映射测试，8 条）与本目录 `test/host.test.mjs` 一致。
+- **已知边界**：只处理归档集内的会话（未归档 id 一律拒绝）；运行中的会话先释放再删除，释放不掉则拒绝；不清理 `storages/session_projcache.json` 聚合表与 `storages/message_feedback.json`（上游未做，删除的 id 由宿主后续重建时自然消失）；来源为子代理（`origin: subagent`）的会话只在其父会话被删时级联清理。
+
+- **第二批（2026-11-05 22:45，重启后的实例）**：用户在 GUI 归档了 5 条，其中 3 条处于「已挂载」状态被旧逻辑拒绝（`session-active`）。本副本加入 **release-then-delete**（借 liuyu-f/dsh-plugin-session-cascade-delete 的 MIT 思路：停 agent → flush → detach `sessions.store` / `agents.store` 条目 → 再删盘），复测：4 条全部删除成功（3 条 `released: true`），`archivedSessionIds` 归零，会话目录 8 秒后仍未重建；备份 `D:\AI\dsh-data\backup\session-purge-20261105-2245`（0.63 MB）。
