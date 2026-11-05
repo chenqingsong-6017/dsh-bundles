@@ -154,7 +154,7 @@ MIT © 2026 5D-artist
 
 - **第二批（2026-11-05 22:45，重启后的实例）**：用户在 GUI 归档了 5 条，其中 3 条处于「已挂载」状态被旧逻辑拒绝（`session-active`）。本副本加入 **release-then-delete**（借 liuyu-f/dsh-plugin-session-cascade-delete 的 MIT 思路：停 agent → flush → detach `sessions.store` / `agents.store` 条目 → 再删盘），复测：4 条全部删除成功（3 条 `released: true`），`archivedSessionIds` 归零，会话目录 8 秒后仍未重建；不留备份（用户 2026-11-05 明示：不备份、不走删除三查）。
 
-- **0.2.2-rc.1 复验（2026-11-05 23:40–23:58，升级后）**：这一轮**没有跑通删除链路**，逐项如实记：
+- **0.2.2-rc.1 复验（2026-11-05 23:40–23:43，升级后）**：这一轮**没有跑通删除链路**，逐项如实记：
   - ✅ Host 单测 `node --test test/host.test.mjs` **11/11 PASS**（含 release-then-delete、释放失败拒绝、subagent 级联、非法 id、announce 双拼写）。
   - ✅ 真机 `GET http://127.0.0.1:63081/plugins/archived-purge/state` 返回真实数据（`archivedCount: 0`，含 `items/totalBytes/generatedAt`）→ 说明 `webServer` / `workspaceRegistry` / `sessions` / `sessionPersistence` 四个依赖在 rc.1 上注入正常、路由存活。
   - ✅ rc.1 安装包内仍存在 `workspace/archiveSession` 与 `workspace/unarchiveSession` RPC 定义（`node _ops/asar.mjs grep archiveSession` 命中 `dsh-api-remotes/lib/client.js`）——插件删归档走的正是这两个。
