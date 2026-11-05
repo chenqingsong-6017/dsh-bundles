@@ -3,6 +3,20 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.2.3 — 2026-11-05
+
+标题：「拆单文件巨无霸」——把 5861 行的 `index.js` 按职责拆成 `lib/` 九个模块，工具名/参数/返回结构一行未变，检索与写入行为零改动。起因：体检 L4「巨无霸」长期 warn（>3000 行评估线），且该文件 45 天内被改 37 次，每次改动都落在一个 4032 行的 `apply` 闭包里。
+
+### Changed（结构，无行为变化）
+- 顶层辅助函数整体迁出：`lib/constants.js`（调参与存储常量）、`lib/util.js`（fail/text）、`lib/entry.js`（时效/重要性/作用域）、`lib/text.js`（分词与相似度）、`lib/score.js`（BM25 + 覆盖率 + 门槛）、`lib/render.js`（注入渲染）、`lib/schema.js`（规范化/迁移/卡片）、`lib/candidates.js`（候选抽取）、`lib/store-snapshot.js`（只读快照）。
+- `index.js` 只保留 `apply` 组装层，并把原公共导出逐个 re-export，外部导入面（测试/其它插件）保持完全一致。
+- `zh-words.txt` 随分词模块迁到 `lib/`，`package.json` 的 `files` 补 `lib/`。
+- `codeFingerprint` 提到 `4.2.3-lib-split`（真机验证 HMR 是否已换新代码的观测点）。
+
+### 测试
+- 拆分前后同一套回归：`memory.test.mjs` 133、`memory-oracle` 12、`memory-schema` 7、`memory-sqlite` 10、`memory-v42` 6 全过；`npm run check` 三道门通过。
+- 真机验收：重组后 `memory_status` 返回新指纹 `4.2.3-lib-split`，`memory_list` 计数与拆分前一致（115 条 / 生效 93 / 11185 字符）。
+
 ## v4.2.2 — 2026-11-03
 
 标题：「修全局审计 H2 + B4」——SQLite 多进程并发写不再静默丢条目；`memory_remove` 加 `confirm:true` 门槛。新增错误码 `MEMORY_ID_CONFLICT`；`memory_remove` 新增可选参数 `confirm`、返回值新增预览字段。证据：`_reports/global-audit-memory-2026-11-03.md` §H2/§M5、`_reports/fix-backlog-2026-11-03.md` A1/B4。
