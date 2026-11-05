@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.0.0-vendored.3 (2026-11-05 23:43)
+## 1.0.0-vendored.3 (2026-11-06 00:20)
 
-- 仅验证记录，无代码改动：DSH 升级到 **0.2.2-rc.1** 后的复验结论写进 README 文末——单测 11/11、真机 `/state` 与 rc.1 的 archive/unarchive RPC 存在三项✅；**真机删除未执行**（归档集为空 + 当轮无法驱动 GUI），不记成已复验。
+- 仅验证记录，无代码改动：DSH 升级到 **0.2.2-rc.1** 后**全链路复验通过**——单测 11/11、`/state` 真机可用、rc.1 的 `workspace/archiveSession`+`unarchiveSession` 存在、**真机删除成功**（`deleted:1 / released:true / failed:0 / removedBytes:6034`，目录与投影缓存消失、10 秒不重建、归档集归零）。方法与临时验证路由的撤销证据见 README 文末。
 
 ## 1.0.0-vendored.2 (2026-11-05 23:10)
 

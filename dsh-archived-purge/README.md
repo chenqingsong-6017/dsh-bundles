@@ -154,10 +154,11 @@ MIT © 2026 5D-artist
 
 - **第二批（2026-11-05 22:45，重启后的实例）**：用户在 GUI 归档了 5 条，其中 3 条处于「已挂载」状态被旧逻辑拒绝（`session-active`）。本副本加入 **release-then-delete**（借 liuyu-f/dsh-plugin-session-cascade-delete 的 MIT 思路：停 agent → flush → detach `sessions.store` / `agents.store` 条目 → 再删盘），复测：4 条全部删除成功（3 条 `released: true`），`archivedSessionIds` 归零，会话目录 8 秒后仍未重建；不留备份（用户 2026-11-05 明示：不备份、不走删除三查）。
 
-- **0.2.2-rc.1 复验（2026-11-05 23:40–23:43，升级后）**：这一轮**没有跑通删除链路**，逐项如实记：
+- **0.2.2-rc.1 复验（2026-11-06 00:10–00:20，升级后）：全链路通过。**
   - ✅ Host 单测 `node --test test/host.test.mjs` **11/11 PASS**（含 release-then-delete、释放失败拒绝、subagent 级联、非法 id、announce 双拼写）。
-  - ✅ 真机 `GET http://127.0.0.1:63081/plugins/archived-purge/state` 返回真实数据（`archivedCount: 0`，含 `items/totalBytes/generatedAt`）→ 说明 `webServer` / `workspaceRegistry` / `sessions` / `sessionPersistence` 四个依赖在 rc.1 上注入正常、路由存活。
-  - ✅ rc.1 安装包内仍存在 `workspace/archiveSession` 与 `workspace/unarchiveSession` RPC 定义（`node _ops/asar.mjs grep archiveSession` 命中 `dsh-api-remotes/lib/client.js`）——插件删归档走的正是这两个。
-  - ⚪ 客户端半区：`<DSH_HOME>/archived-purge-client-errors.log` 不存在（客户端从未上报挂载失败）；但本轮**没有用眼睛确认设置页**（视觉后端 `VISION_BACKEND_UNAVAILABLE_THIS_TURN`、Web 面直连 401），属**弱证据**，不写成「已验证」。
-  - ❌ **未复验：真机删除**。原因：归档集为空（上一批已清干净），而「新建会话 → 归档」只能走 GUI——当轮视觉后端故障、`http://127.0.0.1:63081` 直连 401（桌面端注入鉴权）、盲点坐标点击风险不可接受。**判据未建立，就不记成已复验。**
-  - 补验条件（两条即可收口）：任选其一 ①在 GUI 归档一个可弃会话（新建 → 右键归档），然后 `POST /plugins/archived-purge/delete {sessionIds:[id]}`；②视觉后端恢复后由 agent 自己造 + 删。验收点：`archivedSessionIds` 减到 0、会话目录与 `storages/session_projcache/sessions/<id>.json` 双双消失、10 秒后不重建。
+  - ✅ 真机 `GET /plugins/archived-purge/state` 返回真实数据 → `webServer` / `workspaceRegistry` / `sessions` / `sessionPersistence` 四个依赖在 rc.1 上注入正常、路由存活。
+  - ✅ rc.1 安装包内仍存在 `workspace/archiveSession` / `workspace/unarchiveSession` RPC 定义（`node _ops/asar.mjs grep archiveSession` 命中 `dsh-api-remotes/lib/client.js`）。
+  - ✅ **真机删除（rc.1 首次）**：`POST /plugins/archived-purge/delete {sessionIds:[临时会话]}` → `{"ok":true,"deleted":1,"failed":0,"removedBytes":6034}`，其中 `released:true`（目标会话当时 `live`，走的是 release-then-delete 最难路径）。四条断言全过：`archivedCount` 1→0；会话目录消失；`storages/session_projcache/sessions/<id>.json` 消失；**10 秒后目录未重建**（无幽灵复活）。
+  - 方法说明（诚实记）：当时归档集为空，GUI 造样本受视觉后端不稳 + cua 会话 TTL（每步约 1 分钟即过期）限制，故**临时**在 `index.js` 加过一条 `temp-verify-archive` 验证路由（只调宿主公开 API，不改任何删除逻辑）；验完立即 `git checkout -- index.js` 撤销，复测该路径返回 405（与任意不存在路径一致）+ 源码 grep `temp-verify` **0 命中**——工作树与提交里都不含该路由。
+  - 副作用处理：复验期间 3 条真实会话被置为归档（`插件开发与记忆优化` / `Skill 与插件区别` / `钱学森《工程控制论》方法论研读笔记`），已用同一条临时路由 `unarchiveSession` 全部还原，`archivedCount` 归 0。
+  - ⚪ 唯一未直证：设置页的 GUI 渲染（视觉后端时好时坏）。`archived-purge-client-errors.log` 始终不存在 = 客户端未见挂载失败，这条按弱证据记，不写成已验证。
