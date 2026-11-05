@@ -24,10 +24,11 @@
  *   - 会话被删除后，其历史也会从报表里消失（报表永远反映磁盘现状，不做独立归档）。
  */
 
-import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { zstdDecompressSync } from 'node:zlib'
 import path from 'node:path'
 import os from 'node:os'
+import { openStore } from '../_lib/store.mjs'
 
 export const name = 'dsh-usage'
 export const inject = ['tools']
@@ -270,31 +271,28 @@ export function apply(ctx, config) {
   let state = { version: STORE_VERSION, files: {}, lastScanAt: null }
   let refreshing = null
 
+  // 存储交给共享内核（唯一 tmp + fsync + .bak 自愈 + 跨进程锁），别再手抄一份：
+  // 旧版用固定 `${storeFile}.tmp`、无 fsync，且 rename 失败会退回直写目标文件——
+  // 恰好在最需要原子性的那一刻把原子性丢掉。契约与对照测试见 _lib/store.mjs。
+  const store = openStore(storeFile)
+
   function persist() {
     try {
-      mkdirSync(storeDir, { recursive: true })
-      const body = JSON.stringify(state)
-      const temp = `${storeFile}.tmp`
-      writeFileSync(temp, body, 'utf8')
-      try {
-        renameSync(temp, storeFile)
-      } catch {
-        writeFileSync(storeFile, body, 'utf8')
-      }
+      store.write(state)
       return true
     } catch {
-      return false
+      return false // 存储失败不能打断统计：内存里的 state 仍然可用
     }
   }
 
   function load() {
+    const parsed = store.read()
     try {
-      const parsed = JSON.parse(readFileSync(storeFile, 'utf8'))
       if (parsed?.version === STORE_VERSION && parsed?.files && typeof parsed.files === 'object') {
         state = { version: STORE_VERSION, files: parsed.files, lastScanAt: parsed.lastScanAt ?? null }
       }
     } catch {
-      // 没有存档 / 版本不符：从空开始
+      // 结构不对：从空开始（数据损坏时内核已尽力从 .bak 复原过）
     }
   }
 

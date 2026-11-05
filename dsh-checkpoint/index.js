@@ -28,9 +28,10 @@
  *     出来的路径可能漏抓。
  */
 
-import { promises as fsp, writeFileSync, readFileSync, renameSync, mkdirSync, existsSync, unlinkSync } from 'node:fs'
+import { promises as fsp, mkdirSync, existsSync, unlinkSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { atomicWriteText, openStore } from '../_lib/store.mjs'
 
 export const name = 'dsh-checkpoint'
 export const inject = ['tools', 'fs']
@@ -259,6 +260,9 @@ export function apply(ctx, config) {
   const sandboxPolicy = ctx.get('sandboxPolicy')
   const sessions = ctx.get('sessions')
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
+  // 存档读写交给共享内核（_lib/store.mjs）：唯一 tmp + fsync + .bak 自愈 + fail-closed。
+  // 旧实现用固定 `${storeFile}.tmp`，且 rename 失败会退回直写目标文件——那一刻原子性就没了。
+  const store = openStore(storeFile)
 
   /**
    * 内置红线目录（2026-11-03 全局审计 C1）：**永不采集、永不回滚**，即使传 confirm: true 也拒绝。
@@ -382,16 +386,8 @@ export function apply(ctx, config) {
 
   function persistNow() {
     try {
-      mkdirSync(storeDir, { recursive: true })
-      const body = serialize()
-      const temp = `${storeFile}.tmp`
-      writeFileSync(temp, body, 'utf8')
-      // 原子替换：先写临时文件再 rename，避免半截 JSON
-      try {
-        renameSync(temp, storeFile)
-      } catch (error) {
-        writeFileSync(storeFile, body, 'utf8')
-      }
+      // 内核负责：目录创建、唯一临时文件、fsync、上一版 .bak、失败时 fail-closed。
+      atomicWriteText(storeFile, serialize())
     } catch (error) {
       stats.lastSkip = `persist: ${error instanceof Error ? error.message : String(error)}`
     }
@@ -408,8 +404,8 @@ export function apply(ctx, config) {
 
   function loadPersisted() {
     try {
-      const raw = readFileSync(storeFile, 'utf8')
-      const parsed = JSON.parse(raw)
+      // 内核读：主文件坏了会自动从 .bak 复原，不再「坏一次 = 快照全丢」。
+      const parsed = store.read()
       if (!parsed || !Array.isArray(parsed.records)) return
       if (Array.isArray(parsed.marks)) {
         for (const m of parsed.marks) {

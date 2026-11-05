@@ -12,8 +12,9 @@
  * ② fail-safe：读写失败只记 lastError，不抛；
  * ③ 不替你做判断：只做「缺什么」的机械检查，结论对不对仍由人/agent 负责。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
+import { atomicWriteText } from '../_lib/store.mjs'
 
 export const name = 'dsh-research'
 export const inject = ['tools']
@@ -260,15 +261,12 @@ export function apply(ctx, config) {
 
   function saveStore(store) {
     try {
-      mkdirSync(storeDir, { recursive: true })
       const payload = JSON.stringify({ version: SCHEMA_VERSION, tasks: store.tasks })
-      const tmp = storeFile() + '.tmp-' + process.pid
-      writeFileSync(tmp, payload, 'utf8')
-      renameSync(tmp, storeFile())
+      // 共享内核：唯一 tmp + fsync + .bak 自愈 + fail-closed（改名失败就抛，不直写）。
+      atomicWriteText(storeFile(), payload)
       return true
     } catch (error) {
       note(error)
-      try { unlinkSync(storeFile() + '.tmp-' + process.pid) } catch (ignored) { }
       return false
     }
   }
@@ -567,10 +565,8 @@ export function apply(ctx, config) {
                 '相对路径先按 workspaceDir 解析；确实要写到外部目录，请显式传 allowOutsideWorkspace:true。',
             }
           }
-          mkdirSync(path.dirname(outPath), { recursive: true })
-          const tmp = outPath + '.tmp-' + process.pid
-          writeFileSync(tmp, markdown + '\n', 'utf8')
-          renameSync(tmp, outPath)
+          // 报告是给用户的成品文件：走共享内核的原子写，但不留 .bak（不在工作区里凭空多文件）。
+          atomicWriteText(outPath, markdown + '\n', { backup: false })
           let closed = false
           if (args?.close === true) { task.status = 'closed'; closed = saveStore(store) }
           return { ok: true, code: '', id: task.id, path: outPath, bytes: Buffer.byteLength(markdown, 'utf8'), evidence: lint.total - lint.missingEvidence, inferred: lint.inferred, closed, lastError }
