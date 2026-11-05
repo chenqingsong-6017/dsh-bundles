@@ -204,6 +204,44 @@ test('refuses a live session it cannot release and leaves its files alone', asyn
   assert.ok((await fsp.stat(alphaDir)).isDirectory());
 });
 
+test('delete announces api-session/removed for both id spellings', async () => {
+  const { home, project, cache } = await makeHome();
+  await makeSession(project, 'session-alpha', 64);
+  await makeCache(cache, 'session-alpha', 'Alpha');
+  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+  const events = [];
+  const handlers = createHandlers({
+    home,
+    sessions: { get: () => undefined },
+    agents: { list: () => [], store: new Map() },
+    workspaceRegistry: makeRegistry(['session-alpha']).registry,
+    sessionPersistence: undefined,
+    emit: (event, payload) => events.push([event, payload]),
+  });
+  const result = await handlers.remove(['session-alpha']);
+  assert.equal(result.ok, true);
+  const removed = events.filter(([event]) => event === 'api-session/removed').map(([, id]) => id);
+  assert.ok(removed.includes('session-alpha'), 'canonical spelling announced');
+  assert.ok(removed.includes('alpha'), 'raw-uuid spelling announced');
+});
+
+test('announce replays stale client removals', async () => {
+  const { home } = await makeHome();
+  const events = [];
+  const handlers = createHandlers({
+    home,
+    sessions: { get: () => undefined },
+    agents: { list: () => [], store: new Map() },
+    workspaceRegistry: makeRegistry([]).registry,
+    sessionPersistence: undefined,
+    emit: (event, payload) => events.push([event, payload]),
+  });
+  const result = handlers.announce(['session-stale', 'bad/id']);
+  assert.equal(result.ok, true);
+  assert.equal(result.announced, 2, 'one valid id announces both spellings; invalid ids are skipped');
+  assert.deepEqual(events.map(([, id]) => id).sort(), ['session-stale', 'stale'].sort());
+});
+
 test('rejects malformed ids and non-archived ids', async () => {
   const { home, project } = await makeHome();
   await makeSession(project, 'session-alpha', 32);

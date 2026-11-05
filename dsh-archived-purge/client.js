@@ -270,6 +270,15 @@ window.__ModuleLoader__.load({
               text: `${t('noticeDeleted')} ${result.deleted} ${t('countUnit')} · ${t('noticeFreed')} ${formatBytes(result.removedBytes)}`,
             });
             setSelected(new Set());
+            // Rebaseline the client session list: the Host deletes out of band,
+            // and a row that keeps its old workspace position would otherwise
+            // resurface under "未分组".
+            try {
+              const sessions = ctx.get('sessions');
+              if (sessions && typeof sessions.refresh === 'function') await sessions.refresh();
+            } catch {
+              /* the next page load rebaselines anyway */
+            }
             await load();
           } catch (cause) {
             const payload = cause?.payload;

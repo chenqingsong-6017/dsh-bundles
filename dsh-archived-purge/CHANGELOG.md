@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.0-vendored.2 (2026-11-05 23:10)
+
+- **修「删了还在 / 回到未分组」**：宿主删除后显式 `emit('api-session/removed')`（两种 id 拼写），client 删除成功后调用 `sessions.refresh()` 重拉基线；新增 `POST /plugins/archived-purge/announce` 用于补播已删 id（清理客户端陈旧行）。
+- 测试：11 条（新增 announce/双拼写两条）。
+
 ## 1.0.0-vendored.1 (2026-11-05 22:45)
 
 - **release-then-delete**：归档会话处于「已挂载 / 运行中」时不再直接拒绝，而是先停 agent（cancel + 15s 有界等待）→ flush store → detach `sessions.store` / `agents.store` 条目，再删盘；释放不掉仍拒绝（避免存储层删后重建目录）。

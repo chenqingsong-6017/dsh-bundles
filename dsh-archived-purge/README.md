@@ -73,6 +73,7 @@ https://github.com/5D-artist/dsh-archived-purge
 |---|---|---|
 | GET | `/plugins/archived-purge/state` | 归档列表（标题、工作区、体积、最后活动、是否存在、是否运行中） |
 | POST | `/plugins/archived-purge/delete` | `{ "sessionIds": [...] }` 永久删除 |
+| POST | `/plugins/archived-purge/announce` | 补播 `api-session/removed`（清理客户端陈旧行，body `{sessionIds}`） |
 | POST | `/plugins/archived-purge/client-error` | 客户端挂载失败上报，写入 `<DSH_HOME>/archived-purge-client-errors.log` |
 
 ## 开发

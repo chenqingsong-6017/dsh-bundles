@@ -177,7 +177,7 @@ async function readCacheDoc(cacheDir, sessionId) {
 }
 
 export function createHandlers(deps) {
-  const { home, sessions, agents, workspaceRegistry, sessionPersistence } = deps;
+  const { home, sessions, agents, workspaceRegistry, sessionPersistence, emit } = deps;
   const sessionsRoot = path.join(home, 'sessions');
   const cacheRoot = path.join(home, 'storages', 'session_projcache', 'sessions');
 
@@ -517,6 +517,21 @@ export function createHandlers(deps) {
     }
     const deleted = results.filter((item) => item.ok);
     const failed = results.filter((item) => !item.ok);
+    // Tell every connected client to drop the row now. The disposed live
+    // session already announced its canonical id; the other spelling (and a
+    // composition that missed the detach) would otherwise leave a stale row
+    // behind — which the UI then renders under "未分组".
+    if (typeof emit === 'function') {
+      for (const item of deleted) {
+        for (const variant of idVariants(item.id)) {
+          try {
+            emit('api-session/removed', variant);
+          } catch {
+            /* a missing event bus must not fail the deletion */
+          }
+        }
+      }
+    }
     return {
       ok: failed.length === 0,
       deleted: deleted.length,
@@ -528,7 +543,37 @@ export function createHandlers(deps) {
     };
   }
 
-  return { state, remove, sessionsRoot, cacheRoot };
+  /**
+   * Re-announce removals for ids already deleted out of band: a client that
+   * missed the original event keeps a stale row (rendered under "未分组").
+   * Emitting is idempotent on the client side.
+   */
+  function announce(requested) {
+    if (!Array.isArray(requested) || requested.length === 0) {
+      return { ok: false, code: 'invalid-request', message: 'sessionIds 不能为空' };
+    }
+    if (requested.length > MAX_IDS) {
+      return { ok: false, code: 'invalid-request', message: `一次最多通告 ${MAX_IDS} 个会话` };
+    }
+    if (typeof emit !== 'function') {
+      return { ok: false, code: 'no-event-bus', message: '宿主没有可用的 ctx.emit' };
+    }
+    let announced = 0;
+    for (const raw of requested) {
+      if (typeof raw !== 'string' || !ID_RE.test(raw)) continue;
+      for (const variant of idVariants(raw)) {
+        try {
+          emit('api-session/removed', variant);
+          announced += 1;
+        } catch {
+          /* skip an id the bus rejects */
+        }
+      }
+    }
+    return { ok: true, announced };
+  }
+
+  return { state, remove, announce, sessionsRoot, cacheRoot };
 }
 
 function readBody(req) {
@@ -577,12 +622,20 @@ export function apply(ctx) {
   } catch {
     agents = undefined;
   }
+  const emit = (event, payload) => {
+    try {
+      ctx.emit(event, payload);
+    } catch {
+      /* event bus unavailable */
+    }
+  };
   const handlers = createHandlers({
     home,
     sessions: ctx.sessions,
     agents,
     workspaceRegistry: ctx.workspaceRegistry,
     sessionPersistence: ctx.sessionPersistence,
+    emit,
   });
 
   ctx.effect(() => ctx.webServer.register({
@@ -641,6 +694,28 @@ export function apply(ctx) {
       }
     },
   }));
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: `${ROUTE}/announce`,
+    async handler(req, res) {
+      if (req.method !== 'POST') {
+        send(res, 405, { ok: false, code: 'method-not-allowed' });
+        return;
+      }
+      if (!sameOrigin(req)) {
+        send(res, 403, { ok: false, code: 'foreign-origin' });
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req));
+        const result = handlers.announce(body?.sessionIds);
+        send(res, result.ok ? 200 : 400, result);
+      } catch (error) {
+        send(res, 400, { ok: false, code: 'invalid-request', message: formatError(error) });
+      }
+    },
+  }));
+
 
   // Browser-side mount diagnostics: the Client half reports a failed apply here
   // so a future slot/API change leaves a readable trace instead of only a
