@@ -2719,7 +2719,9 @@ export function apply(ctx, config) {
         }
         const insert = db.prepare('INSERT INTO entries(id, payload, updated_at, seq, tokens, units, sort_len, unit_len) VALUES(?,?,?,?,?,?,?,?)')
         const update = db.prepare('UPDATE entries SET payload = ?, updated_at = ?, tokens = ?, units = ?, sort_len = ?, unit_len = ? WHERE id = ?')
-        let nextSeq = Number(metaGet('next_seq') ?? state.entries.length)
+        // v4.2.2（H2⑤）：next_seq 必须在写事务内直读磁盘——旧实现读内存缓存，两进程并发写时
+        // 各自拿到相同的起始 seq，seq 重复发号、next_seq 落后于行数（审计 H2 实测：16 行、next_seq=15）。
+        let nextSeq = Number(metaGetOn(db, 'next_seq') ?? state.entries.length)
         for (const [id, payload] of upserts) {
           const entry = state.entries.find((item) => item.id === id)
           if (entry === undefined) continue
@@ -2759,7 +2761,9 @@ export function apply(ctx, config) {
         state.nextId = Math.max(state.nextId, storedNextId)
         metaSet('next_id', state.nextId)
         metaSet('data_version', state.version)
-        const writeSeq = Number(metaGet('write_seq') ?? 0) + 1
+        // v4.2.2（H2⑤）：write_seq 同样在事务内直读磁盘再 +1。旧实现读缓存 +1 是 TOCTOU：
+        // 两进程可写相同值，单调性丢失后别的进程 refresh 判重失效（与 next_seq 同一根因）。
+        const writeSeq = Number(metaGetOn(db, 'write_seq') ?? 0) + 1
         metaSet('write_seq', writeSeq)
         db.exec('COMMIT')
         for (const id of freshLocalIds) localNewIds.delete(id)
