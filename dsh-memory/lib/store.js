@@ -12,6 +12,7 @@ import { BACKUP_KEEP, BM25_ALIAS_WEIGHT, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDI
 import { curationDecision, detectScope, effectiveImportance, eliminationSignal, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
 import { canonicalJson, migrateState, normalizeEntry, schemaTooNewError } from './schema.js'
 import { fail, text } from './util.js'
+import { atomicWriteText } from '../../_lib/store.mjs'
 import { contentUnitsOf, expandQuery, textSimilarity, tokenize } from './text.js'
 import { bm25Doc } from './score.js'
 import { renderMemory } from './render.js'
@@ -103,37 +104,20 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
 
   function saveAliases() {
     try {
-      mkdirSync(storeDir, { recursive: true })
-      const body = JSON.stringify(
-        {
-          version: 1,
-          note: '别名旁路文件：改这里不会动 memory.json；插件启动时按 id 合并进条目，用于检索的跨词面桥接。',
-          aliases: aliasesSidecar,
-        },
-        null,
-        2,
+      // 别名旁路是「防丢副本」：主源是条目自身，所以不留 .bak。
+      atomicWriteText(
+        aliasesFile,
+        JSON.stringify(
+          {
+            version: 1,
+            note: '别名旁路文件：改这里不会动 memory.json；插件启动时按 id 合并进条目，用于检索的跨词面桥接。',
+            aliases: aliasesSidecar,
+          },
+          null,
+          2,
+        ),
+        { backup: false },
       )
-      // v3.10（B17 同款）：唯一临时名 + 重试 rename，不再「失败就直接覆盖」（非原子，崩了留半截）。
-      tmpCounter += 1
-      const temp = `${aliasesFile}.tmp-${process.pid}-${tmpCounter}`
-      writeFileSync(temp, body, 'utf8')
-      let renamed = false
-      for (let attempt = 0; attempt < 3 && !renamed; attempt += 1) {
-        try {
-          renameSync(temp, aliasesFile)
-          renamed = true
-        } catch (error) {
-          // 重试
-        }
-      }
-      if (!renamed) {
-        try {
-          unlinkSync(temp)
-        } catch (error) {
-          // 留着下次覆盖
-        }
-        return false
-      }
       return true
     } catch (error) {
       return false
@@ -1235,15 +1219,8 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
 
   function persistCandidates() {
     try {
-      mkdirSync(storeDir, { recursive: true })
-      const body = JSON.stringify(candidates, null, 2)
-      const temp = `${candidateFile}.tmp`
-      writeFileSync(temp, body, 'utf8')
-      try {
-        renameSync(temp, candidateFile)
-      } catch (error) {
-        writeFileSync(candidateFile, body, 'utf8')
-      }
+      // 候选池是派生数据（可从条目重建），用内核但不留 .bak：避免数据目录里多一份镜像。
+      atomicWriteText(candidateFile, JSON.stringify(candidates, null, 2), { backup: false })
       return true
     } catch (error) {
       return false

@@ -2,8 +2,9 @@
 // 循环 import 说明：本文件从 ../index.js 反向 import measureDir/detectLocks/readText。
 //   这三个都是 function 声明（ESM 提升），且只在工具运行时被调用、不在本模块求值时调用，
 //   故循环安全。未来若要消除循环，把这三者抽到 lib/fs-tools.js 即可。
-import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
+import { atomicWriteText as atomicWriteStore } from '../../_lib/store.mjs'
 import { text, fmtSize, fmtCount, pad2 } from './format.js'
 import { norm, isUnder, lockHint, isProtected } from './path-safety.js'
 import { measureDir, readText } from '../index.js'
@@ -266,21 +267,13 @@ export function readInventory(store) {
   return { file: jsonFile, existed: true, data: { version: INVENTORY_VERSION, nextId, entries } }
 }
 
-/** 原子写：同目录临时文件 + rename，写一半断电也不会留下半截 JSON */
+/**
+ * 原子写：交给共享内核 `_lib/store.mjs`（唯一临时名 + fsync + fail-closed + 机器可读错误码）。
+ * 这里写的是台账 json/md（给人看的清单），所以**不留 .bak**：台账目录里凭空多文件是污染。
+ * 旧实现在 rename 失败时只清理临时文件并原样抛错，也不 fsync——内核这两点都补齐了。
+ */
 export function atomicWriteText(file, content) {
-  mkdirSync(path.dirname(file), { recursive: true })
-  const temp = file + '.tmp-' + process.pid + '-' + Date.now()
-  try {
-    writeFileSync(temp, content, 'utf8')
-    renameSync(temp, file)
-  } catch (error) {
-    try {
-      unlinkSync(temp)
-    } catch (ignored) {
-      /* 临时文件删不掉不影响结果 */
-    }
-    throw error
-  }
+  atomicWriteStore(file, content, { backup: false })
 }
 
 export function writeInventory(store, data) {

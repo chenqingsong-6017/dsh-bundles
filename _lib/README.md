@@ -46,20 +46,26 @@ atomicWriteText(outPath, markdown, { backup: false })
   自愈收益低于中断代价，所以超过上限就跳过备份。
 - **不给用户文件留 `.bak`**：用户目录里凭空多文件是污染，用 `{ backup: false }`。
 
-## 迁移进度（2026-11-05）
+## 迁移进度（2026-11-06 收口）
 
-已切到内核：
+5 处手写原子写全部有结论：
 
-- `dsh-usage`（`persist` / `load`）
-- `dsh-checkpoint`（`persistNow` / `loadPersisted`）
-- `dsh-research`（`saveStore` + 报告文件写）
+| 位置 | 状态 |
+|---|---|
+| `dsh-usage` 的 `persist` / `load` | 已接入内核 |
+| `dsh-checkpoint` 的 `persistNow` / `loadPersisted` | 已接入内核 |
+| `dsh-research` 的 `saveStore` + 报告文件写 | 已接入内核（报告用 `backup: false`） |
+| `dsh-butler-tidy` 的 `lib/inventory.js` `atomicWriteText` | 已接入内核（`backup: false`，台账是给人看的清单） |
+| `dsh-memory` 的候选池 `persistCandidates` / 别名旁路 `saveAliases` | 已接入内核（`backup: false`，都是派生数据） |
+| `dsh-memory` 主库 `persist` + `archive.json` | **保留自研**，理由见下 |
 
-待切（各自有真实差异，不是偷懒）：
+**为什么 memory 主库不切内核**：它本来就比内核强——多文件事务（先写归档、再写主库，失败整体回滚）、
+跨进程锁、rename 重试、损坏库存隔离（改名成 corrupt 副本而不是覆盖）、每日备份、SQLite 后端。
+硬切过来是**降级**，所以只把它两处漏网的派生数据写手收进内核。
 
-- `dsh-butler-tidy`（`lib/inventory.js` 的 `atomicWriteText`）：它写的是**用户目录里的台账/清单**，
-  切过去必须显式 `backup: false`，且要连同「整理操作是否允许留临时文件」一起复核。
-- `dsh-memory`（`lib/store.js`）：一份内存状态要同时落 `memory.json` + 别名旁路 + 历史流水，
-  是多文件事务，不能按单文件原子写一刀切；要切得连 `store-snapshot.js` 一起设计。
+这也修正了本项目最初的口径：不是「5 份都得用同一个函数」，而是**同一件事只能有一种实现，
+且每一处要么用内核，要么能证明自己比内核强**。memory 主库属于后者。
+
 
 ## 测试
 
