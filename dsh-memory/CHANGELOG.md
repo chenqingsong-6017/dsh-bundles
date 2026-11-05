@@ -3,6 +3,21 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.3.0 — 2026-11-05
+
+标题：「把 apply 拆成组装层」——存储层（状态 + 双后端持久化 + 备份 + 别名旁路 + 候选池 + 归档）搬进 `lib/store.js` 的 `createStore()` 工厂，`apply` 只负责组装与工具注册。工具名/参数/返回结构、检索与写入行为一行未变。承接同日的 v4.2.3（顶层辅助函数拆出 lib 九模块）。
+
+### Changed（结构，无行为变化）
+- 新增 `lib/store.js`（约 1900 行）：`createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots, relevanceFloor })` 返回存储入口——`load/persist/refreshBeforeWrite/newEntryId/makeRoom/persistCandidates/...` 等 30 个函数，加 7 个 getter（`storeHealth/corruptCopy/schemaUpgraded/db/usageDirty/lastUsageFlush/lastKnownCwd`）。可变标量走 getter，避免工具层拿到创建时的快照。
+- `state` / `candidates` 改成**稳定对象 + 原地替换**（`replaceState/replaceCandidates`）：原来 `state = {...}` 整体赋值会把工具层握着的引用变成旧对象——这是拆分时唯一必须改语义的地方，专门加了注释与两个替换函数。
+- `index.js` 5861 → **2271 行**（v4.2.3 的 4157 再降 1886）；`apply` 只剩配置校验、工厂装配、14 个工具注册、注入层挂载。
+- `codeFingerprint` 提到 `4.3.0-store-factory`。
+
+### 测试
+- 同一套回归全过：`memory.test` 133、`memory-oracle` 12、`memory-schema` 7、`memory-sqlite` 10（含双进程并发写）、`memory-v42` 6。
+- 拆分过程中用「真机指纹 + 全量回归」逐步收敛：先搬数据层（存储/别名/备份），再搬派生视图（isActive/usedChars/renderOnce），每步跑测试；`ctx` 传入工厂后才把 `currentCwdOf` 等依赖修正。
+- 真机验收：重组后 `memory_status` 返回 `4.3.0-store-factory`，条目/字符数与拆分前一致。
+
 ## v4.2.3 — 2026-11-05
 
 标题：「拆单文件巨无霸」——把 5861 行的 `index.js` 按职责拆成 `lib/` 九个模块，工具名/参数/返回结构一行未变，检索与写入行为零改动。起因：体检 L4「巨无霸」长期 warn（>3000 行评估线），且该文件 45 天内被改 37 次，每次改动都落在一个 4032 行的 `apply` 闭包里。

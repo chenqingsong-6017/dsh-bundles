@@ -7,7 +7,24 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
 - **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
-- **版本 / 引擎**：v4.2.2（2026-11-03）。v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+- **版本 / 引擎**：v4.3.0（2026-11-05）。v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+
+## 代码结构（v4.3.0 起）
+
+| 文件 | 职责 |
+|---|---|
+| `index.js` | 插件入口与**组装层**：配置校验 → `createStore()` → 注册 14 个工具 → 挂注入层（2271 行） |
+| `lib/store.js` | 记忆存储：`state`、双后端持久化（JSON / SQLite）、备份、别名旁路、候选池、归档（约 1900 行） |
+| `lib/constants.js` | 所有阈值 / 上限 / 开关，改行为先看这里 |
+| `lib/entry.js` | 条目时效、重要性、作用域 |
+| `lib/text.js` | 分词与文本相似度（词典 `lib/zh-words.txt`） |
+| `lib/score.js` | BM25 + 内容单元覆盖率 + 注入门槛 |
+| `lib/render.js` | 注入块 / 列表视图渲染 |
+| `lib/schema.js` | 条目规范化、schema 迁移、卡片导出 |
+| `lib/candidates.js` | 候选抽取（对话文本 / 规则文件） |
+| `lib/store-snapshot.js` | 只读快照读取（迁移与诊断） |
+
+约定：`state` / `candidates` 是**稳定对象**，加载与迁移用 `replaceState` / `replaceCandidates` 原地替换（整体赋值会让工具层握着旧对象）；工具层只通过 `createStore` 返回的入口读写，不直接碰 `db` 与文件。
 
 ## 工具
 
