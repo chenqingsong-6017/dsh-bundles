@@ -684,6 +684,62 @@ export function lintIndex(index, options) {
   return { total: index.notes.length, errorCount, warnCount: issues.length - errorCount, issues }
 }
 
+/**
+ * 记忆指针落地检查（单一实现，导出给体检复用）：vault:// 指针能否落到真实文件与真实锚点。
+ * 为什么抽出来：obsidian_status 与 _ops/system-health 必须同一口径，两处各写一份就会
+ * 「一边说断、一边说不断」（2026-11-05 对抗性检查后收口）。
+ * @param {string} memoryText 记忆正文（多条目换行拼接）
+ * @param {string} vaultDir vault 根目录
+ * @param {(abs:string)=>string[]|null} [headingReader] 可选注入的标题读取器（插件内传带缓存的版本）
+ * @returns {{total:number, checked:boolean, fileMissing:number, anchorMissing:number, anchorChecked:number, anchorSkipped:number, broken:Array<{pointer:string, kind:string}>}}
+ */
+export function checkMemoryPointers(memoryText, vaultDir, headingReader) {
+  const result = { total: 0, checked: true, fileMissing: 0, anchorMissing: 0, anchorChecked: 0, anchorSkipped: 0, broken: [] }
+  const readHeads = typeof headingReader === 'function' ? headingReader : defaultHeadingReader
+  const cache = new Map()
+  const headsOf = (abs) => {
+    if (!cache.has(abs)) cache.set(abs, readHeads(abs))
+    return cache.get(abs)
+  }
+  for (const pointer of [...new Set(parseMemoryPointers(memoryText))]) {
+    result.total += 1
+    const raw = String(pointer)
+    const hashAt = raw.indexOf('#')
+    const clean = hashAt === -1 ? raw : raw.slice(0, hashAt)
+    const anchor = hashAt === -1 ? '' : raw.slice(hashAt + 1)
+    const abs = safeResolve(vaultDir, normalizeVaultPath(clean))
+    if (abs === null || !existsSync(abs)) {
+      result.fileMissing += 1
+      result.broken.push({ pointer: raw, kind: 'file-missing' })
+      continue
+    }
+    if (anchor === '') continue
+    const heads = headsOf(abs)
+    if (heads === null) {
+      // 读不到正文 / 超限：这次不判锚点。宁可漏判，也不要把「读失败」说成「锚点缺失」。
+      result.anchorSkipped += 1
+      continue
+    }
+    result.anchorChecked += 1
+    if (!matchHeadingAnchor(anchor, heads).ok) {
+      result.anchorMissing += 1
+      result.broken.push({ pointer: raw, kind: 'anchor-missing' })
+    }
+  }
+  return result
+}
+
+/** 无缓存版标题读取（体检等一次性调用用） */
+function defaultHeadingReader(abs) {
+  try {
+    const info = statSync(abs)
+    if (info.size > MAX_NOTE_BYTES) return null
+    return headingAnchors(parseFrontmatter(readFileSync(abs, 'utf8')).body)
+  } catch {
+    return null
+  }
+}
+
 /** 记忆里 vault:// 指针指向的相对路径集合（剥锚点，统一小写） */
 export function pointerTargetsOf(memoryText) {
   const set = new Set()
@@ -809,6 +865,7 @@ export function apply(ctx, config) {
       if (loaded.entries === null) { report.error = loaded.error || ('记忆文件不存在：' + memoryPath); return report }
       const entries = loaded.entries
       report.entryCount = entries.length
+      // owners 只用于把断链指回记忆条目 id；判定本身交给 checkMemoryPointers（单一实现，体检也用它）
       const owners = new Map()
       for (const entry of entries) {
         for (const pointer of parseMemoryPointers(entry?.text)) {
@@ -817,34 +874,14 @@ export function apply(ctx, config) {
         }
       }
       report.checked = true
-      report.total = owners.size
-      for (const [pointer, ids] of owners) {
-        const ownerIds = ids.slice(0, 5)
-        const raw = String(pointer)
-        const hashAt = raw.indexOf('#')
-        const clean = hashAt === -1 ? raw : raw.slice(0, hashAt)
-        const anchor = hashAt === -1 ? '' : raw.slice(hashAt + 1)
-        const abs = safeResolve(vaultDir, normalizeVaultPath(clean))
-        if (abs === null || !existsSync(abs)) {
-          report.fileMissing += 1
-          report.broken.push({ pointer, memoryIds: ownerIds, kind: 'file-missing' })
-          continue
-        }
-        if (anchor !== '') {
-          const heads = headingsOfNote(abs)
-          if (heads === null) {
-            report.anchorSkipped += 1
-          } else {
-            report.anchorChecked += 1
-            if (!matchHeadingAnchor(anchor, heads).ok) {
-              report.anchorMissing += 1
-              report.broken.push({ pointer, memoryIds: ownerIds, kind: 'anchor-missing' })
-              continue
-            }
-          }
-        }
-        if (report.sample.length < 5) report.sample.push(pointer)
-      }
+      const checked = checkMemoryPointers(entries.map((entry) => String(entry?.text ?? '')).join('\n'), vaultDir, headingsOfNote)
+      report.total = checked.total
+      report.fileMissing = checked.fileMissing
+      report.anchorMissing = checked.anchorMissing
+      report.anchorChecked = checked.anchorChecked
+      report.anchorSkipped = checked.anchorSkipped
+      report.broken = checked.broken.map((item) => ({ ...item, memoryIds: (owners.get(item.pointer) ?? []).slice(0, 5) }))
+      report.sample = [...owners.keys()].slice(0, 5)
       report.ok = report.broken.length === 0
     } catch (error) {
       note(error)

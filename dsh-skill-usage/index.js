@@ -50,7 +50,7 @@ function fail(code, message) {
   return error
 }
 
-function storeLocation(overrideDir) {
+export function storeLocation(overrideDir) {
   const override = typeof overrideDir === 'string' ? overrideDir.trim() : ''
   const base =
     override !== ''
@@ -143,10 +143,16 @@ export function apply(ctx, config) {
   const catalog = new Map()
   let persistTimer = null
   const stats = { toolResults: 0, skillLoads: 0, skillErrors: 0, lastError: null }
+  /**
+   * 最近一次成功刷新目录的时间（账本级）。体检据此区分「目录里现在还有的技能」与
+   * 「账本里残留、目录里已经没了的技能」——后者永远等不到使用记录，不区分会让它们
+   * 30 天后集体变成 archive-candidate，逼人每 30 天手动续期一次（2026-11-05 对抗性检查）。
+   */
+  let catalogAt = null
 
   // ---------- 持久化 ----------
   function serialize() {
-    return JSON.stringify({ version: 1, savedAt: new Date().toISOString(), skills: Object.fromEntries(records) })
+    return JSON.stringify({ version: 1, savedAt: new Date().toISOString(), catalogAt, skills: Object.fromEntries(records) })
   }
 
   function persistNow() {
@@ -177,6 +183,7 @@ export function apply(ctx, config) {
   function loadPersisted() {
     try {
       const parsed = JSON.parse(readFileSync(storeFile, 'utf8'))
+      if (typeof parsed?.catalogAt === 'string' && parsed.catalogAt !== '') catalogAt = parsed.catalogAt
       const table = parsed?.skills
       if (!table || typeof table !== 'object') return
       for (const [name, value] of Object.entries(table)) {
@@ -187,6 +194,7 @@ export function apply(ctx, config) {
           ...(typeof value.lastUsedAt === 'string' ? { lastUsedAt: value.lastUsedAt } : {}),
           ...(typeof value.reviewedAt === 'string' ? { reviewedAt: value.reviewedAt } : {}),
           ...(typeof value.note === 'string' ? { note: value.note } : {}),
+          ...(typeof value.catalogSeenAt === 'string' ? { catalogSeenAt: value.catalogSeenAt } : {}),
         })
       }
     } catch (error) {
@@ -210,7 +218,7 @@ export function apply(ctx, config) {
   async function refreshCatalog(view = {}) {
     try {
       const summaries = await skills.list(view)
-      let changed = false
+      const seenAt = new Date().toISOString()
       for (const summary of summaries) {
         if (!summary || typeof summary.name !== 'string') continue
         catalog.set(summary.name, {
@@ -218,12 +226,12 @@ export function apply(ctx, config) {
           provider: summary.provider,
           description: summary.description,
         })
-        if (!records.has(summary.name)) {
-          ensureRecord(summary.name)
-          changed = true
-        }
+        // 目录里看到的技能打上时间戳：体检据此区分「目录里还有」与「账本残留」。
+        const record = ensureRecord(summary.name)
+        record.catalogSeenAt = seenAt
       }
-      if (changed) schedulePersist()
+      catalogAt = seenAt
+      schedulePersist()
       return summaries.length
     } catch (error) {
       stats.lastError = error instanceof Error ? error.message : String(error)
