@@ -45,7 +45,6 @@ import {
   normalizeScope,
   migrateState,
   textSimilarity as sim,
-  queryEntity,
 } from '../../dsh-memory/index.js'
 
 // 清掉上次运行遗留的临时目录（此刻本文件还没建任何目录，安全）。
@@ -2011,22 +2010,6 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.match(String(nested.payload?.code), /^MEMORY_STORE_(LOCKED|WRITE_FAILED)$/)
   rmSync(root, { recursive: true, force: true })
   ok('v4.2.1 H1：storeDir 不存在能快速写入；不可写/父级不可用时快速报错（子进程 5s 内退出，无死循环）')
-}
-
-// ---- v4.6 零模型实体共现图 ----
-{
-  const r = queryEntity([
-    { id: 'a', text: 't', entities: ['Obsidian', '记忆'] },
-    { id: 'b', text: 't2', entities: ['Obsidian', '插件'] },
-    { id: 'c', text: 't3', entities: ['DSH'] },
-  ], 'Obsidian')
-  assert.equal(r.count, 2, '命中 2 条')
-  assert.equal(r.cooccurring.length, 2, '共现 2 个实体')
-  assert.equal(r.cooccurring[0].entity, '记忆', '共现按次数排序')
-  assert.equal(queryEntity([{ id: 'x', text: 't', entities: ['DSH-Memory'] }], 'dsh-memory').count, 1, '大小写不敏感')
-  assert.equal(queryEntity([], '').count, 0, '空实体')
-  assert.equal(queryEntity([{ id: 'x', text: 't' }], 'Obsidian').count, 0, '无 entities 的条目')
-  ok('v4.6 实体共现图：queryEntity 倒排 + 共现')
 }
 
 console.log(`memory: ${passed} 项通过`)

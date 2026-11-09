@@ -35,7 +35,6 @@ import { createStore } from './lib/store.js'
 import { MEMORY_STATUS, cardMarkdown, cleanAliases, cleanEntities, cleanSources, memoryEntrySchema, normalizeEntry, normalizeScope, slugOf } from './lib/schema.js'
 import { trustMark } from './lib/render.js'
 import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
-import { queryEntity } from './lib/entities.js'
 
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
@@ -47,7 +46,6 @@ export { trustMark, renderMemory } from './lib/render.js'
 export { cleanAliases, migrateState, canonicalJson, cleanEntities, cleanSources, normalizeScope, normalizeEntry, memoryEntrySchema, cardMarkdown, slugOf } from './lib/schema.js'
 export { extractCandidates, extractRuleCandidates, collectRuleFiles, normalizeRuleLine, derivableHit } from './lib/candidates.js'
 export { readStoreSnapshot } from './lib/store-snapshot.js'
-export { queryEntity } from './lib/entities.js'
 
 export function apply(ctx, config) {
   const maxBytes =
@@ -404,47 +402,6 @@ export function apply(ctx, config) {
             score: Math.round(item.score * 1000) / 1000,
           })),
         }
-      },
-    }),
-  )
-
-  ctx.effect(() =>
-    tools.register({
-      name: 'memory_entities',
-      description: 'Query the zero-model entity co-occurrence graph: which memories mention an entity, and which entities co-occur with it. Use it to answer how X and Y relate via shared memories.',
-      parameters: {
-        type: 'object',
-        properties: {
-          entity: { type: 'string', description: 'Entity label (case-insensitive), e.g. dsh-memory or Obsidian.' },
-        },
-        required: ['entity'],
-        additionalProperties: false,
-      },
-      output: {
-        schema: {
-          type: 'object',
-          properties: {
-            entity: { type: 'string' },
-            count: { type: 'integer' },
-            memories: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, text: { type: 'string' } }, required: ['id', 'text'], additionalProperties: false } },
-            cooccurring: { type: 'array', items: { type: 'object', properties: { entity: { type: 'string' }, count: { type: 'integer' } }, required: ['entity', 'count'], additionalProperties: false } },
-          },
-          required: ['entity', 'count', 'memories', 'cooccurring'],
-          additionalProperties: false,
-        },
-      },
-      render(_args, value) {
-        const mems = Array.isArray(value?.memories) ? value.memories : []
-        const cooc = Array.isArray(value?.cooccurring) ? value.cooccurring : []
-        if (mems.length === 0) return [text('没有记忆提到实体「' + (value?.entity ?? '') + '」。')]
-        const lines = mems.map((m) => '- ' + m.id + ' ' + m.text)
-        if (cooc.length > 0) lines.push('共现实体：' + cooc.map((c) => c.entity + '(' + c.count + ')').join('、'))
-        return [text('实体「' + value?.entity + '」出现在 ' + value?.count + ' 条记忆：\n' + lines.join('\n'))]
-      },
-      async execute(args) {
-        const name = String(args?.entity ?? '').trim()
-        if (name === '') throw fail('MEMORY_ARG_MISSING', 'memory_entities 需要 entity。')
-        return queryEntity(state.entries.filter((entry) => !isInvalidEntry(entry)), name)
       },
     }),
   )
@@ -2345,7 +2302,7 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.6.0-entities',
+          codeFingerprint: '4.5.2-scope',
         }
       },
     }),

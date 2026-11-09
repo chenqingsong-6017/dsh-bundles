@@ -3,6 +3,10 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.6.0 — 2026-11-09（已回滚）
+
+零模型实体共现图（memory_entities 工具 + lib/entities.js）——因塞进 dsh-memory 导致挂载失败（Cordis schema 验证/新增依赖问题），已回滚，转独立插件 dsh-memory-entities。教训：新维度应独立插件，不塞核心记忆插件（「一切皆插件」）。
+
 ## v4.6.0 — 2026-11-09
 
 标题：「零模型实体共现图」——新工具 memory_entities + 实体倒排。
