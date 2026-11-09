@@ -3,6 +3,22 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.7.0 — 2026-11-10
+
+标题：「实体图视图」——entityIndex + entityCoccur 纯函数，memory_search 加 entity 过滤；图作为派生索引，不另起权威源。
+
+### Added
+- `entityIndex`（实体→记忆倒排）、`entityCoccur`（实体共现，按频次）纯函数——从 entries 的 entities 标签派生「图视图」，零模型、零图库。
+- memory_search 加 `entity` 参数：按实体过滤检索，返回 `coccurring`（与它共现的实体，按频次）。
+
+### 依据
+- graph-taxonomy（arXiv:2602.05665）：图作为「索引/视图」而非「权威存储」；上次 v4.6.0 实体图塞核心导致挂载失败，这次复用已有工具、不新建。
+
+### 测试
+- 单测 138 → 140（新增：entityIndex/entityCoccur 纯函数 + entity 过滤端到端）。
+- 判据锚：写「用户+Anthropic」「用户+OpenAI」「DSH」，entity=用户 只回前两条，共现=Anthropic/OpenAI。
+
+
 ## v4.6.0 — 2026-11-10
 
 标题：「bi-temporal 时间分层」——补全 validFrom 事件时间起点 + at_time 点时间查询，对齐 Graphiti/memv 双时间戳。

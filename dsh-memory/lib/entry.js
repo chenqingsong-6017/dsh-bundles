@@ -221,3 +221,43 @@ export function detectScope(cwd, roots) {
   }
   return ''
 }
+
+/**
+ * v4.7：实体索引（图作为派生视图，不是权威存储）。
+ * 从 entries 的 entities 标签派生「实体 → 记忆 id 集合」的倒排。零模型、零图库：
+ * 实体标签就是节点，记忆就是承载边。taxonomy 的教训：图是索引，不另起权威源。
+ */
+export function entityIndex(entries) {
+  const index = new Map()
+  for (const entry of entries) {
+    if (!Array.isArray(entry?.entities) || entry.entities.length === 0) continue
+    for (const entity of entry.entities) {
+      if (typeof entity !== 'string' || entity.trim() === '') continue
+      const key = entity.trim()
+      if (!index.has(key)) index.set(key, new Set())
+      index.get(key).add(entry.id)
+    }
+  }
+  return index
+}
+
+/**
+ * v4.7：实体共现——给定实体，返回和它出现在同一记忆里的其他实体（按共现频次降序）。
+ * 这是「图遍历」的零模型版：不做语义关系，只做「共享记忆」的共现统计。
+ * 与 entityIndex 合起来就是「节点 → 邻接」的最小图视图。
+ */
+export function entityCoccur(entries, target) {
+  const result = new Map()
+  const targetKey = String(target ?? '').trim()
+  if (targetKey === '') return result
+  for (const entry of entries) {
+    if (!Array.isArray(entry?.entities)) continue
+    const entities = [...new Set(entry.entities.map((e) => String(e).trim()).filter((e) => e !== ''))]
+    if (!entities.includes(targetKey)) continue
+    for (const peer of entities) {
+      if (peer === targetKey) continue
+      result.set(peer, (result.get(peer) ?? 0) + 1)
+    }
+  }
+  return result
+}

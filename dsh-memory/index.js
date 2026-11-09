@@ -27,7 +27,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { CONFLICT_FLOOR, CONSOLIDATE_MIN_USES, CONTEXT_ORDER, DATE_ONLY, DEFAULT_MAX_BYTES, DEFAULT_MAX_INJECT_CHARS, DEFAULT_SCOPE_ROOTS, KIND_PROCEDURE, MAX_CANDIDATES_PER_TURN, MAX_SIMILAR_HINT, MAX_TEXT_CHARS, PROCEDURE_MIN_VERIFIED, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, TEXT_TOO_LONG_HINT } from './lib/constants.js'
-import { deriveStaleAfter, effectiveImportance, importanceOf, isArchivedEntry, isInvalidEntry, isNotYetValid, isStaleEntry, isTrueAt, localDateOf, parseTimestamp } from './lib/entry.js'
+import { deriveStaleAfter, effectiveImportance, entityCoccur, entityIndex, importanceOf, isArchivedEntry, isInvalidEntry, isNotYetValid, isStaleEntry, isTrueAt, localDateOf, parseTimestamp } from './lib/entry.js'
 import { stripHarnessBlocks, suggestAliases, textSimilarity } from './lib/text.js'
 import { collectRuleFiles, derivableHit, extractCandidates, extractRuleCandidates } from './lib/candidates.js'
 import { fail, text } from './lib/util.js'
@@ -39,7 +39,7 @@ import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 
-export { isStaleEntry, isArchivedEntry, isInvalidEntry, isNotYetValid, isTrueAt, parseTimestamp, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
+export { isStaleEntry, isArchivedEntry, isInvalidEntry, isNotYetValid, isTrueAt, parseTimestamp, entityIndex, entityCoccur, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
 export { bigramSet, textSimilarity, stripHarnessBlocks, tokenize, suggestAliases, expandQuery, contentUnitsOf, queryClauses } from './lib/text.js'
 export { queryIdfSum, scoreEntries, scoreEntriesStrict, gateDecision, relevanceCoverage, scoreMemory } from './lib/score.js'
 export { trustMark, renderMemory } from './lib/render.js'
@@ -276,6 +276,11 @@ export function apply(ctx, config) {
             description:
               'v4.6: point-in-time query (bi-temporal). YYYY-MM-DD or ISO time — return entries true at that moment (validFrom reached, invalidAt not reached). Omit for now.',
           },
+          entity: {
+            type: 'string',
+            description:
+              'v4.7: filter to entries whose entities include this label (graph view). When set, the result also carries coccurring — entities co-occurring with it, ranked by count.',
+          },
         },
         required: ['query'],
         additionalProperties: false,
@@ -290,6 +295,7 @@ export function apply(ctx, config) {
             confidence: { type: 'string' },
             coverage: { type: 'number' },
             byId: { type: 'array', items: { type: 'string' } },
+            coccurring: { type: 'array', items: { type: 'object', properties: { entity: { type: 'string' }, count: { type: 'integer' } } } },
             matches: {
               type: 'array',
               items: {
@@ -346,7 +352,9 @@ export function apply(ctx, config) {
         const atTimeRaw = typeof args?.at_time === 'string' && args.at_time !== '' ? args.at_time.trim() : ''
         const atTime = atTimeRaw === '' ? Date.now() : parseTimestamp(atTimeRaw)
         if (Number.isNaN(atTime)) throw fail('MEMORY_DATE_INVALID', 'at_time 需要 YYYY-MM-DD 或 ISO 时间。')
-        const searchable = state.entries.filter((entry) => isTrueAt(entry, atTime))
+        const activeEntries = state.entries.filter((entry) => isTrueAt(entry, atTime))
+        const entityFilter = typeof args?.entity === 'string' && args.entity !== '' ? args.entity.trim() : ''
+        const searchable = entityFilter === '' ? activeEntries : activeEntries.filter((entry) => Array.isArray(entry.entities) && entry.entities.includes(entityFilter))
         const idHits = [...new Set(query.match(/m\d+/g) ?? [])]
           .map((id) => searchable.find((entry) => entry.id === id))
           .filter((entry) => entry !== undefined)
@@ -388,6 +396,7 @@ export function apply(ctx, config) {
         })
         const confidence = idHits.length > 0 || gate.pass ? 'ok' : 'low'
         const coverage = Math.round(coverageReport.coverage * 1000) / 1000
+        const coccurring = entityFilter === '' ? undefined : [...entityCoccur(activeEntries, entityFilter).entries()].sort((a, b) => b[1] - a[1]).map(([entity, count]) => ({ entity, count }))
         return {
           query,
           total: searchable.length,
@@ -395,6 +404,7 @@ export function apply(ctx, config) {
           confidence,
           coverage,
           ...(idHits.length > 0 ? { byId: idHits.map((entry) => entry.id) } : {}),
+          ...(coccurring !== undefined ? { coccurring } : {}),
           matches: scored.slice(0, limit).map((item) => ({
             id: item.entry.id,
             text: item.entry.text,
@@ -2340,7 +2350,7 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.6.0-bi-temporal',
+          codeFingerprint: '4.7.0-entity-graph',
         }
       },
     }),

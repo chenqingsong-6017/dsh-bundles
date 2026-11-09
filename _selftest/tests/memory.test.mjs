@@ -43,6 +43,8 @@ import {
   isNotYetValid,
   isTrueAt,
   parseTimestamp,
+  entityIndex,
+  entityCoccur,
   cleanEntities,
   cleanSources,
   normalizeScope,
@@ -1967,6 +1969,40 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const block = h.layers[0].text({})
   assert.ok(!block.includes('未来才生效的计划'), 'validFrom 未到不应注入')
   ok('v4.6 bi-temporal：点时间查询 / 历史留档 / validFrom 未到不注入')
+  rmSync(dir, { recursive: true, force: true })
+}
+// ---- v4.7（实体图视图）：entityIndex / entityCoccur / memory_search entity 过滤 ----
+// 图作为派生索引（不是权威存储）：实体标签=节点，共享记忆=边。
+// 判据锚：写「用户+Anthropic」「用户+OpenAI」「DSH」三条，entity=用户 只回前两条，共现=Anthropic/OpenAI。
+{
+  const entries = [
+    { id: 'a', entities: ['用户', 'Anthropic'] },
+    { id: 'b', entities: ['用户', 'OpenAI'] },
+    { id: 'c', entities: ['DSH'] },
+  ]
+  const idx = entityIndex(entries)
+  assert.deepEqual([...idx.get('用户')].sort(), ['a', 'b'], '实体「用户」→ 记忆 a/b')
+  assert.deepEqual([...idx.get('Anthropic')].sort(), ['a'], '实体「Anthropic」→ 记忆 a')
+  assert.equal(idx.has('DSH'), true, '实体「DSH」有索引')
+  const co = entityCoccur(entries, '用户')
+  assert.deepEqual(Object.fromEntries(co), { Anthropic: 1, OpenAI: 1 }, '「用户」共现 Anthropic/OpenAI 各 1')
+  assert.equal(entityCoccur(entries, 'DSH').size, 0, '「DSH」无共现（孤点）')
+  assert.equal(entityCoccur(entries, '').size, 0, '空实体返回空')
+  ok('v4.7 纯函数：entityIndex / entityCoccur（图视图派生）')
+}
+
+{
+  const dir = makeTmp('dsh-memory-v47')
+  const h = host(dir)
+  await h.defs.get('memory_add').execute({ text: '实体图A：用户在Anthropic工作', entities: ['用户', 'Anthropic'], allowDuplicate: true })
+  await h.defs.get('memory_add').execute({ text: '实体图B：用户在OpenAI工作', entities: ['用户', 'OpenAI'], allowDuplicate: true })
+  await h.defs.get('memory_add').execute({ text: '实体图C：DSH是harness', entities: ['DSH'], allowDuplicate: true })
+  const filtered = await h.defs.get('memory_search').execute({ query: '实体图', entity: '用户' })
+  assert.ok(filtered.matches.some((m) => m.text.includes('Anthropic')), 'entity=用户 应含 Anthropic 那条')
+  assert.ok(filtered.matches.some((m) => m.text.includes('OpenAI')), 'entity=用户 应含 OpenAI 那条')
+  assert.ok(!filtered.matches.some((m) => m.text.includes('DSH是')), 'entity=用户 不应含 DSH 那条')
+  assert.deepEqual(filtered.coccurring ?? [], [{ entity: 'Anthropic', count: 1 }, { entity: 'OpenAI', count: 1 }], '共现=Anthropic/OpenAI')
+  ok('v4.7 entity 过滤 + 共现返回（图查询）')
   rmSync(dir, { recursive: true, force: true })
 }
 // ---- v4.2.2（B4）：memory_remove 无 confirm → 只返回待删清单、不删；confirm:true 才物理删 ----
