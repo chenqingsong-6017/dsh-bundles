@@ -1,6 +1,0 @@
-- insert:
-    - id: memory-entities
-      name: '@local/dsh-memory-entities'
-      config:
-        # 只读 dsh-memory 的 memory.db（数据唯一真源），不写、不依赖 dsh-memory 运行时
-        storeFile: 'D:\AI\dsh-data\memory\memory.db'
