@@ -45,6 +45,7 @@ import {
   normalizeScope,
   migrateState,
   textSimilarity as sim,
+  queryEntity,
 } from '../../dsh-memory/index.js'
 
 // 清掉上次运行遗留的临时目录（此刻本文件还没建任何目录，安全）。
@@ -306,7 +307,8 @@ rmSync(tmp2, { recursive: true, force: true })
 
 // ---- v2.2 scope 加分 + 自动沉淀候选（影子模式）----
 assert.equal(detectScope('D:\\AI\\dsh-bundles\\dsh-memory'), 'plugin-dev')
-assert.equal(detectScope('D:\\AI-date\\dsh-date\\dsh-创建'), 'dsh-date')
+assert.equal(detectScope('D:\\AI-date\\dsh-date\\dsh-创建'), 'plugin-dev')
+assert.equal(detectScope('D:\\AI-date\\dsh-date\\dsh-亲爱的管家'), 'dsh-date')
 assert.equal(detectScope('C:\\Windows\\System32'), '')
 assert.equal(detectScope(''), '')
 ok('v2.2 detectScope：按 cwd 前缀映射 scope 域')
@@ -1467,6 +1469,10 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const fresh = { id: 's2', text: '验证门在收工前自动跑' }
   assert.equal(isStaleEntry(stale, '2026-10-30'), true, '过期判据')
   assert.equal(isStaleEntry(fresh, '2026-10-30'), false, '没有 staleAfter 不算过期')
+  // v4.5：软期限（softDeadline）到期也算「该复核」，但不失效——对齐 Graphiti「软期限不算 invalid_at」
+  const softPlan = { id: 's3', text: '计划 2026-03 前完成迁移', softDeadline: '2026-03-01' }
+  assert.equal(isStaleEntry(softPlan, '2026-10-30'), true, '软期限过期 = 该复核（stale）')
+  assert.equal(isStaleEntry(softPlan, '2026-02-01'), false, '软期限未到 = 不 stale')
   const ranked = scoreEntries([stale, fresh], '验证门 收工前').sort((a, b) => b.score - a.score)
   assert.equal(ranked[0].entry.id, 's2', '同样文本时未过期的排前面')
   ok('v3.19 时效降权：过期条目仍可检索，但排序压后')
@@ -1846,6 +1852,11 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.equal(isInvalidEntry({ invalidAt: '2000-01-01' }), true, '过去的日期 = 已失效')
   assert.equal(isInvalidEntry({ invalidAt: '2999-01-01' }), false, '未来的日期 = 仍生效')
   assert.equal(isInvalidEntry({}), false, '没有 invalidAt = 不失效')
+  // v4.5：软期限≠硬失效——softDeadline 到期不隐藏（isInvalidEntry 仍 false），只有 invalidAt 到期才失效
+  assert.equal(isInvalidEntry({ softDeadline: '2000-01-01' }), false, '软期限过期 ≠ 失效（核心修复）')
+  assert.equal(isInvalidEntry({ softDeadline: '2000-01-01', invalidAt: '2000-01-01' }), true, '只有 invalidAt 到期才失效')
+  assert.equal(normalizeEntry({ id: 'sd', text: 't', softDeadline: '2026-03-01' }).softDeadline, '2026-03-01', 'normalize 保留软期限')
+  assert.equal(normalizeEntry({ id: 'sd2', text: 't', softDeadline: '10-01' }).softDeadline, undefined, '软期限非法格式丢弃')
   assert.equal(isArchivedEntry({ invalidAt: '2000-01-01' }), true, '失效条目按归档口径处理')
   assert.deepEqual(cleanEntities(['抖音', '抖音', ' DSH ', '', 'dsh']), ['抖音', 'DSH'], '实体标签去重（忽略大小写）并 trim')
   assert.deepEqual(cleanSources(['https://x', ' https://x ', 'index.js:429']), ['https://x', 'index.js:429'], '来源去重并 trim')
@@ -2002,6 +2013,20 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   ok('v4.2.1 H1：storeDir 不存在能快速写入；不可写/父级不可用时快速报错（子进程 5s 内退出，无死循环）')
 }
 
+// ---- v4.6 零模型实体共现图 ----
+{
+  const r = queryEntity([
+    { id: 'a', text: 't', entities: ['Obsidian', '记忆'] },
+    { id: 'b', text: 't2', entities: ['Obsidian', '插件'] },
+    { id: 'c', text: 't3', entities: ['DSH'] },
+  ], 'Obsidian')
+  assert.equal(r.count, 2, '命中 2 条')
+  assert.equal(r.cooccurring.length, 2, '共现 2 个实体')
+  assert.equal(r.cooccurring[0].entity, '记忆', '共现按次数排序')
+  assert.equal(queryEntity([{ id: 'x', text: 't', entities: ['DSH-Memory'] }], 'dsh-memory').count, 1, '大小写不敏感')
+  assert.equal(queryEntity([], '').count, 0, '空实体')
+  assert.equal(queryEntity([{ id: 'x', text: 't' }], 'Obsidian').count, 0, '无 entities 的条目')
+  ok('v4.6 实体共现图：queryEntity 倒排 + 共现')
+}
+
 console.log(`memory: ${passed} 项通过`)
-
-

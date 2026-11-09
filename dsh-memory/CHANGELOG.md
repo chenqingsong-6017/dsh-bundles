@@ -3,6 +3,58 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.6.0 — 2026-11-09
+
+标题：「零模型实体共现图」——新工具 memory_entities + 实体倒排。
+
+### Added
+- `lib/entities.js`：`queryEntity` 纯函数，零模型实体共现图（倒排 + 共现，不做语义关系）。
+- 新工具 `memory_entities`：查实体出现在哪些记忆、与谁共现，回答「X 和 Y 通过哪些共享记忆关联」。
+
+### 说明
+- 这是 Graphiti 实体图的最小零模型版。实体覆盖率当前只有 14/103（13.6%）、22 个实体、共现稀疏——能力先建、标签后补。
+
+### 测试
+- 单测 136 → 137（新增 v4.6 实体共现图）。
+
+## v4.5.2 — 2026-11-09
+
+标题：「作用域治理」——DEFAULT_SCOPE_ROOTS 把 dsh-创建 归入 plugin-dev 域。
+
+### Changed
+- DEFAULT_SCOPE_ROOTS 修正：plugin-dev 加 `D:\AI-date\dsh-date\dsh-创建`。此前 dsh-创建（cwd 在 dsh-date 下）被 detectScope 判成 dsh-date，28 条 plugin-dev 条目被当「跨域」压成 14 字 compact；现在正确识别为 plugin-dev，本域条目完整渲染。
+- 数据治理：35 条 unscoped 补标 scope/workspaces——6 条 global 价值观、28 条 plugin-dev + workspaces=[dsh-创建]、m239 补 global。
+
+### 测试
+- detectScope 断言更新（dsh-创建→plugin-dev），补「亲爱的管家仍 dsh-date」防误伤；单测 136 项全过。
+
+## v4.5.1 — 2026-11-09
+
+标题：「停用词补漏 + bench 口径修正」——修两处实践检验暴露的问题。
+
+### Fixed
+- 中文停用字补「少」：此前「多少」不在停用表，负例「今天汇率多少」单命中「多少」（df=1、覆盖率 0.300 越过长查询单单元门槛 0.25）被误注入。补「少」后「多少」成为纯虚词被过滤，负例误注入 4.8% → 0，recall@1/3 仍 0.969。
+- bench 口径修正（`_selftest/memory-bench.mjs`）：默认读 SQLite `memory.db`（此前读迁移前的旧 `memory.json`）+ `BUDGET` 1500 → 2500（对齐生产 `maxInjectChars`）。旧口径误报负例误注入 0，修正后才暴露上面这条。
+
+### 测试
+- 单测 136 项全过；bench recall@1/3 0.969、负例误注入 0、注入覆盖 0.375。
+
+## v4.5.0 — 2026-11-09
+
+标题：「软期限≠硬失效」——新增 `softDeadline` 字段，对齐 Graphiti「软期限不算 invalid_at」（edges.py:281-284）。
+
+### Added
+- `softDeadline` 字段（YYYY-MM-DD，可选）：目标/计划日期。到期**不失效**（仍注入与检索），只转「该复核」（`isStaleEntry` 判 stale、注入带 ⏰、排序降权）。与 `invalidAt`（硬失效，到期隐藏）严格区分。
+- 写入（memory_add）与更新（memory_update）两侧都支持 `softDeadline`；非法日期格式报 `MEMORY_DATE_INVALID`，空串清除。
+- 卡片导出（`cardMarkdown`）补 `softDeadline` frontmatter。
+
+### 依据
+- Graphiti 源码：软期限明确不算 `invalid_at`，代码层 `normalize_future_temporal_bounds` 正则兜底（`temporal_edge_utils.py:15-71`）。此前 `invalidAt` 单字段会把「by March 2026」这类软期限误判为过期。
+
+### 测试
+- 单测 131 → **136**（新增 5 项：软期限到期=stale / 未到=不 stale / 软期限过期≠失效 / 只有 invalidAt 才失效 / normalize 保留与非法丢弃）。
+- 全部门 `npm run check` 通过（31 通过 · 0 警告 · 0 失败）。
+
 ## v4.3.1 — 2026-11-05
 
 标题：「拆完扫尾」——清掉两处拆分后暴露的死代码，无行为变化。

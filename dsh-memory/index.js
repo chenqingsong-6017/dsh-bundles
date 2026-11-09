@@ -35,6 +35,7 @@ import { createStore } from './lib/store.js'
 import { MEMORY_STATUS, cardMarkdown, cleanAliases, cleanEntities, cleanSources, memoryEntrySchema, normalizeEntry, normalizeScope, slugOf } from './lib/schema.js'
 import { trustMark } from './lib/render.js'
 import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
+import { queryEntity } from './lib/entities.js'
 
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
@@ -46,6 +47,7 @@ export { trustMark, renderMemory } from './lib/render.js'
 export { cleanAliases, migrateState, canonicalJson, cleanEntities, cleanSources, normalizeScope, normalizeEntry, memoryEntrySchema, cardMarkdown, slugOf } from './lib/schema.js'
 export { extractCandidates, extractRuleCandidates, collectRuleFiles, normalizeRuleLine, derivableHit } from './lib/candidates.js'
 export { readStoreSnapshot } from './lib/store-snapshot.js'
+export { queryEntity } from './lib/entities.js'
 
 export function apply(ctx, config) {
   const maxBytes =
@@ -408,6 +410,47 @@ export function apply(ctx, config) {
 
   ctx.effect(() =>
     tools.register({
+      name: 'memory_entities',
+      description: 'Query the zero-model entity co-occurrence graph: which memories mention an entity, and which entities co-occur with it. Use it to answer how X and Y relate via shared memories.',
+      parameters: {
+        type: 'object',
+        properties: {
+          entity: { type: 'string', description: 'Entity label (case-insensitive), e.g. dsh-memory or Obsidian.' },
+        },
+        required: ['entity'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            entity: { type: 'string' },
+            count: { type: 'integer' },
+            memories: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, text: { type: 'string' } }, required: ['id', 'text'], additionalProperties: false } },
+            cooccurring: { type: 'array', items: { type: 'object', properties: { entity: { type: 'string' }, count: { type: 'integer' } }, required: ['entity', 'count'], additionalProperties: false } },
+          },
+          required: ['entity', 'count', 'memories', 'cooccurring'],
+          additionalProperties: false,
+        },
+      },
+      render(_args, value) {
+        const mems = Array.isArray(value?.memories) ? value.memories : []
+        const cooc = Array.isArray(value?.cooccurring) ? value.cooccurring : []
+        if (mems.length === 0) return [text('没有记忆提到实体「' + (value?.entity ?? '') + '」。')]
+        const lines = mems.map((m) => '- ' + m.id + ' ' + m.text)
+        if (cooc.length > 0) lines.push('共现实体：' + cooc.map((c) => c.entity + '(' + c.count + ')').join('、'))
+        return [text('实体「' + value?.entity + '」出现在 ' + value?.count + ' 条记忆：\n' + lines.join('\n'))]
+      },
+      async execute(args) {
+        const name = String(args?.entity ?? '').trim()
+        if (name === '') throw fail('MEMORY_ARG_MISSING', 'memory_entities 需要 entity。')
+        return queryEntity(state.entries.filter((entry) => !isInvalidEntry(entry)), name)
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    tools.register({
       name: 'memory_add',
       description:
         'Persist one durable fact across sessions (user preferences, environment quirks, project conventions). Keep each entry short and self-contained; it costs prompt space. It takes effect from the next model request.',
@@ -461,6 +504,11 @@ export function apply(ctx, config) {
             type: 'string',
             description:
               'v4.0: YYYY-MM-DD (or ISO time) from which this fact stops being true. The entry is kept for history but no longer injected or returned by memory_search.',
+          },
+          softDeadline: {
+            type: 'string',
+            description:
+              'v4.5: YYYY-MM-DD target/deadline date. Reaching it does NOT invalidate the fact — it flips the entry to stale (re-check needed). Use for plans/goals ("by March 2026"); use invalidAt only for facts that stop being true.',
           },
           supersede: {
             type: 'boolean',
@@ -581,6 +629,9 @@ export function apply(ctx, config) {
           if (!DATE_ONLY.test(rawInvalid) && Number.isNaN(Date.parse(rawInvalid))) {
             throw fail('MEMORY_DATE_INVALID', 'invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
           }
+        }
+        if (args?.softDeadline !== undefined && args.softDeadline !== '' && !DATE_ONLY.test(String(args.softDeadline))) {
+          throw fail('MEMORY_DATE_INVALID', 'softDeadline 需要 YYYY-MM-DD 格式。')
         }
         // v4.0：scope 收敛（global 或小写 slug）。早失败好过再攒出 8 种混用取值。
         const incomingScope = normalizeScope(args?.scope)
@@ -762,6 +813,7 @@ export function apply(ctx, config) {
           ...(Array.isArray(args?.sources) ? { sources: args.sources } : {}),
           ...(Array.isArray(args?.entities) ? { entities: args.entities } : {}),
           ...(typeof args?.invalidAt === 'string' && args.invalidAt !== '' ? { invalidAt: args.invalidAt } : {}),
+          ...(typeof args?.softDeadline === 'string' && args.softDeadline !== '' ? { softDeadline: args.softDeadline } : {}),
           ...(Array.isArray(args?.workspaces) ? { workspaces: args.workspaces } : {}),
           // v4.2：procedure 的复用证据（Voyager 门槛：≥2 次成功复运用）。
           ...(incomingKind === KIND_PROCEDURE ? { verifiedCount: incomingVerified, lastVerifiedAt: now } : {}),
@@ -880,6 +932,10 @@ export function apply(ctx, config) {
           invalidAt: {
             type: 'string',
             description: 'v4.0: YYYY-MM-DD (or ISO) from which the fact stops being true; empty string clears it.',
+          },
+          softDeadline: {
+            type: 'string',
+            description: 'v4.5: YYYY-MM-DD target/deadline; reaching it flips the entry stale (re-check), never invalidates it. empty string clears it.',
           },
           workspaces: {
             type: 'array',
@@ -1061,6 +1117,16 @@ export function apply(ctx, config) {
               throw fail('MEMORY_DATE_INVALID', 'invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
             }
             entry.invalidAt = rawInvalid
+          }
+        }
+        if (typeof args?.softDeadline === 'string') {
+          if (args.softDeadline === '') delete entry.softDeadline
+          else {
+            const rawSoft = args.softDeadline.trim()
+            if (!DATE_ONLY.test(rawSoft)) {
+              throw fail('MEMORY_DATE_INVALID', 'softDeadline 需要 YYYY-MM-DD 格式（空串表示清除）。')
+            }
+            entry.softDeadline = rawSoft
           }
         }
         // v4.2：复用成功一次就累加证据（procedure 的「验证过几次」不是用户说记住，而是真跑成功）。
@@ -2279,7 +2345,7 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.4.0-curator',
+          codeFingerprint: '4.6.0-entities',
         }
       },
     }),

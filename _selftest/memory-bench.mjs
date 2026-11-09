@@ -2,18 +2,28 @@
 // 真实库微基准：30+ 正例 / 6 负例，输出 recall@k、MRR、注入了多少、负例有没有硬注入。
 // 用法：node _selftest/memory-bench.mjs [--json] [--store <path>] [--cases <path>]
 import { readFileSync } from 'node:fs'
+import { DatabaseSync } from 'node:sqlite'
 import { renderMemory, scoreEntries } from '../dsh-memory/index.js'
 
 const args = process.argv.slice(2)
 const jsonOut = args.includes('--json')
 const pick = (flag, fallback) => { const index = args.indexOf(flag); return index >= 0 && args[index + 1] !== undefined ? args[index + 1] : fallback }
-const STORE = pick('--store', 'D:/AI/dsh-data/memory/memory.json')
+const STORE = pick('--store', 'D:/AI/dsh-data/memory/memory.db')
 const CASES = pick('--cases', new URL('./memory-bench-cases.json', import.meta.url).pathname.replace(/^\//, ''))
-const BUDGET = 1500
+const BUDGET = 2500
 
-const store = JSON.parse(readFileSync(STORE, 'utf8'))
+let entries
+if (STORE.endsWith('.json')) {
+  const store = JSON.parse(readFileSync(STORE, 'utf8'))
+  entries = store.entries
+} else {
+  const db = new DatabaseSync(STORE)
+  entries = db.prepare('SELECT id, payload FROM entries ORDER BY seq').all()
+    .map((row) => { try { return JSON.parse(row.payload) } catch { return null } })
+    .filter((e) => e && typeof e.id === 'string' && typeof e.text === 'string')
+  db.close()
+}
 const cases = JSON.parse(readFileSync(CASES, 'utf8'))
-const entries = store.entries
 const active = entries.filter((entry) => typeof entry.supersededBy !== 'string')
 const scorable = active.filter((entry) => entry.pinned !== true)
 const pinnedIds = new Set(active.filter((entry) => entry.pinned === true).map((entry) => entry.id))

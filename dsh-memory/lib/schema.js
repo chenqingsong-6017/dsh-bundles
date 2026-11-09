@@ -178,6 +178,7 @@ export function normalizeEntry(input) {
   if (typeof input.verifiedBy === 'string' && input.verifiedBy !== '') out.verifiedBy = input.verifiedBy
   if (typeof input.verifiedAt === 'string' && input.verifiedAt !== '') out.verifiedAt = input.verifiedAt
   if (typeof input.staleAfter === 'string' && DATE_ONLY.test(input.staleAfter)) out.staleAfter = input.staleAfter
+  if (typeof input.softDeadline === 'string' && DATE_ONLY.test(input.softDeadline)) out.softDeadline = input.softDeadline
   if (Array.isArray(input.sources)) {
     const sources = cleanSources(input.sources)
     if (sources.length > 0) out.sources = sources
@@ -238,6 +239,7 @@ export const memoryEntrySchema = {
     // v4.0：实体标签（纯字符串）与失效时刻（对齐双时间戳里可用的那一半）。
     entities: { type: 'array', items: { type: 'string' } },
     invalidAt: { type: 'string' },
+    softDeadline: { type: 'string' },
     // v4.2：procedure 的复用证据（Voyager「验证过才入库」；只在 kind=procedure 时写）。
     verifiedCount: { type: 'integer' },
     lastVerifiedAt: { type: 'string' },
@@ -283,6 +285,7 @@ export function cardMarkdown(entry, today = localDateOf()) {
   // v4.0：把「以后」需要的字段一起导出去（sources/entities/invalidAt/workspaces）——
   // 导出物是脱离 DSH 也能读的资产，字段不全等于将来迁移时丢信息。
   if (typeof entry.invalidAt === 'string' && entry.invalidAt !== '') lines.push('invalidAt: ' + entry.invalidAt)
+  if (typeof entry.softDeadline === 'string' && entry.softDeadline !== '') lines.push('softDeadline: ' + entry.softDeadline)
   if (Array.isArray(entry.entities) && entry.entities.length > 0) {
     lines.push('entities:')
     for (const entity of entry.entities) lines.push('  - ' + yamlScalar(entity))

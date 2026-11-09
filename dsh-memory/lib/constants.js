@@ -150,7 +150,7 @@ export const SCHEMA_VERSION = 2
 export const SCOPE_SLUG = /^[a-z][a-z0-9-]{0,31}$/
 
 export const DEFAULT_SCOPE_ROOTS = {
-  'plugin-dev': ['D:\\AI\\dsh-bundles'],
+  'plugin-dev': ['D:\\AI\\dsh-bundles', 'D:\\AI-date\\dsh-date\\dsh-创建'],
   'data-infra': ['D:\\AI\\dsh-data'],
   'dsh-date': ['D:\\AI-date\\dsh-date'],
 }

@@ -14,7 +14,11 @@ function localDayStart(stamp) {
 
 /** 待复核判据：staleAfter 走本地日历日字符串比较，与 invalidAt 同一口径（本地日）。 */
 export function isStaleEntry(entry, today = localDateOf()) {
-  return typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < today
+  if (typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < today) return true
+  // v4.5：软期限（softDeadline）到期也算「该复核」——对齐 Graphiti「软期限不算 invalid_at」（edges.py:281-284）。
+  // 目标/计划日期过了，不代表事实失效（不隐藏），只降权提示该检查进度，与 invalidAt 硬失效严格区分。
+  if (typeof entry?.softDeadline === 'string' && DATE_ONLY.test(entry.softDeadline) && entry.softDeadline < today) return true
+  return false
 }
 
 /**
