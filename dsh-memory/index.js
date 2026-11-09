@@ -27,7 +27,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { CONFLICT_FLOOR, CONSOLIDATE_MIN_USES, CONTEXT_ORDER, DATE_ONLY, DEFAULT_MAX_BYTES, DEFAULT_MAX_INJECT_CHARS, DEFAULT_SCOPE_ROOTS, KIND_PROCEDURE, MAX_CANDIDATES_PER_TURN, MAX_SIMILAR_HINT, MAX_TEXT_CHARS, PROCEDURE_MIN_VERIFIED, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, TEXT_TOO_LONG_HINT } from './lib/constants.js'
-import { deriveStaleAfter, effectiveImportance, importanceOf, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './lib/entry.js'
+import { deriveStaleAfter, effectiveImportance, importanceOf, isArchivedEntry, isInvalidEntry, isNotYetValid, isStaleEntry, isTrueAt, localDateOf, parseTimestamp } from './lib/entry.js'
 import { stripHarnessBlocks, suggestAliases, textSimilarity } from './lib/text.js'
 import { collectRuleFiles, derivableHit, extractCandidates, extractRuleCandidates } from './lib/candidates.js'
 import { fail, text } from './lib/util.js'
@@ -39,7 +39,7 @@ import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 
-export { isStaleEntry, isArchivedEntry, isInvalidEntry, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
+export { isStaleEntry, isArchivedEntry, isInvalidEntry, isNotYetValid, isTrueAt, parseTimestamp, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
 export { bigramSet, textSimilarity, stripHarnessBlocks, tokenize, suggestAliases, expandQuery, contentUnitsOf, queryClauses } from './lib/text.js'
 export { queryIdfSum, scoreEntries, scoreEntriesStrict, gateDecision, relevanceCoverage, scoreMemory } from './lib/score.js'
 export { trustMark, renderMemory } from './lib/render.js'
@@ -271,6 +271,11 @@ export function apply(ctx, config) {
         properties: {
           query: { type: 'string', description: 'Keywords; space-separated terms are AND-weighted, a whole-string hit scores higher.' },
           limit: { type: 'integer', description: 'Max matches to return (1-20, default 5).' },
+          at_time: {
+            type: 'string',
+            description:
+              'v4.6: point-in-time query (bi-temporal). YYYY-MM-DD or ISO time — return entries true at that moment (validFrom reached, invalidAt not reached). Omit for now.',
+          },
         },
         required: ['query'],
         additionalProperties: false,
@@ -303,6 +308,8 @@ export function apply(ctx, config) {
                   staleAfter: { type: 'string' },
                   stale: { type: 'boolean' },
                   verifiedAt: { type: 'string' },
+                  validFrom: { type: 'string' },
+                  invalidAt: { type: 'string' },
                   sources: { type: 'array', items: { type: 'string' } },
                   score: { type: 'number' },
                 },
@@ -336,7 +343,10 @@ export function apply(ctx, config) {
         // v2.7：query 里出现 m\d+ 就按 id 直取。注入块一直写着「用 memory_search 按 id 取全文」，
         // 但 BM25 不认 id——实测搜 m33 命中 0/63。文档与实现不一致，这里补上。
         // v4.0：invalidAt 已到的条目不再参与检索（留档不删，memory_list includeArchived 仍可见）。
-        const searchable = state.entries.filter((entry) => !isInvalidEntry(entry))
+        const atTimeRaw = typeof args?.at_time === 'string' && args.at_time !== '' ? args.at_time.trim() : ''
+        const atTime = atTimeRaw === '' ? Date.now() : parseTimestamp(atTimeRaw)
+        if (Number.isNaN(atTime)) throw fail('MEMORY_DATE_INVALID', 'at_time 需要 YYYY-MM-DD 或 ISO 时间。')
+        const searchable = state.entries.filter((entry) => isTrueAt(entry, atTime))
         const idHits = [...new Set(query.match(/m\d+/g) ?? [])]
           .map((id) => searchable.find((entry) => entry.id === id))
           .filter((entry) => entry !== undefined)
@@ -398,6 +408,8 @@ export function apply(ctx, config) {
             ...(typeof item.entry.staleAfter === 'string' ? { staleAfter: item.entry.staleAfter } : {}),
             ...(isStaleEntry(item.entry) ? { stale: true } : {}),
             ...(typeof item.entry.verifiedAt === 'string' ? { verifiedAt: item.entry.verifiedAt } : {}),
+            ...(typeof item.entry.validFrom === 'string' ? { validFrom: item.entry.validFrom } : {}),
+            ...(typeof item.entry.invalidAt === 'string' ? { invalidAt: item.entry.invalidAt } : {}),
             ...(Array.isArray(item.entry.sources) ? { sources: item.entry.sources } : {}),
             score: Math.round(item.score * 1000) / 1000,
           })),
@@ -461,6 +473,11 @@ export function apply(ctx, config) {
             type: 'string',
             description:
               'v4.0: YYYY-MM-DD (or ISO time) from which this fact stops being true. The entry is kept for history but no longer injected or returned by memory_search.',
+          },
+          validFrom: {
+            type: 'string',
+            description:
+              'v4.6: YYYY-MM-DD (or ISO time) from which this fact becomes true. Before that date it is neither injected nor returned by memory_search (bi-temporal event-time start; pairs with invalidAt as the end).',
           },
           softDeadline: {
             type: 'string',
@@ -585,6 +602,12 @@ export function apply(ctx, config) {
           const rawInvalid = String(args.invalidAt)
           if (!DATE_ONLY.test(rawInvalid) && Number.isNaN(Date.parse(rawInvalid))) {
             throw fail('MEMORY_DATE_INVALID', 'invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
+          }
+        }
+        if (args?.validFrom !== undefined && args.validFrom !== '') {
+          const rawValid = String(args.validFrom)
+          if (!DATE_ONLY.test(rawValid) && Number.isNaN(Date.parse(rawValid))) {
+            throw fail('MEMORY_DATE_INVALID', 'validFrom 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
           }
         }
         if (args?.softDeadline !== undefined && args.softDeadline !== '' && !DATE_ONLY.test(String(args.softDeadline))) {
@@ -770,6 +793,7 @@ export function apply(ctx, config) {
           ...(Array.isArray(args?.sources) ? { sources: args.sources } : {}),
           ...(Array.isArray(args?.entities) ? { entities: args.entities } : {}),
           ...(typeof args?.invalidAt === 'string' && args.invalidAt !== '' ? { invalidAt: args.invalidAt } : {}),
+          ...(typeof args?.validFrom === 'string' && args.validFrom !== '' ? { validFrom: args.validFrom } : {}),
           ...(typeof args?.softDeadline === 'string' && args.softDeadline !== '' ? { softDeadline: args.softDeadline } : {}),
           ...(Array.isArray(args?.workspaces) ? { workspaces: args.workspaces } : {}),
           // v4.2：procedure 的复用证据（Voyager 门槛：≥2 次成功复运用）。
@@ -889,6 +913,10 @@ export function apply(ctx, config) {
           invalidAt: {
             type: 'string',
             description: 'v4.0: YYYY-MM-DD (or ISO) from which the fact stops being true; empty string clears it.',
+          },
+          validFrom: {
+            type: 'string',
+            description: 'v4.6: YYYY-MM-DD (or ISO) from which the fact becomes true; empty string clears it.',
           },
           softDeadline: {
             type: 'string',
@@ -1074,6 +1102,16 @@ export function apply(ctx, config) {
               throw fail('MEMORY_DATE_INVALID', 'invalidAt 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
             }
             entry.invalidAt = rawInvalid
+          }
+        }
+        if (typeof args?.validFrom === 'string') {
+          if (args.validFrom === '') delete entry.validFrom
+          else {
+            const rawValid = args.validFrom.trim()
+            if (!DATE_ONLY.test(rawValid) && Number.isNaN(Date.parse(rawValid))) {
+              throw fail('MEMORY_DATE_INVALID', 'validFrom 需要 YYYY-MM-DD 或 ISO 时间（空串表示清除）。')
+            }
+            entry.validFrom = rawValid
           }
         }
         if (typeof args?.softDeadline === 'string') {
@@ -2302,7 +2340,7 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.5.2-scope',
+          codeFingerprint: '4.6.0-bi-temporal',
         }
       },
     }),

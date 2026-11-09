@@ -40,6 +40,9 @@ import {
   isStaleEntry,
   isArchivedEntry,
   isInvalidEntry,
+  isNotYetValid,
+  isTrueAt,
+  parseTimestamp,
   cleanEntities,
   cleanSources,
   normalizeScope,
@@ -1920,6 +1923,52 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   rmSync(d, { recursive: true, force: true })
 }
 
+// ---- v4.6（bi-temporal）：validFrom 事件时间起点 + at_time 点时间查询 ----
+// 对齐 Graphiti/memv 双时间戳：事实区间 [validFrom, invalidAt)，旧事实失效留档不删。
+// 判据锚：写「1月 Anthropic（3月失效）」「3月 OpenAI」两条，点时间查 2月只回 Anthropic、3月只回 OpenAI、现在只回 OpenAI，两条都留档。
+{
+  // 纯函数：validFrom 未到 = 尚未生效；isTrueAt = 区间内为真
+  assert.equal(isNotYetValid({ validFrom: '2999-01-01' }), true, '未来 validFrom = 尚未生效')
+  assert.equal(isNotYetValid({ validFrom: '2000-01-01' }), false, '过去 validFrom = 已生效')
+  assert.equal(isNotYetValid({}), false, '无 validFrom = 不拦')
+  assert.equal(isTrueAt({}, Date.parse('2024-02-15')), true, '无时间字段 = 恒真')
+  assert.equal(isTrueAt({ validFrom: '2024-01-01', invalidAt: '2024-03-01' }, Date.parse('2024-02-15')), true, '区间内为真')
+  assert.equal(isTrueAt({ validFrom: '2024-01-01', invalidAt: '2024-03-01' }, Date.parse('2024-03-15')), false, 'invalidAt 已过为假')
+  assert.equal(isTrueAt({ validFrom: '2024-01-01' }, Date.parse('2023-12-15')), false, 'validFrom 未到为假')
+  assert.ok(Number.isNaN(parseTimestamp('bad-date')), '非法日期返回 NaN')
+  assert.ok(Number.isFinite(parseTimestamp('2024-02-15')), '合法日期返回时间戳')
+  ok('v4.6 纯函数：isNotYetValid / isTrueAt / parseTimestamp')
+}
+
+{
+  const dir = makeTmp('dsh-memory-v46')
+  const h = host(dir)
+  // 写 A：1 月在 Anthropic（3 月失效）；写 B：3 月在 OpenAI（仍生效）
+  await h.defs.get('memory_add').execute({ text: '用户就职于 Anthropic', validFrom: '2024-01-01', invalidAt: '2024-03-01', allowDuplicate: true })
+  await h.defs.get('memory_add').execute({ text: '用户就职于 OpenAI', validFrom: '2024-03-01', allowDuplicate: true })
+  // 点时间查 2 月 → 只回 Anthropic（OpenAI 的 validFrom 未到）
+  const feb = await h.defs.get('memory_search').execute({ query: '就职', at_time: '2024-02-15' })
+  assert.ok((feb.matches ?? []).some((m) => m.text.includes('Anthropic')), '2 月应返回 Anthropic')
+  assert.ok(!(feb.matches ?? []).some((m) => m.text.includes('OpenAI')), '2 月不应返回 OpenAI')
+  // 点时间查 3 月中 → 只回 OpenAI（Anthropic 的 invalidAt 已过）
+  const mar = await h.defs.get('memory_search').execute({ query: '就职', at_time: '2024-03-15' })
+  assert.ok((mar.matches ?? []).some((m) => m.text.includes('OpenAI')), '3 月应返回 OpenAI')
+  assert.ok(!(mar.matches ?? []).some((m) => m.text.includes('Anthropic')), '3 月不应返回 Anthropic')
+  // 查现在（不传 at_time）→ 只回 OpenAI（Anthropic 已失效）
+  const nowRes = await h.defs.get('memory_search').execute({ query: '就职' })
+  assert.ok((nowRes.matches ?? []).some((m) => m.text.includes('OpenAI')), '现在应返回 OpenAI')
+  assert.ok(!(nowRes.matches ?? []).some((m) => m.text.includes('Anthropic')), '现在不应返回 Anthropic')
+  // 两条都在库里（留档不删，历史可反查）
+  const listed = await h.defs.get('memory_list').execute({ includeArchived: true })
+  assert.ok(listed.entries.some((e) => e.text.includes('Anthropic')), '旧事实留档不删')
+  assert.ok(listed.entries.some((e) => e.text.includes('OpenAI')), '新事实在库')
+  // validFrom 未到的不注入
+  await h.defs.get('memory_add').execute({ text: '未来才生效的计划：2030 年搬家', validFrom: '2030-01-01', allowDuplicate: true })
+  const block = h.layers[0].text({})
+  assert.ok(!block.includes('未来才生效的计划'), 'validFrom 未到不应注入')
+  ok('v4.6 bi-temporal：点时间查询 / 历史留档 / validFrom 未到不注入')
+  rmSync(dir, { recursive: true, force: true })
+}
 // ---- v4.2.2（B4）：memory_remove 无 confirm → 只返回待删清单、不删；confirm:true 才物理删 ----
 // 为什么：单条物理删原来比批量 memory_purge（必须 confirm:true）还宽松，用户的「删除三查」
 // 在工具层完全没兜。现在缺省只摊开「将删什么」（id / 字符数 / 是否 pinned）并要求先核对 memory_list。

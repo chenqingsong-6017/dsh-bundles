@@ -2,7 +2,7 @@
  * 记忆块渲染：注入视图（全文/索引）、列表视图与信任标记。
  */
 import { COMPACT_PEEK_CHARS, COMPOSITE_IMPORTANCE_WEIGHT, COMPOSITE_RECENCY_WEIGHT, DATE_ONLY, INDEX_SUMMARY_CHARS, KIND_PROCEDURE, KIND_REFERENCE, MAX_RELEVANT, MEMORY_HEADER, RELEVANCE_FLOOR, RELEVANT_COMPOSITE_MARGIN, RELEVANT_SHARE, SCOPE_BOOST } from './constants.js'
-import { applicableAt, effectiveImportance, isInvalidEntry, localDateOf, recencyOf } from './entry.js'
+import { applicableAt, effectiveImportance, isTrueAt, localDateOf, recencyOf } from './entry.js'
 import { TRUST_LEGEND } from './schema.js'
 import { gateDecision, relevanceCoverage, scoreEntries } from './score.js'
 
@@ -77,7 +77,7 @@ export function renderMemory(allEntries, options) {
       // 依据 Anthropic 官方 context engineering：前置只留硬规则，事实/历史类走 just-in-time 检索。
       entry?.inject !== false &&
       // v4.0：invalidAt 已到的条目只留档，不进提示（与 memory_search 的口径一致）。
-      !isInvalidEntry(entry) &&
+      isTrueAt(entry) &&
       applicableAt(entry, cwd),
   )
 

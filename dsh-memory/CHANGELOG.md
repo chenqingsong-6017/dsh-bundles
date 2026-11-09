@@ -3,6 +3,28 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.6.0 — 2026-11-10
+
+标题：「bi-temporal 时间分层」——补全 validFrom 事件时间起点 + at_time 点时间查询，对齐 Graphiti/memv 双时间戳。
+
+### Added
+- `validFrom` 语义补全（此前是 v2.6.1 捡回的「幽灵字段」——只存不用、无工具入口）：memory_add / memory_update 两侧支持；YYYY-MM-DD 或 ISO，非法报 `MEMORY_DATE_INVALID`，空串清除。
+- 点时间查询：memory_search 加 `at_time` 参数（YYYY-MM-DD 或 ISO），返回「那一刻为真」的条目（validFrom 已到、invalidAt 未到）。
+- 纯函数：`isNotYetValid`（validFrom 未到=尚未生效）、`isTrueAt`（区间 [validFrom, invalidAt) 内为真）、`parseTimestamp`（统一日期/ISO 解析，消除 isInvalidEntry 与新函数的重复）。
+
+### Changed
+- 注入（render.js）与检索（memory_search）过滤从「只拦 invalidAt」升级为 `isTrueAt`——validFrom 未到的条目不注入、不检索。
+- 检索结果补 validFrom/invalidAt 字段（点时间查询能看到事实区间）。
+
+### 依据
+- Graphiti/memv bi-temporal（事件时间 valid_at/invalid_at + 事务时间 created_at/expired_at）；Zep temporal KG（arXiv:2501.13956）；Memobase 靠 event timeline 拿 LoCoMo temporal 85.05%。
+- 调研来源：agentic-memory 合集（ANALYSIS-arxiv-2501.13956-zep.md、vendor/memv/docs/concepts/bi-temporal.md）。
+
+### 测试
+- 单测 136 → 138（新增：纯函数 isNotYetValid/isTrueAt/parseTimestamp + 点时间查询端到端）。
+- 判据锚：写「1月Anthropic（3月失效）」「3月OpenAI」，点时间查 2月只回 Anthropic、3月只回 OpenAI、现在只回 OpenAI，两条留档；validFrom 未到不注入。
+
+
 ## v4.6.0 — 2026-11-09（已回滚）
 
 零模型实体共现图（memory_entities 工具 + lib/entities.js）——因塞进 dsh-memory 导致挂载失败（Cordis schema 验证/新增依赖问题），已回滚，转独立插件 dsh-memory-entities。教训：新维度应独立插件，不塞核心记忆插件（「一切皆插件」）。

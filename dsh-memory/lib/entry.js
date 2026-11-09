@@ -89,11 +89,35 @@ export function isArchivedEntry(entry) {
  *   - staleAfter：**到该日期当天为止**仍有效，次日本地零点起才算待重验（"哪天该复核"）。
  * 测试用「本地 00:30」这种构造钉住，不依赖跑测试的钟点。
  */
+/** 统一解析「YYYY-MM-DD 或 ISO 时间」为毫秒时间戳；非法/空返回 NaN。DATE_ONLY 走本地日历日零点（与 invalidAt 同口径）。 */
+export function parseTimestamp(value) {
+  const raw = String(value ?? '').trim()
+  if (raw === '') return NaN
+  return DATE_ONLY.test(raw) ? localDayStart(raw) : Date.parse(raw)
+}
+
 export function isInvalidEntry(entry, now = Date.now()) {
-  const raw = typeof entry?.invalidAt === 'string' ? entry.invalidAt.trim() : ''
-  if (raw === '') return false
-  const stamp = DATE_ONLY.test(raw) ? localDayStart(raw) : Date.parse(raw)
+  const stamp = parseTimestamp(entry?.invalidAt)
   return Number.isFinite(stamp) && stamp <= now
+}
+/**
+ * v4.6：一条记忆是否「尚未生效」——validFrom 还没到。
+ * bi-temporal 的事件时间起点（对齐 Graphiti/memv 的 valid_at）：
+ * 计划/预约/未来才成立的事实，在 validFrom 之前不注入、不检索，到了才「生效」。
+ * 与 invalidAt（终点）配对，构成完整事件时间区间 [validFrom, invalidAt)。
+ */
+export function isNotYetValid(entry, now = Date.now()) {
+  const stamp = parseTimestamp(entry?.validFrom)
+  return Number.isFinite(stamp) && stamp > now
+}
+
+/**
+ * v4.6：在 atTime 这个时点，这条事实是否为真（事件时间判据）。
+ * 区间 [validFrom, invalidAt)：validFrom 已到（或没设）且 invalidAt 未到（或没设）。
+ * 点时间查询（memory_search at_time）与注入/检索过滤共用这一条，避免三处判断漂移。
+ */
+export function isTrueAt(entry, atTime = Date.now()) {
+  return !isNotYetValid(entry, atTime) && !isInvalidEntry(entry, atTime)
 }
 
 const normalizePath = (value) => String(value ?? '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase()
