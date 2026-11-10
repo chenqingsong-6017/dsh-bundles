@@ -3,6 +3,23 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.8.0 — 2026-11-10
+
+标题：「用户画像」——slot 槽位 + profileView 聚合，memory_search slot 查询。
+
+### Added
+- `PROFILE_SLOTS`（identity/preference/habit/environment/taboo/goal/milestone）槽位定义 + 中文标签。
+- `slot` 字段：memory_add/update 两侧支持，白名单校验。
+- `profileView` 纯函数：按槽位聚合画像，读不碰 LLM。
+- memory_search 加 `slot` 参数：按槽位过滤（或 all），返回 `profile`（完整画像）。
+
+### 依据
+- Memobase typed taxonomy（8 主题/~40 槽位）的零模型版：画像=结构化槽位，不是笔记袋；读路径纯 SQL/内存、不碰 LLM。
+
+### 测试
+- 单测 140 → 142（新增：profileView 纯函数 + slot 写入/过滤/画像端到端）。
+
+
 ## v4.7.0 — 2026-11-10
 
 标题：「实体图视图」——entityIndex + entityCoccur 纯函数，memory_search 加 entity 过滤；图作为派生索引，不另起权威源。

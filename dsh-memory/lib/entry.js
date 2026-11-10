@@ -261,3 +261,18 @@ export function entityCoccur(entries, target) {
   }
   return result
 }
+
+/**
+ * v4.8：用户画像视图——把「关于用户的稳定事实」按槽位聚合。
+ * 零模型版 Memobase typed taxonomy：slot 是主题（identity/preference/habit/environment/taboo/goal/milestone）。
+ * 读路径纯内存聚合、不碰 LLM；返回 { slot: [text, ...] }，按槽位分组。
+ */
+export function profileView(entries) {
+  const result = {}
+  for (const entry of entries) {
+    if (typeof entry?.slot !== 'string' || entry.slot === '') continue
+    if (!Array.isArray(result[entry.slot])) result[entry.slot] = []
+    result[entry.slot].push(entry.text)
+  }
+  return result
+}

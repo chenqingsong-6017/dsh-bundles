@@ -45,6 +45,7 @@ import {
   parseTimestamp,
   entityIndex,
   entityCoccur,
+  profileView,
   cleanEntities,
   cleanSources,
   normalizeScope,
@@ -2003,6 +2004,39 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.ok(!filtered.matches.some((m) => m.text.includes('DSH是')), 'entity=用户 不应含 DSH 那条')
   assert.deepEqual(filtered.coccurring ?? [], [{ entity: 'Anthropic', count: 1 }, { entity: 'OpenAI', count: 1 }], '共现=Anthropic/OpenAI')
   ok('v4.7 entity 过滤 + 共现返回（图查询）')
+  rmSync(dir, { recursive: true, force: true })
+}
+// ---- v4.8（用户画像）：slot 槽位 + profileView 聚合 ----
+// 画像 = 「关于用户的稳定事实」按槽位分桶，读不碰 LLM（Memobase typed taxonomy 零模型版）。
+// 判据锚：写 preference/habit/taboo 三条画像，profileView 按槽位分组；slot=all 一次返回完整画像。
+{
+  const entries = [
+    { id: 'a', slot: 'preference', text: '处女座，追问值不值' },
+    { id: 'b', slot: 'habit', text: '插件数据落 D 盘' },
+    { id: 'c', slot: 'taboo', text: '负资产不留' },
+    { id: 'd', text: '无槽位的普通记忆' },
+  ]
+  const view = profileView(entries)
+  assert.deepEqual(view, { preference: ['处女座，追问值不值'], habit: ['插件数据落 D 盘'], taboo: ['负资产不留'] }, 'profileView 按槽位分组，无 slot 忽略')
+  ok('v4.8 纯函数：profileView（画像槽位聚合）')
+}
+
+{
+  const dir = makeTmp('dsh-memory-v48')
+  const h = host(dir)
+  await h.defs.get('memory_add').execute({ text: '画像：处女座追问值不值', slot: 'preference', allowDuplicate: true })
+  await h.defs.get('memory_add').execute({ text: '画像：插件数据落D盘', slot: 'habit', allowDuplicate: true })
+  await h.defs.get('memory_add').execute({ text: '画像：负资产不留', slot: 'taboo', allowDuplicate: true })
+  await h.defs.get('memory_add').execute({ text: '普通记忆：无槽位', allowDuplicate: true })
+  const all = await h.defs.get('memory_search').execute({ query: '画像', slot: 'all' })
+  assert.ok(all.matches.some((m) => m.text.includes('处女座')), 'slot=all 应含 preference')
+  assert.ok(all.matches.some((m) => m.text.includes('落D盘')), 'slot=all 应含 habit')
+  assert.ok(all.matches.some((m) => m.text.includes('负资产')), 'slot=all 应含 taboo')
+  assert.ok(!all.matches.some((m) => m.text.includes('无槽位')), 'slot=all 不应含无 slot 的')
+  assert.deepEqual(all.profile?.preference, ['画像：处女座追问值不值'], 'profile 按槽位返回完整画像')
+  const pref = await h.defs.get('memory_search').execute({ query: '画像', slot: 'preference' })
+  assert.ok(pref.matches.every((m) => !m.text.includes('落D盘') && !m.text.includes('负资产')), 'slot=preference 只回 preference')
+  ok('v4.8 slot 写入 + 过滤 + profile 一次返回完整画像')
   rmSync(dir, { recursive: true, force: true })
 }
 // ---- v4.2.2（B4）：memory_remove 无 confirm → 只返回待删清单、不删；confirm:true 才物理删 ----

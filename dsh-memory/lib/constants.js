@@ -208,3 +208,9 @@ export const BM25_ALIAS_WEIGHT = 2.5
 
 /** 同义词扩展的权重：低于原词，避免扩展词把噪声顶上来。 */
 export const EXPANSION_WEIGHT = 0.2
+
+// v4.8：用户画像槽位（对齐 Memobase typed taxonomy 的零模型版）。
+// 画像 = 「关于用户的稳定事实」按主题分槽，读路径纯内存聚合、不碰 LLM。
+// 中文：身份/偏好/习惯/环境/禁忌/目标/里程碑。
+export const PROFILE_SLOTS = ['identity', 'preference', 'habit', 'environment', 'taboo', 'goal', 'milestone']
+export const PROFILE_SLOT_LABELS = { identity: '身份', preference: '偏好', habit: '习惯', environment: '环境', taboo: '禁忌', goal: '目标', milestone: '里程碑' }
