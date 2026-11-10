@@ -3,7 +3,8 @@
   "version": "0.11.4",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Butler file organizer for C:/D:: classify loose files into folders by type or month, preview first, apply on confirm, undo anytime. Also reports safe-to-clean junk separately. Also keeps an install/uninstall ledger (inventory) with a read-only uninstall dry-run and a reconcile check.",
@@ -24,5 +25,6 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "main": "index.js"
 }

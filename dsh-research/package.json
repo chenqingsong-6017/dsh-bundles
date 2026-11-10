@@ -3,7 +3,8 @@
   "version": "0.1.4",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Research workflow as tool boundaries: concrete decision question, one evidence line per conclusion, tiered sources, mechanical audit, markdown report.",
@@ -13,7 +14,14 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
-  "files": ["index.js", "cordis.patch.yml", "locale/*.json", "icon.svg", "README.md", "CHANGELOG.md"],
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

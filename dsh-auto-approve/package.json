@@ -3,7 +3,8 @@
   "version": "0.1.2",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Deterministic auto-approval layer for tool calls: JSON rules decide allow / ask / deny before dispatch, with built-in hard red lines and a reserved v2 classifier hook.",
@@ -23,5 +24,6 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "main": "index.js"
 }

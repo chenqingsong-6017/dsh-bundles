@@ -3,7 +3,8 @@
   "version": "0.1.3",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Git-based plugin updater and GitHub study bench: track upstream commits for local bundles, validate and stage updates with backup/rollback, and clone public repos locally so the agent can read and learn from them.",
@@ -23,5 +24,6 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "main": "index.js"
 }

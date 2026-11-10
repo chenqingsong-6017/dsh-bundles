@@ -3,7 +3,8 @@
   "version": "4.9.0",
   "private": true,
   "engines": {
-    "node": ">=23.4.0"
+    "node": ">=23.4.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Persistent memory across sessions: agent-curated facts injected into the system prompt, editable with memory tools.",
@@ -25,5 +26,6 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "main": "index.js"
 }

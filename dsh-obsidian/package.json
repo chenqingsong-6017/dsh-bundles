@@ -3,7 +3,8 @@
   "version": "0.4.1",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Obsidian vault toolkit: P1 read-only search/read/status, P2 controlled write (allowlist / no-overwrite / conflict-abort), P3 page-contract lint (fields, naming, one-liner, ids, pointer targets).",

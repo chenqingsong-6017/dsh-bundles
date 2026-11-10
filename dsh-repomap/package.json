@@ -3,7 +3,8 @@
   "version": "1.0.4",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Ranked repository map and symbol outline for any workspace: which files matter, what they define, within a token budget.",
@@ -23,5 +24,6 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "main": "index.js"
 }

@@ -3,7 +3,8 @@
   "version": "0.2.0",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "description": "四档推理等级滑条：在输入栏右侧直接切换当前会话的 reasoningEffort（关/低/高/最高）。",
   "type": "module",

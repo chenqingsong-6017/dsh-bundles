@@ -3,7 +3,8 @@
   "version": "0.1.1",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "User-level hooks for DeepSeek Harness: a hooks.json turns lifecycle events into shell checks that can deny, ask, or annotate tool calls without writing a plugin.",

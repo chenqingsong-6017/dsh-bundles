@@ -3,7 +3,8 @@
   "version": "0.1.4",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "Local event log on D: (Windows Event Viewer style) — channels, levels, stable event codes, on-demand query, never injected into the prompt.",

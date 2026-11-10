@@ -3,7 +3,8 @@
   "version": "0.2.0",
   "private": true,
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
   },
   "type": "module",
   "description": "把会话榨成带证据的候选记忆（先榨后删），数据落 D 盘；v0 规则抽取、零依赖、不自动写入 memory。",
