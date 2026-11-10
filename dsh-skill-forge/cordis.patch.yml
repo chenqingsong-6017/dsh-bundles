@@ -1,0 +1,10 @@
+# dsh-skill-forge：学习循环（事实候选 → skill 候选 → 复核入库）。
+# 本 bundle 自带插件代码，name 用相对路径即按本 patch 所在目录解析。
+- insert:
+    - id: skill-forge
+      name: './index.js'
+      # 需要改配置时取消注释（默认即推荐值）：
+      # config:
+      #   harvestDir: D:\AI\dsh-data\harvest
+      #   storeDir: D:\AI\dsh-data\skill-forge
+      #   skillsRoot: C:\Users\cqs6017\.dsh\skills
