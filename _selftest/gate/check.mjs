@@ -228,6 +228,56 @@ for (const bundle of bundles) {
   }
 }
 if (localeChecked > 0) lines.push('结构门：检查 ' + localeChecked + ' 个 locale 文件')
+// ---- 阶段 2c：工具契约（对齐官方 defineTool，2026-11-10 补） ----
+//
+// 官方 adding-a-tool.md：面向模型的工具必须声明 output.schema（返回规范 JSON 值）+ output.render（渲染成人话）。
+// 臣的插件用 raw ctx.tools.register（官方允许，但要求「自行负责输入校验」），output.schema/render 仍须显式声明；
+// 缺了 = 返回契约不可验收、模型看到原始 JSON。本门只查「有 execute 的工具块」，webServer 路由等非工具注册块跳过。
+// 两个健壮性要点（2026-11-10 实测踩过）：
+//   1) 入口按 package.json 的 main 定位，不能硬编码 index.js（dsh-reasoning-slider 的入口是 lib/index.js）；
+//   2) 注册写法按 /\.register\s*\(/ 匹配，不能硬编码 tools.register(（dsh-subagent-brief 用 toolService.register）。
+const extractRegisterBlocks = (source) => {
+  const blocks = []
+  const re = /\.register\s*\(/g
+  let m
+  while ((m = re.exec(source)) !== null) {
+    const open = source.indexOf('(', m.index)
+    let depth = 0
+    let j = open
+    let inStr = null
+    for (; j < source.length; j += 1) {
+      const c = source[j]
+      if (inStr) { if (c === '\\') { j += 1; continue } if (c === inStr) inStr = null; continue }
+      if (c === '"' || c === "'" || c === '`') { inStr = c; continue }
+      if (c === '(') depth += 1
+      else if (c === ')') { depth -= 1; if (depth === 0) break }
+    }
+    blocks.push(source.slice(m.index, j + 1))
+    re.lastIndex = j + 1
+  }
+  return blocks
+}
+let toolChecked = 0
+for (const bundle of bundles) {
+  const dir = path.join(BUNDLES_DIR, bundle)
+  const pkgFile = path.join(dir, 'package.json')
+  if (!existsSync(pkgFile)) continue
+  let pkg
+  try { pkg = JSON.parse(readFileSync(pkgFile, 'utf8')) } catch { continue }
+  const mainRel = typeof pkg.main === 'string' ? pkg.main : 'index.js'
+  const entry = path.join(dir, mainRel)
+  if (!existsSync(entry)) continue
+  const source = readFileSync(entry, 'utf8')
+  const toolBlocks = extractRegisterBlocks(source).filter((block) => /\bexecute\s*[(:]/.test(block))
+  for (const block of toolBlocks) {
+    toolChecked += 1
+    const name = (block.match(/name\s*:\s*['"]([^'"]+)['"]/) || [])[1] || '(未命名)'
+    if (!/output\s*:/.test(block)) failures.push('✗ ' + bundle + '/' + name + ': 工具缺 output（官方要求 output.schema + output.render）')
+    else if (!/schema\s*:/.test(block)) failures.push('✗ ' + bundle + '/' + name + ': 工具 output 缺 schema')
+    else if (!/render/.test(block)) failures.push('✗ ' + bundle + '/' + name + ': 工具 output 缺 render')
+  }
+}
+if (toolChecked > 0) lines.push('工具契约：检查 ' + toolChecked + ' 个模型工具（output.schema + render）')
 
 // 测试门前先扫掉上次运行遗留的测试临时目录（gate 串行跑测试，此刻扫到的都是旧账）。
 // 2026-11-02：memory 测试曾 5 小时积 153 个目录；统一兜底后不管哪个测试文件漏，这里补扫。
