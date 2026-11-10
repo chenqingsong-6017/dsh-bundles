@@ -301,7 +301,18 @@ export function apply(ctx, config) {
             coverage: { type: 'number' },
             byId: { type: 'array', items: { type: 'string' } },
             coccurring: { type: 'array', items: { type: 'object', properties: { entity: { type: 'string' }, count: { type: 'integer' } } } },
-            profile: { type: 'object', additionalProperties: { type: 'array', items: { type: 'string' } } },
+            profile: {
+              type: 'object',
+              properties: {
+                identity: { type: 'array', items: { type: 'string' } },
+                preference: { type: 'array', items: { type: 'string' } },
+                habit: { type: 'array', items: { type: 'string' } },
+                environment: { type: 'array', items: { type: 'string' } },
+                taboo: { type: 'array', items: { type: 'string' } },
+                goal: { type: 'array', items: { type: 'string' } },
+                milestone: { type: 'array', items: { type: 'string' } },
+              },
+            },
             matches: {
               type: 'array',
               items: {
