@@ -155,6 +155,16 @@ for (const bundle of bundles) {
   }
   if (typeof pkg?.name !== 'string') failures.push('✗ ' + bundle + ': package.json 缺 name')
 
+  // 包契约（对齐官方 publish.md 组合包标准，2026-11-10 补）：
+  // engines.dsh 声明支持的 DSH 版本范围（官方 app-boot 用它单独判定兼容，semver includePrerelease:true）；
+  // main 显式声明入口（官方组合包要求 main: index.js）。缺了 = 版本兼容/入口不可验收。
+  if (typeof pkg?.engines?.dsh !== 'string' || pkg.engines.dsh.trim() === '') {
+    failures.push('✗ ' + bundle + ': 缺 engines.dsh（组合包须声明 DSH 版本范围，见官方 publish.md）')
+  }
+  if (typeof pkg?.main !== 'string' || pkg.main.trim() === '') {
+    failures.push('✗ ' + bundle + ': 缺 main（组合包须显式声明入口，官方 publish.md 要求 main: index.js）')
+  }
+
   const patchRel = pkg?.dsh?.bundle?.patch
   if (typeof patchRel !== 'string') {
     failures.push('✗ ' + bundle + ': 缺 dsh.bundle.patch')

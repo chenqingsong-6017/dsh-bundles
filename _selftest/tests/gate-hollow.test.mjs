@@ -46,6 +46,7 @@ function makePlugin(root, name) {
     version: "0.0.0",
     type: "module",
     main: "index.js",
+    engines: { dsh: ">=0.2.0 <0.3.0" },
     exports: { ".": "./index.js" },
     dsh: { bundle: { patch: "./cordis.patch.yml" } },
   }, null, 2));
