@@ -4,6 +4,7 @@
  * 只管「一条记忆在某一刻算什么状态」，不碰存储与渲染。
  */
 import { CURATOR_STALE_GRACE_DAYS, DATE_ONLY, DEFAULT_SCOPE_ROOTS, IMPORTANCE_BASE, KIND_REFERENCE, RECENCY_DECAY_PER_HOUR, REFERENCE_STALE_DAYS } from './constants.js'
+import { textSimilarity } from './text.js'
 
 /** 只写日期的字段（staleAfter / invalidAt）→ 本地日历日零点的毫秒时间戳；非法返回 NaN。 */
 function localDayStart(stamp) {
@@ -275,4 +276,36 @@ export function profileView(entries) {
     result[entry.slot].push(entry.text)
   }
   return result
+}
+
+/**
+ * v4.9：矛盾浮现（对齐 ai-memory-mcp curator daemon 的 surface contradictions）。
+ * 同一 entity 下的生效条目对，文本不是重复（相似度 < 0.9）= 疑似矛盾（共享谓词模板、值不同）。
+ * 只浮现、不自动失效——零模型判「矛盾」有误杀风险，浮现后交人/LLM 确认再 supersede。
+ */
+export function detectContradictions(entries) {
+  const byEntity = new Map()
+  for (const entry of entries) {
+    if (!Array.isArray(entry?.entities) || entry.entities.length === 0) continue
+    for (const entity of entry.entities) {
+      const key = String(entity).trim()
+      if (key === '') continue
+      if (!byEntity.has(key)) byEntity.set(key, [])
+      byEntity.get(key).push(entry)
+    }
+  }
+  const contradictions = []
+  for (const [entity, list] of byEntity) {
+    if (list.length < 2) continue
+    for (let i = 0; i < list.length; i++) {
+      for (let j = i + 1; j < list.length; j++) {
+        const a = list[i]
+        const b = list[j]
+        if (textSimilarity(a.text, b.text) < 0.9) {
+          contradictions.push({ entity, a: a.id, b: b.id, aText: a.text, bText: b.text })
+        }
+      }
+    }
+  }
+  return contradictions
 }

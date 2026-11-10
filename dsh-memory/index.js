@@ -27,7 +27,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { CONFLICT_FLOOR, CONSOLIDATE_MIN_USES, CONTEXT_ORDER, DATE_ONLY, DEFAULT_MAX_BYTES, DEFAULT_MAX_INJECT_CHARS, DEFAULT_SCOPE_ROOTS, KIND_PROCEDURE, MAX_CANDIDATES_PER_TURN, MAX_SIMILAR_HINT, MAX_TEXT_CHARS, PROCEDURE_MIN_VERIFIED, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, TEXT_TOO_LONG_HINT, PROFILE_SLOTS, PROFILE_SLOT_LABELS } from './lib/constants.js'
-import { deriveStaleAfter, effectiveImportance, entityCoccur, entityIndex, importanceOf, isArchivedEntry, isInvalidEntry, isNotYetValid, isStaleEntry, isTrueAt, profileView, localDateOf, parseTimestamp } from './lib/entry.js'
+import { deriveStaleAfter, detectContradictions, effectiveImportance, entityCoccur, entityIndex, importanceOf, isArchivedEntry, isInvalidEntry, isNotYetValid, isStaleEntry, isTrueAt, profileView, localDateOf, parseTimestamp } from './lib/entry.js'
 import { stripHarnessBlocks, suggestAliases, textSimilarity } from './lib/text.js'
 import { collectRuleFiles, derivableHit, extractCandidates, extractRuleCandidates } from './lib/candidates.js'
 import { fail, text } from './lib/util.js'
@@ -39,7 +39,7 @@ import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 
-export { isStaleEntry, isArchivedEntry, isInvalidEntry, isNotYetValid, isTrueAt, parseTimestamp, entityIndex, entityCoccur, profileView, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
+export { isStaleEntry, isArchivedEntry, isInvalidEntry, isNotYetValid, isTrueAt, parseTimestamp, entityIndex, entityCoccur, profileView, detectContradictions, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
 export { bigramSet, textSimilarity, stripHarnessBlocks, tokenize, suggestAliases, expandQuery, contentUnitsOf, queryClauses } from './lib/text.js'
 export { queryIdfSum, scoreEntries, scoreEntriesStrict, gateDecision, relevanceCoverage, scoreMemory } from './lib/score.js'
 export { trustMark, renderMemory } from './lib/render.js'
@@ -561,6 +561,7 @@ export function apply(ctx, config) {
           properties: {
             entry: entrySchema,
             deduped: { type: 'boolean' },
+            confidenceBoosted: { type: 'boolean' },
             usedChars: { type: 'integer' },
             maxBytes: { type: 'integer' },
             // v4.2：可推导过滤命中时 entry 缺省（不写库），改为返回诊断三件套。
@@ -851,6 +852,25 @@ export function apply(ctx, config) {
           .map((item) => ({ entry: item, similarity: textSimilarity(item.text, raw) }))
           .sort((a, b) => b.similarity - a.similarity)
         const similar = neighbours.filter((item) => item.similarity >= SIMILAR_HINT_FLOOR).slice(0, MAX_SIMILAR_HINT)
+        // v4.9（7 完整 curator）：信任增量（对齐 core-memory-kit「dedup hit → confidence++」）。
+        // 写入几乎完全一致的内容 = 对同一事实的再次确认，不是新增重复——旧条目置信度 +1，不产生垃圾。
+        // 阈值 0.97 高于 CONFLICT_FLOOR(0.92)：完全一致先走信任增量，高度相似但不同才走冲突门。
+        const nearDup = neighbours.find((item) => item.similarity >= 0.97 && item.entry.status !== 'draft')
+        if (nearDup && args?.supersede !== true && args?.allowDuplicate !== true && args?.status !== 'draft') {
+          const dupEntry = nearDup.entry
+          dupEntry.verifiedCount = (dupEntry.verifiedCount ?? 0) + 1
+          dupEntry.lastVerifiedAt = new Date().toISOString()
+          dupEntry.updatedAt = new Date().toISOString()
+          persist()
+          return {
+            entry: publicEntry(dupEntry),
+            deduped: true,
+            confidenceBoosted: true,
+            usedChars: usedChars(),
+            maxBytes,
+            similar: [{ id: dupEntry.id, similarity: Math.round(nearDup.similarity * 1000) / 1000, text: dupEntry.text }],
+          }
+        }
         // v4.0：写入冲突**硬**检测。调研（mem0/Letta/Graphiti）唯一有共识的一条是「冲突必须显式处理」，
         // 而不是像旧版那样只提示一句、模型可以当没看见。同 scope + 高度相似 + 双方都生效 → 直接拒绝，
         // 逼出三个明确选项；draft 与 allowDuplicate 是合法逃生口。
@@ -1731,6 +1751,7 @@ export function apply(ctx, config) {
               required: ['entries', 'avgChars', 'injectRatio', 'entitiesCovered', 'sourcesCovered', 'invalid', 'stage', 'nextTrigger'],
               additionalProperties: false,
             },
+            contradictions: { type: 'array', items: { type: 'object', properties: { entity: { type: 'string' }, a: { type: 'string' }, b: { type: 'string' }, aText: { type: 'string' }, bText: { type: 'string' } } } },
             schemaVersion: { type: 'integer' },
           },
           required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget', 'growth', 'schemaVersion'],
@@ -1810,6 +1831,7 @@ export function apply(ctx, config) {
           .sort((a, b) => (b.usedCount ?? 0) - (a.usedCount ?? 0))
           .slice(0, limit)
           .map((entry) => ({ id: entry.id, usedCount: entry.usedCount ?? 0 }))
+        const contradictions = detectContradictions(active)
         return {
           total: state.entries.length,
           active: active.length,
@@ -1862,6 +1884,7 @@ export function apply(ctx, config) {
               nextTrigger,
             }
           })(),
+          contradictions: contradictions.slice(0, limit),
           schemaVersion: Number.isInteger(state.version) && state.version > 0 ? state.version : SCHEMA_VERSION,
         }
       },
@@ -2395,7 +2418,7 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.8.0-profile',
+          codeFingerprint: '4.9.0-curator',
         }
       },
     }),

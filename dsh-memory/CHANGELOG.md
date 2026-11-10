@@ -3,6 +3,25 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.9.0 — 2026-11-10
+
+标题：「完整 curator」——信任增量（dedup→confidence++）+ 矛盾浮现（surface contradictions）。
+
+### Added
+- 信任增量：memory_add 写入几乎一致内容（相似度 ≥0.97）→ 旧条目 verifiedCount++（置信度提升），不新增重复。对齐 core-memory-kit「dedup hit → confidence++」。
+- `detectContradictions` 纯函数：同 entity 的条目对、文本非重复（相似度 <0.9）→ 疑似矛盾。只浮现不自动失效（零模型误杀风险，交人/LLM 确认）。
+- memory_audit 加 `contradictions` 报告。
+
+### Changed
+- 冲突门改进：v4.0「高度相似必拒」→ v4.9「只差标点（相似度 1.0）dedup→confidence++，内容不同才拒绝」。
+
+### 依据
+- core-memory-kit（trust delta：dedup→confidence++、downgrade on supersede）、ai-memory-mcp（autonomous curator daemon surface contradictions）、Cognee improve（feedback-weighted consolidation）。
+
+### 测试
+- 单测 142 → 144（新增：detectContradictions 纯函数 + 信任增量端到端）。
+
+
 ## v4.8.0 — 2026-11-10
 
 标题：「用户画像」——slot 槽位 + profileView 聚合，memory_search slot 查询。

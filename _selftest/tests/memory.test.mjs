@@ -46,6 +46,7 @@ import {
   entityIndex,
   entityCoccur,
   profileView,
+  detectContradictions,
   cleanEntities,
   cleanSources,
   normalizeScope,
@@ -1885,7 +1886,12 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   assert.deepEqual(first.entry.entities, ['抖音', 'dsh-memory'], '实体标签要落库')
   assert.deepEqual(first.entry.sources, ['index.js:429'], '来源要落库')
   // 冲突硬门：默认拒绝，并点名三条出路
-  await assert.rejects(() => h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev' }), /写入冲突/, '高度相似必须被拒')
+  // v4.9：信任增量改进了 v4.0 冲突门——「只差标点」（相似度 1.0）不再拒绝，而是 dedup→confidence++。
+  // 只有「内容不同但高度相似」（如改字）才仍走冲突门拒绝。
+  const dedupHit = await h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev' })
+  assert.equal(dedupHit.deduped, true, '几乎一致（只差标点）→ 信任增量 dedup，不拒绝')
+  assert.equal(dedupHit.entry.id, first.entry.id, 'dedup 返回旧条目 id')
+  assert.equal(dedupHit.entry.verifiedCount, 1, '旧条目置信度 +1')
   const draft = await h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev', status: 'draft' })
   assert.ok(draft.entry && draft.entry.id !== first.entry.id, 'draft 是合法逃生口')
   const dup = await h.defs.get('memory_add').execute({ text: textB, scope: 'plugin-dev', allowDuplicate: true })
@@ -2037,6 +2043,42 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   const pref = await h.defs.get('memory_search').execute({ query: '画像', slot: 'preference' })
   assert.ok(pref.matches.every((m) => !m.text.includes('落D盘') && !m.text.includes('负资产')), 'slot=preference 只回 preference')
   ok('v4.8 slot 写入 + 过滤 + profile 一次返回完整画像')
+  rmSync(dir, { recursive: true, force: true })
+}
+// ---- v4.9（7 完整 curator）：信任增量（dedup→confidence++）+ 矛盾浮现 ----
+// 对齐 core-memory-kit「dedup hit → confidence++」与 ai-memory-mcp「surface contradictions」。
+// 判据锚：写几乎一致内容 → dedup 命中、旧条目 verifiedCount++、不新增；同 entity 不同值 → audit 浮现矛盾。
+{
+  const entries = [
+    { id: 'a', entities: ['用户'], text: '用户在 OpenAI 工作' },
+    { id: 'b', entities: ['用户'], text: '用户在 Anthropic 工作' },
+    { id: 'c', entities: ['DSH'], text: 'DSH 是 harness' },
+  ]
+  const contra = detectContradictions(entries)
+  assert.equal(contra.length, 1, '应检测到 1 对矛盾')
+  assert.equal(contra[0].entity, '用户', '矛盾实体是「用户」')
+  assert.equal(contra[0].a, 'a', '矛盾对 a')
+  assert.equal(contra[0].b, 'b', '矛盾对 b')
+  ok('v4.9 纯函数：detectContradictions 矛盾浮现')
+}
+
+{
+  const dir = makeTmp('dsh-memory-v49')
+  const h = host(dir)
+  // 信任增量：写几乎一致内容 → dedup 命中、confidence++、不新增
+  const first = await h.defs.get('memory_add').execute({ text: '用户在 OpenAI 工作', entities: ['用户'], allowDuplicate: true })
+  const dup = await h.defs.get('memory_add').execute({ text: '用户在 OpenAI 工作。' })
+  assert.equal(dup.deduped, true, 'dedup 命中应返回 deduped: true')
+  assert.equal(dup.confidenceBoosted, true, '应标记 confidenceBoosted')
+  assert.equal(dup.entry.id, first.entry.id, 'dedup 返回的是旧条目 id')
+  assert.equal(dup.entry.verifiedCount, 1, '旧条目 verifiedCount 从 0 → 1')
+  const listAfter = await h.defs.get('memory_list').execute({})
+  assert.equal(listAfter.entries.filter((e) => e.text.includes('OpenAI')).length, 1, '不新增重复条目')
+  // 矛盾浮现：同 entity 不同值
+  await h.defs.get('memory_add').execute({ text: '用户在 Anthropic 工作', entities: ['用户'], allowDuplicate: true })
+  const audit = await h.defs.get('memory_audit').execute({})
+  assert.ok((audit.contradictions ?? []).some((c) => c.entity === '用户'), 'audit 应浮现「用户」矛盾')
+  ok('v4.9 信任增量 + 矛盾浮现（7 curator 核心）')
   rmSync(dir, { recursive: true, force: true })
 }
 // ---- v4.2.2（B4）：memory_remove 无 confirm → 只返回待删清单、不删；confirm:true 才物理删 ----
