@@ -284,6 +284,7 @@ MIT © 2026 5D-artist
 - **验证记录（2026-11-11，DSH 0.2.2-rc.1，Windows）**：
   - ✅ 单测：上游 5 个测试文件 **39/39 PASS**（`node --test test/host.test.mjs test/http.test.mjs test/clean.test.mjs test/leftovers.test.mjs test/client.test.mjs`）。
   - ✅ 映射测试：`_selftest/tests/archived-purge.test.mjs` = 上游 39 条 + 本仓补丁 3 条 = **42 条全过**，已进 `npm run check` 验证门。
+  - ✅ 测试稳定性：修掉上游 `http.test.mjs` 与插件启动 `finalizePending()` 的竞态（mock registry 写入重试 + 等 finalize settle 后再种 ghost）；修复前连跑 12 次有 2–5 次报「leftover scan … purges them」，修复后 http **12/12**、映射测试 **8/8** 稳定通过。
   - ✅ 真机宿主侧（profile 重组后零重启）：`GET /plugins/archived-purge/state` 返回 1.3.0 字段（`pendingFinalize` / `activity` / `activityUnknown` / `resident` / `scheduleCount`），**19 条归档会话**列举正常；`activity` 非 `activityUnknown` = rc.1 的 `workspace/session-activity` waterfall 正常应答。
   - ✅ 只读路由真机：`POST /scan`（2 个会话预演 ok）、`POST /leftovers`（扫描完成）、`POST /gc {dryRun:true}`（报 12 个孤儿附件 / 8.5 MB，未删）、`POST /announce` 空数组返回 `invalid-request`（补丁路由已注册）。
   - ⚠️ 未直证：设置页 GUI 渲染（1.3.0 页面重设计）。`archived-purge-client-errors.log` 不存在 = 客户端未见挂载失败，但浏览器端 bundle 重建后需要刷新页面（Ctrl+R）才能看到新 UI；真正机删除未执行（19 条归档会话是真实数据，不冒险）。

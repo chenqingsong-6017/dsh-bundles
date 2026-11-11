@@ -47,11 +47,22 @@ function makeCtx(home, activity, options = {}) {
   function rewrite(change) {
     chain = chain.then(async () => {
       const file = path.join(home, 'storages', 'workspace.json');
-      const doc = JSON.parse(await fsp.readFile(file, 'utf8'));
-      change(doc);
       const temporary = `${file}.${Math.random().toString(16).slice(2)}.tmp`;
-      await fsp.writeFile(temporary, JSON.stringify(doc, null, 2));
-      await fsp.rename(temporary, file);
+      // The plugin's start-up finalize may hold the same file open while this
+      // rewrite lands; Windows refuses to replace a file another handle is
+      // reading, so retry instead of surfacing a spurious delete failure.
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const doc = JSON.parse(await fsp.readFile(file, 'utf8'));
+          change(doc);
+          await fsp.writeFile(temporary, JSON.stringify(doc, null, 2));
+          await fsp.rename(temporary, file);
+          return;
+        } catch (error) {
+          if (attempt >= 4) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
     });
     return chain;
   }
@@ -286,9 +297,10 @@ test('leftover scan reports stale index entries and purges them', async () => {
   process.env.DSH_HOME = home;
   const { ctx, routes } = makeCtx(home, () => []);
   apply(ctx);
-  // Let the plugin's own start-up finalize settle before planting the ghosts,
-  // otherwise it would clean them up before the test looks at them.
-  await new Promise((resolve) => setImmediate(resolve));
+  // Let the plugin's own start-up finalize (a fire-and-forget async task) settle
+  // before planting the ghosts, otherwise it races this test's rewrites and can
+  // clean them up before the test looks at them.
+  await new Promise((resolve) => setTimeout(resolve, 50));
 
   const registryFile = path.join(home, 'storages', 'workspace.json');
   const doc = JSON.parse(await fsp.readFile(registryFile, 'utf8'));

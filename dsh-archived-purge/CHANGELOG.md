@@ -11,6 +11,7 @@
 - **保留本地增强**：删除后为每个 id 的两种拼写补播 `api-session/removed`；新增 `POST /plugins/archived-purge/announce`；客户端删除成功后 `sessions.refresh()`。
 - **移除本地旧实现**：release-then-delete（停 agent → flush → detach live 条目）不再保留——上游 1.0.1 的方案更稳（不强行 detach 内存中的会话，避免与宿主存储层竞争）。
 - 测试：上游 5 个测试文件 39 条 + 本仓补丁 3 条 = 42 条全过；`npm run check` 验证门通过。
+- 测试稳定性：修掉上游 `test/http.test.mjs` 与插件启动 `finalizePending()` 的竞态（mock registry 写入重试 + 等 finalize settle 后再种 ghost）——修复前连跑 12 次有 2–5 次报「leftover scan … purges them」，修复后 http 12/12、映射测试 8/8 稳定。
 - 真机（DSH 0.2.2-rc.1）：`GET /state` 返回 1.3.0 字段（`activity` / `resident` / `scheduleCount` / `pendingFinalize`），`/scan`、`/leftovers`、`/gc`(dryRun)、`/announce` 均可用；`activity` 无 `activityUnknown` 标记 = rc.1 的 `workspace/session-activity` waterfall 正常应答。删除链路未在本轮真机执行（19 条归档会话是真实数据，不冒险）。
 
 ## 1.0.0-vendored.3 (2026-11-06 00:20)
