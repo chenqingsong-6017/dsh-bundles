@@ -271,7 +271,17 @@ export function apply(ctx, config) {
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Keywords; space-separated terms are AND-weighted, a whole-string hit scores higher.' },
+          query: {
+            type: 'string',
+            description:
+              'The question in your own words; space-separated terms are AND-weighted, a whole-string hit scores higher. Memories often word a fact differently from how it is asked — pass extra phrasings via queries instead of retrying one at a time.',
+          },
+          queries: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'v4.11: up to 5 extra phrasings of the same question (colloquial vs written, synonyms, Chinese/English). Each is scored separately and every entry keeps its best score across all phrasings, so a memory surfaces whichever words it actually uses. One call instead of several retries.',
+          },
           limit: { type: 'integer', description: 'Max matches to return (1-20, default 5).' },
           at_time: {
             type: 'string',
@@ -297,6 +307,7 @@ export function apply(ctx, config) {
           type: 'object',
           properties: {
             query: { type: 'string' },
+            queries: { type: 'array', items: { type: 'string' } },
             total: { type: 'integer' },
             matched: { type: 'integer' },
             confidence: { type: 'string' },
@@ -355,8 +366,15 @@ export function apply(ctx, config) {
           const lines = matches.map((item) =>
             `- ${item.id}${trustMark(item)}${item.pinned ? ' 📌' : ''}${(item.tags?.[0] ?? item.tag) ? ` [${item.tags?.[0] ?? item.tag}]` : ''}${item.scope ? ` <${item.scope}>` : ''} ${item.text}`)
           const byId = Array.isArray(value?.byId) && value.byId.length > 0 ? `（按 id 直取 ${value.byId.join('、')}）` : ''
-          const weak = value?.confidence === 'low' ? `\n⚠ 相关性低于注入门槛（覆盖率 ${value?.coverage ?? 0}），这些可能只是词面巧合；若都不对，换个关键词再搜。` : ''
-          return [text(`匹配 ${value?.matched ?? 0} / ${value?.total ?? 0} 条${byId}：\n${lines.join('\n')}${weak}`)]
+          const multi = Array.isArray(value?.queries) && value.queries.length > 1 ? `（已合并 ${value.queries.length} 种说法）` : ''
+          // v4.11：命中不足时把「换说法」说成下一步动作，而不是泛泛的「换个关键词」——
+          // 记忆里的措辞常与提问不同（口语/书面、同义、中英），单靠原词硬碰会漏。
+          const thin = value?.confidence === 'low'
+            ? `\n⚠ 相关性低于注入门槛（覆盖率 ${value?.coverage ?? 0}），这些可能只是词面巧合。`
+            : Array.isArray(value?.matches) && value.matches.length < 3
+              ? `\n（命中偏少：若不像要找的，用 queries 一次给几种不同说法再搜——记忆里的措辞常与提问不同。）`
+              : ''
+          return [text(`匹配 ${value?.matched ?? 0} / ${value?.total ?? 0} 条${byId}${multi}：\n${lines.join('\n')}${thin}`)]
         },
       },
       async execute(args) {
@@ -381,23 +399,48 @@ export function apply(ctx, config) {
         const idHits = [...new Set(query.match(/m\d+/g) ?? [])]
           .map((id) => searchable.find((entry) => entry.id === id))
           .filter((entry) => entry !== undefined)
-        // v4.1（P2.2）：默认走 FTS5 候选集 + df 统计（公式不变）；索引不可用/差分不过时回退全量扫描。
-        let scoredRaw = null
-        if (backend === 'sqlite' && retrievalMode === 'index') {
-          try {
-            scoredRaw = scoreEntriesIndexed(searchable, query)
-          } catch (error) {
-            scoredRaw = null
+        // v4.11 多说法查询（max-pooling）：同一条记忆常常只在某个说法下对得上。
+        // 实测（_ops/memory-bench.mjs 23 题基准）三道语义缺口题——问法口语化、记忆写书面语——
+        // 单说法分别排第 6/6/8 名，换成记忆自己的说法后全部升到第 1 名。
+        // 所以**不把多个说法拼成一个长查询**（拼起来每个说法的信号都被稀释），
+        // 而是各自打分、每条记忆取它对所有说法的最高分；覆盖率/门槛也按最能对上的那个说法算。
+        const extraQueries = Array.isArray(args?.queries)
+          ? [
+              ...new Set(
+                args.queries
+                  .map((item) => (typeof item === 'string' ? item.trim() : ''))
+                  .filter((item) => item !== '' && item !== query),
+              ),
+            ].slice(0, 5)
+          : []
+        const allQueries = [query, ...extraQueries]
+        const bestById = new Map()
+        let coverageReport = null
+        for (const activeQuery of allQueries) {
+          // v4.1（P2.2）：默认走 FTS5 候选集 + df 统计（公式不变）；索引不可用/差分不过时回退全量扫描。
+          let scoredRaw = null
+          if (backend === 'sqlite' && retrievalMode === 'index') {
+            try {
+              scoredRaw = scoreEntriesIndexed(searchable, activeQuery)
+            } catch (error) {
+              scoredRaw = null
+            }
           }
+          if (scoredRaw === null) scoredRaw = scoreEntries(searchable, activeQuery)
+          for (const item of scoredRaw) {
+            if (item.score <= 0.0001) continue
+            if (idHits.some((entry) => entry.id === item.entry.id)) continue
+            const best = bestById.get(item.entry.id)
+            if (best === undefined || item.score > best.score) bestById.set(item.entry.id, item)
+          }
+          const report = relevanceCoverage(searchable, activeQuery)
+          if (coverageReport === null || report.coverage > coverageReport.coverage) coverageReport = report
         }
-        if (scoredRaw === null) scoredRaw = scoreEntries(searchable, query)
-        const scored = scoredRaw
-          .filter((item) => item.score > 0.0001 && !idHits.some((entry) => entry.id === item.entry.id))
-          .sort(
-            (a, b) =>
-              b.score - a.score ||
-              String(b.entry.updatedAt).localeCompare(String(a.entry.updatedAt)),
-          )
+        const scored = [...bestById.values()].sort(
+          (a, b) =>
+            b.score - a.score ||
+            String(b.entry.updatedAt).localeCompare(String(a.entry.updatedAt)),
+        )
         if (idHits.length > 0) scored.unshift(...idHits.map((entry) => ({ entry, score: 1e6 })))
         const top = scored.slice(0, limit)
         countUsage(top.map((item) => item.entry.id))
@@ -408,7 +451,6 @@ export function apply(ctx, config) {
         // v3.15：搜索侧补「证据充分性」信号（学 arXiv 2610.22668：相关 ≠ 充分证据）。
         // 之前只滤 score>0.0001，问「MySQL 索引优化」也会吐 8 条 —— 有结果不等于有答案。
         // 不砍结果（砍了会把「库里没有」误报成「有但不相关」），只给结论加一个可判读的信号。
-        const coverageReport = relevanceCoverage(searchable, query)
         const agreeWithRanking = coverageReport.topId != null && scored.length > 0 && scored[0].entry.id === coverageReport.topId
         const gate = gateDecision({
           coverage: coverageReport.coverage,
@@ -423,6 +465,7 @@ export function apply(ctx, config) {
         const profile = slotFilter === '' ? undefined : profileView(activeEntries)
         return {
           query,
+          ...(extraQueries.length > 0 ? { queries: allQueries } : {}),
           total: searchable.length,
           matched: scored.length,
           confidence,
@@ -2421,7 +2464,7 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.10.0-entity',
+          codeFingerprint: '4.11.0-multiquery',
         }
       },
     }),
