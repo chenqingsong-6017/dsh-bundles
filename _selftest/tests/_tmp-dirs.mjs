@@ -102,6 +102,11 @@ const TEST_PREFIXES = [
   'icd-fixture-',
   'tidy-inv-test-',
   'workbuddy-product-spill-',
+  // dsh-archived-purge 的 5 个上游测试文件（2026-11-11 升级到 1.3.0 后纳入）：
+  // archived-purge-test / -http / -mapped，以及 purge-clean / -leftovers / -ws /
+  // -everything / -workspace / -artifacts。这些测试只 mkdtemp、不自清，靠这里兜底。
+  'archived-purge-',
+  'purge-',
 ]
 
 /** 清掉上次运行遗留的全部测试临时目录。返回清掉的个数。 */
