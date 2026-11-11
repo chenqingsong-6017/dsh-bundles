@@ -3,6 +3,33 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.13.0（2026-11-11）
+
+**domain 受控词表**——把 155 个自由 tag 收成 12 个可检索的粗分类，不动历史数据。
+
+### 背景（v4.12 遗留的真瓶颈）
+- v4.12 的分类检索机制真机通过（`total == matches`），但端到端聚合覆盖只到 50%。
+- 根因不在代码而在数据：**113 条记忆上有 155 个 tag**，同义并存严重——
+  `plugin-dev`(10)/`plugin`(2)/`dsh-plugin`(1)、`dsh-memory`(8)/`memory`(3)/`记忆`(3)、
+  `硬规则`(9)/`rule`(5)/`workspace-rule`(1)、`HMR`(2)/`hmr`(1)、`验证门`(2)/`verification-gate`(1)/`verify-gate`(1)。
+
+### Added
+- `lib/tagdomains.js`：12 个受控 domain（rule / memory / plugin-dev / dsh / ops / research / obsidian /
+  machine / eval / workbuddy / security / identity / misc）+ 反向索引 + `expandTagFilter` / `domainsOfEntry`。
+- `memory_search` 的 `tags` 参数支持 **domain 名展开**：传 `plugin-dev` 会命中该域下所有原 tag；
+  传原 tag 仍精确匹配（向后兼容）。
+- `memory_status.facets` 新增 `domains`（域覆盖条目数）与 `unclassified`（无有效 tag 的条目数）——
+  后者是数据治理的观测值，不是装饰。
+
+### 数据修正（只补不改）
+- 补了 4 条无 tag 条目的标签（m246/m247/m248/m249，都是硬规则类）。
+- 补了 9 个遗漏 tag 的映射（env / 命名 / ops / 架构 / 规则收窄 / 整体进化 / 落地 / 乔布斯 / verified）。
+- 映射覆盖：155 个 tag 中 146 已映射（94%）；未分类条目从 5 降到 **0**。
+
+### 为什么不批量改历史 tag
+- 题集 gold（23 道 benchmark）与既有检索行为都依赖当前 tag 分布，批量改会同时移动基线和行为，
+  改完无法判断「变好是因为分类对了，还是因为基线被改了」。
+- 两层分类是只读视图：随时可调映射、可回滚，且原 tag 的细粒度检索能力不丢。
 ## v4.12.1（2026-11-11）
 
 **修分类浏览被两处机制砍条**——真机暴露，两处都只在「带过滤 + SQLite 后端」时出现。
