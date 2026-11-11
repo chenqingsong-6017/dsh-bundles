@@ -293,6 +293,17 @@ export function apply(ctx, config) {
             description:
               'v4.7: filter to entries whose entities include this label (graph view). When set, the result also carries coccurring — entities co-occurring with it, ranked by count.',
           },
+          tags: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'v4.12: filter to entries carrying ANY of these tags (OR). Use it for aggregation questions — "what upgrades did the memory system go through" is a CATEGORY query, not a similarity query: BM25 can only rank near matches, it cannot enumerate a category. Tag distribution is reported by memory_status.',
+          },
+          scope: {
+            type: 'string',
+            description:
+              'v4.12: filter to one scope (e.g. global / plugin-dev / dsh-date / machine). Combine with tags for category views.',
+          },
           slot: {
             type: 'string',
             description:
@@ -308,6 +319,7 @@ export function apply(ctx, config) {
           properties: {
             query: { type: 'string' },
             queries: { type: 'array', items: { type: 'string' } },
+            filters: { type: 'object', properties: { tags: { type: 'array', items: { type: 'string' } }, scope: { type: 'string' } } },
             total: { type: 'integer' },
             matched: { type: 'integer' },
             confidence: { type: 'string' },
@@ -396,6 +408,20 @@ export function apply(ctx, config) {
         const entityKeySet = entityFilter === '' ? null : expandEntityKeys(entityFilter, state.entityAliases)
         let searchable = entityKeySet === null ? activeEntries : activeEntries.filter((entry) => Array.isArray(entry.entities) && entry.entities.some((label) => entityKeySet.has(entityKey(label))))
         if (slotFilter !== '') searchable = slotFilter === 'all' ? searchable.filter((entry) => typeof entry.slot === 'string' && entry.slot !== '') : searchable.filter((entry) => entry.slot === slotFilter)
+        // v4.12 分类检索：聚合问题（「做过哪几次升级」「有哪些硬规则」）靠 BM25 打分永远召回不全——
+        // 打分是「找最像的几条」，分类是「把某类全部捞出来」。先按 tag/scope 收窄语料，再在类内打分排序。
+        // 这是 Hindsight 四操作里 synthesis 缺口的零模型解法：不是让模型跨条目推理，而是先把同一类的条目凑齐。
+        const tagFilter = Array.isArray(args?.tags)
+          ? [...new Set(args.tags.map((item) => (typeof item === 'string' ? item.trim() : '')).filter((item) => item !== ''))]
+          : []
+        const scopeFilter = typeof args?.scope === 'string' ? args.scope.trim() : ''
+        if (tagFilter.length > 0) {
+          searchable = searchable.filter((entry) => {
+            const tags = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags : typeof entry.tag === 'string' ? [entry.tag] : []
+            return tagFilter.some((tag) => tags.includes(tag))
+          })
+        }
+        if (scopeFilter !== '') searchable = searchable.filter((entry) => entry.scope === scopeFilter)
         const idHits = [...new Set(query.match(/m\d+/g) ?? [])]
           .map((id) => searchable.find((entry) => entry.id === id))
           .filter((entry) => entry !== undefined)
@@ -418,8 +444,10 @@ export function apply(ctx, config) {
         let coverageReport = null
         for (const activeQuery of allQueries) {
           // v4.1（P2.2）：默认走 FTS5 候选集 + df 统计（公式不变）；索引不可用/差分不过时回退全量扫描。
+          // v4.12：分类浏览（tag/scope 过滤）必须走**全量扫描**——FTS5 候选集只返回词面命中的条目，
+          // 拿它做分类会漏人（实测 total=10 只回了 2 条，因为另外 8 条跟 query 没有共同词）。
           let scoredRaw = null
-          if (backend === 'sqlite' && retrievalMode === 'index') {
+          if (backend === 'sqlite' && retrievalMode === 'index' && tagFilter.length === 0 && scopeFilter === '') {
             try {
               scoredRaw = scoreEntriesIndexed(searchable, activeQuery)
             } catch (error) {
@@ -428,7 +456,11 @@ export function apply(ctx, config) {
           }
           if (scoredRaw === null) scoredRaw = scoreEntries(searchable, activeQuery)
           for (const item of scoredRaw) {
-            if (item.score <= 0.0001) continue
+            // v4.12：纯分类浏览（带 tag/scope 过滤）时不做分数门槛。
+            // 否则「把这一类全捞出来」会被「query 词面不重合 → 分数 0」砍掉——
+            // 实测插件规范类 10 条只回了 2 条，覆盖率反而从 2/5 掉到 0/5。
+            // 分类浏览的语义是「列出这一类」，排序只是锦上添花，不是准入门槛。
+            if (item.score <= 0.0001 && tagFilter.length === 0 && scopeFilter === '') continue
             if (idHits.some((entry) => entry.id === item.entry.id)) continue
             const best = bestById.get(item.entry.id)
             if (best === undefined || item.score > best.score) bestById.set(item.entry.id, item)
@@ -466,6 +498,9 @@ export function apply(ctx, config) {
         return {
           query,
           ...(extraQueries.length > 0 ? { queries: allQueries } : {}),
+          ...(tagFilter.length > 0 || scopeFilter !== ''
+            ? { filters: { ...(tagFilter.length > 0 ? { tags: tagFilter } : {}), ...(scopeFilter !== '' ? { scope: scopeFilter } : {}) } }
+            : {}),
           total: searchable.length,
           matched: scored.length,
           confidence,
@@ -2352,6 +2387,15 @@ export function apply(ctx, config) {
             maxInjectChars: { type: 'integer' },
             configWarning: { type: 'string' },
             codeFingerprint: { type: 'string' },
+            // v4.12：分类分布——聚合问题（「做过哪几次升级」「有哪些硬规则」）的入口。
+            // agent 看到 tag 分布才知道该用 memory_search({tags:[...]}) 把一类条目全捞出来。
+            facets: {
+              type: 'object',
+              properties: {
+                tags: { type: 'array', items: { type: 'object', properties: { tag: { type: 'string' }, count: { type: 'integer' } } } },
+                scopes: { type: 'array', items: { type: 'object', properties: { scope: { type: 'string' }, count: { type: 'integer' } } } },
+              },
+            },
             maintenance: {
               type: 'object',
               properties: {
@@ -2440,7 +2484,20 @@ export function apply(ctx, config) {
         if (!writable.ok) note('MEMORY_STORE_UNWRITABLE', writable.reason)
 
         const ready = problems.length === 0
-        const active = activeEntries().length
+        const liveEntries = activeEntries()
+        const active = liveEntries.length
+        // v4.12：类目分布（tag / scope）。只统计生效条目；tag 只报前 20，避免状态输出膨胀。
+        const tagCounts = new Map()
+        const scopeCounts = new Map()
+        for (const entry of liveEntries) {
+          const tags = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags : typeof entry.tag === 'string' && entry.tag !== '' ? [entry.tag] : []
+          for (const tag of tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1)
+          if (typeof entry.scope === 'string' && entry.scope !== '') scopeCounts.set(entry.scope, (scopeCounts.get(entry.scope) ?? 0) + 1)
+        }
+        const facets = {
+          tags: [...tagCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([tag, count]) => ({ tag, count })),
+          scopes: [...scopeCounts.entries()].sort((a, b) => b[1] - a[1]).map(([scope, count]) => ({ scope, count })),
+        }
         return {
           ready,
           unavailableReason: problems.join('；'),
@@ -2460,11 +2517,12 @@ export function apply(ctx, config) {
           maxBytes,
           maxInjectChars,
           ...(configWarning !== '' ? { configWarning } : {}),
+          facets,
           // v4.4：维护循环（curate 过期归档 / consolidate draft→stable）的上一次运行结果，供诊断「自动生命周期有没有在跑」。
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.11.0-multiquery',
+          codeFingerprint: '4.12.1-tagfilter-fullscan',
         }
       },
     }),
