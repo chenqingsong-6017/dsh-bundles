@@ -35,6 +35,7 @@ import { createStore } from './lib/store.js'
 import { MEMORY_STATUS, cardMarkdown, cleanAliases, cleanEntities, cleanSources, memoryEntrySchema, normalizeEntry, normalizeScope, slugOf } from './lib/schema.js'
 import { trustMark } from './lib/render.js'
 import { buildAliasMap, entityKey, entityStats, expandEntityKeys, findAliasCandidates, normalizeEntity, resolveEntities } from './lib/entity.js'
+import { domainsOfEntry, expandTagFilter, isDomainName } from './lib/tagdomains.js'
 import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 
 export const name = 'dsh-memory'
@@ -415,10 +416,15 @@ export function apply(ctx, config) {
           ? [...new Set(args.tags.map((item) => (typeof item === 'string' ? item.trim() : '')).filter((item) => item !== ''))]
           : []
         const scopeFilter = typeof args?.scope === 'string' ? args.scope.trim() : ''
-        if (tagFilter.length > 0) {
+        // v4.13：传 domain 名（如 "plugin-dev"）会展开成该域下所有原 tag；传具体 tag 仍精确匹配。
+        // 背景：113 条记忆上有 155 个自由 tag，同义碎片化严重（plugin-dev/plugin/dsh-plugin…），
+        // 聚合问题按原 tag 捞不全。domain 是受控粗分类，展开是只读操作，不动历史数据。
+        const tagFilterExpanded = expandTagFilter(tagFilter)
+        if (tagFilterExpanded.size > 0) {
           searchable = searchable.filter((entry) => {
             const tags = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags : typeof entry.tag === 'string' ? [entry.tag] : []
-            return tagFilter.some((tag) => tags.includes(tag))
+            for (const tag of tags) if (tagFilterExpanded.has(tag)) return true
+            return false
           })
         }
         if (scopeFilter !== '') searchable = searchable.filter((entry) => entry.scope === scopeFilter)
@@ -2394,6 +2400,8 @@ export function apply(ctx, config) {
               properties: {
                 tags: { type: 'array', items: { type: 'object', properties: { tag: { type: 'string' }, count: { type: 'integer' } } } },
                 scopes: { type: 'array', items: { type: 'object', properties: { scope: { type: 'string' }, count: { type: 'integer' } } } },
+                domains: { type: 'array', items: { type: 'object', properties: { domain: { type: 'string' }, count: { type: 'integer' } } } },
+                unclassified: { type: 'integer' },
               },
             },
             maintenance: {
@@ -2494,9 +2502,24 @@ export function apply(ctx, config) {
           for (const tag of tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1)
           if (typeof entry.scope === 'string' && entry.scope !== '') scopeCounts.set(entry.scope, (scopeCounts.get(entry.scope) ?? 0) + 1)
         }
+        // v4.13：domain 视图 + 未分类计数。agent 用 domain 名做分类检索（比猜原 tag 稳），
+        // unclassified 是数据治理的观测值——今天 113 条里 5 条无有效 tag，补完为 0。
+        const domainCounts = new Map()
+        let unclassified = 0
+        for (const entry of liveEntries) {
+          const tags = Array.isArray(entry.tags) && entry.tags.length > 0 ? entry.tags : typeof entry.tag === 'string' && entry.tag !== '' ? [entry.tag] : []
+          const domains = domainsOfEntry(tags)
+          if (domains.size === 0) {
+            unclassified += 1
+            continue
+          }
+          for (const domain of domains) domainCounts.set(domain, (domainCounts.get(domain) ?? 0) + 1)
+        }
         const facets = {
           tags: [...tagCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([tag, count]) => ({ tag, count })),
           scopes: [...scopeCounts.entries()].sort((a, b) => b[1] - a[1]).map(([scope, count]) => ({ scope, count })),
+          domains: [...domainCounts.entries()].sort((a, b) => b[1] - a[1]).map(([domain, count]) => ({ domain, count })),
+          unclassified,
         }
         return {
           ready,
@@ -2522,7 +2545,7 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.12.1-tagfilter-fullscan',
+          codeFingerprint: '4.13.0-domains',
         }
       },
     }),

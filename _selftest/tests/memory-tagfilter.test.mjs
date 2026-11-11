@@ -101,6 +101,25 @@ try {
   assert.equal(reconcile.matches.length, reconcile.total, 'matches 必须等于过滤后语料总量')
   ok('分类浏览：matches 与 total 对账一致')
 
+  // 11) v4.13 domain 展开：传 domain 名（rule）应匹配该域下的原 tag（硬规则）
+  const byDomain = await search({ query: 'zzz', tags: ['rule'], limit: 50 })
+  assert.ok(byDomain.matches.some((item) => item.text.includes('gamma')), 'rule 域应包含 tag=硬规则 的条目')
+  assert.ok(!byDomain.matches.some((item) => item.text.includes('alpha')), '不该把 memory 域的条目带进来')
+  ok('domain 展开：传 rule 命中 tag=硬规则 的条目')
+
+  // 12) 原 tag 精确匹配仍然有效（向后兼容）
+  const byRawTag = await search({ query: 'zzz', tags: ['硬规则'], limit: 50 })
+  assert.equal(byRawTag.matches.length, 1)
+  ok('domain 展开：传原 tag 仍精确匹配（向后兼容）')
+
+  // 13) facets.domains 与 unclassified
+  const st2 = await defs.get('memory_status').execute({})
+  const dmap = new Map((st2.facets.domains || []).map((item) => [item.domain, item.count]))
+  assert.equal(dmap.get('rule'), 1, 'tag=硬规则 应归入 rule 域')
+  assert.equal(dmap.get('memory'), 2, 'tag=dsh-memory 的两条应归入 memory 域')
+  assert.equal(st2.facets.unclassified, 1, 'epsilon 无 tag，应计入 unclassified')
+  ok('facets.domains：域统计与 unclassified 计数准确')
+
   console.log(`\n全部通过（${passed} 项）`)
 } finally {
   rmSync(dir, { recursive: true, force: true })
