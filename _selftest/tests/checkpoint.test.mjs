@@ -561,3 +561,8 @@ try {
   )
   ok('未知标记：MARK_NOT_FOUND 拒绝')
 }
+
+// 任务标记段用的是 root 下的 marks/ —— 上面的 finally 已删过一次 root，这一段的
+// mkdirSync(recursive) 又把 root 建了回来，所以收尾必须再删一次（2026-11-11 实测：
+// 漏这一步，D:\AI\dsh-data 下积了 109 个 _selftest-checkpoint-* 残留）。
+rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })

@@ -13,6 +13,11 @@ import os from 'node:os'
 import path from 'node:path'
 
 const ROOT = os.tmpdir()
+// 有的测试故意把临时目录建在数据盘（checkpoint.test.mjs：为了验证 checkpoint 在
+// 真实数据盘上的行为）。数据盘根下只认测试自建的 `_selftest-` 前缀，插件自己的
+// 数据目录一律不碰。2026-11-11 实测这里积了 109 个 _selftest-checkpoint-* 残留。
+const DATA_ROOT = 'D:\\AI\\dsh-data'
+const DATA_PREFIXES = ['_selftest-']
 // 目录名形如 dsh-memory-sqlite-migrate-12345-AbCdEf（末段是 mkdtemp 的 6 位随机串）
 const STALE = /^dsh-memory-[\w-]+-(\d+)-[A-Za-z0-9]{6}$/
 const owned = []
@@ -113,23 +118,29 @@ const TEST_PREFIXES = [
 export function sweepAllTestDirs() {
   const startedAt = Date.now() - process.uptime() * 1000
   const graceMs = 5000 // 本进程刚启动时的时间窗，避免把正在启动的并发写误判成遗留
-  let names = []
-  try {
-    names = readdirSync(ROOT)
-  } catch {
-    return 0
-  }
+  const roots = [
+    { dir: ROOT, prefixes: TEST_PREFIXES },
+    { dir: DATA_ROOT, prefixes: DATA_PREFIXES },
+  ]
   let swept = 0
-  for (const name of names) {
-    if (!TEST_PREFIXES.some((prefix) => name.startsWith(prefix))) continue
-    const full = path.join(ROOT, name)
+  for (const { dir, prefixes } of roots) {
+    let names = []
     try {
-      const stat = statSync(full)
-      if (stat.birthtimeMs > startedAt - graceMs) continue // 本次运行刚建的，不碰
-      rmSync(full, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
-      swept += 1
+      names = readdirSync(dir)
     } catch {
-      /* 下一次再试 */
+      continue
+    }
+    for (const name of names) {
+      if (!prefixes.some((prefix) => name.startsWith(prefix))) continue
+      const full = path.join(dir, name)
+      try {
+        const stat = statSync(full)
+        if (stat.birthtimeMs > startedAt - graceMs) continue // 本次运行刚建的，不碰
+        rmSync(full, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 })
+        swept += 1
+      } catch {
+        /* 下一次再试 */
+      }
     }
   }
   return swept
