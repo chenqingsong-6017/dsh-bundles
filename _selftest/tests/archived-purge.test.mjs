@@ -1,14 +1,23 @@
-// 映射测试：dsh-archived-purge（来自上游 test/host.test.mjs，2026-11-05 纳入验证门）
+// 映射测试：dsh-archived-purge（2026-11-11 升级到上游 1.3.0）
+// 上游 5 个测试文件原样纳入验证门（相对 import 以本文件为基准解析到插件目录），
+// 另加本仓补丁的 3 条断言：删除后补播 api-session/removed、announce 补播、
+// 以及事件总线故障不影响删除。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { createHandlers, readArchivedState, scanSessionDirs } from '../../dsh-archived-purge/index.js';
+import '../../dsh-archived-purge/test/host.test.mjs';
+import '../../dsh-archived-purge/test/http.test.mjs';
+import '../../dsh-archived-purge/test/clean.test.mjs';
+import '../../dsh-archived-purge/test/leftovers.test.mjs';
+import '../../dsh-archived-purge/test/client.test.mjs';
+
+import { createHandlers } from '../../dsh-archived-purge/index.js';
 
 async function makeHome() {
-  const home = await fsp.mkdtemp(path.join(os.tmpdir(), 'archived-purge-test-'));
+  const home = await fsp.mkdtemp(path.join(os.tmpdir(), 'archived-purge-mapped-'));
   const project = path.join(home, 'sessions', '--C-tmp-proj--');
   const cache = path.join(home, 'storages', 'session_projcache', 'sessions');
   await fsp.mkdir(project, { recursive: true });
@@ -16,7 +25,7 @@ async function makeHome() {
   return { home, project, cache };
 }
 
-async function makeSession(project, id, bytes = 512) {
+async function makeSession(project, id, bytes = 256) {
   const dir = path.join(project, id);
   await fsp.mkdir(dir, { recursive: true });
   await fsp.writeFile(path.join(dir, 'session.v4.jsonl.zstd'), Buffer.alloc(bytes, 7));
@@ -49,275 +58,77 @@ async function writeRegistry(home, archived, sessionIds) {
 }
 
 function makeRegistry(sessionIds) {
-  const detached = [];
-  const unarchived = [];
   return {
-    detached,
-    unarchived,
     registry: {
-      list: () => [{ id: 'w1', title: 'demo-workspace', sessionIds: [...sessionIds], detachSession: async (id) => { detached.push(id); } }],
-      unarchiveSession: async (id) => { unarchived.push(id); },
+      list: () => [{
+        id: 'w1',
+        title: 'demo-workspace',
+        sessionIds: [...sessionIds],
+        detachSession: async () => {},
+      }],
+      unarchiveSession: async () => {},
     },
   };
 }
 
-test('reads archived ids and groups sessions by workspace', async () => {
-  const { home, project, cache } = await makeHome();
-  await makeSession(project, 'session-alpha', 2048);
-  await makeSession(project, 'session-beta', 1024);
-  await makeCache(cache, 'session-alpha', 'Alpha title');
-  await makeCache(cache, 'session-beta', 'Beta title');
-  await writeRegistry(home, ['session-alpha', 'session-beta'], ['session-alpha', 'session-beta']);
+async function prepare(home, ids) {
+  const { project, cache } = { project: path.join(home, 'sessions', '--C-tmp-proj--'), cache: path.join(home, 'storages', 'session_projcache', 'sessions') };
+  for (const id of ids) {
+    await makeSession(project, id);
+    await makeCache(cache, id, id);
+  }
+  await writeRegistry(home, ids, ids);
+}
 
-  const state = await readArchivedState(home);
-  assert.deepEqual(state.archived, ['session-alpha', 'session-beta']);
-
-  const handlers = createHandlers({
-    home,
-    sessions: { get: () => undefined },
-    agents: undefined,
-    workspaceRegistry: makeRegistry(['session-alpha', 'session-beta']).registry,
-    sessionPersistence: undefined,
-  });
-  const data = await handlers.state();
-  assert.equal(data.archivedCount, 2);
-  assert.equal(data.items.length, 2);
-  const alpha = data.items.find((item) => item.id === 'session-alpha');
-  assert.equal(alpha.title, 'Alpha title');
-  assert.equal(alpha.workspaceTitle, 'demo-workspace');
-  assert.equal(alpha.exists, true);
-  assert.ok(alpha.sizeBytes >= 2048);
-  assert.ok(data.totalBytes >= 3072);
-});
-
-test('delete removes log, cache, accounting and archive marker', async () => {
-  const { home, project, cache } = await makeHome();
-  const alphaDir = await makeSession(project, 'session-alpha', 4096);
-  const betaDir = await makeSession(project, 'session-beta', 512);
-  await makeCache(cache, 'session-alpha', 'Alpha');
-  await makeCache(cache, 'session-beta', 'Beta');
-  await writeRegistry(home, ['session-alpha', 'session-beta'], ['session-alpha', 'session-beta']);
-
-  const { registry, detached, unarchived } = makeRegistry(['session-alpha', 'session-beta']);
-  const handlers = createHandlers({
-    home,
-    sessions: { get: () => undefined },
-    workspaceRegistry: registry,
-    sessionPersistence: undefined,
-  });
-  const result = await handlers.remove(['session-alpha']);
-  assert.equal(result.ok, true);
-  assert.equal(result.deleted, 1);
-  assert.ok(result.removedBytes >= 4096);
-
-  await assert.rejects(fsp.stat(alphaDir));
-  await assert.rejects(fsp.stat(path.join(cache, 'session-alpha.json')));
-  assert.ok((await fsp.stat(betaDir)).isDirectory());
-  assert.ok((await fsp.stat(path.join(cache, 'session-beta.json'))).isFile());
-  assert.deepEqual(detached, ['session-alpha']);
-  assert.deepEqual(unarchived, ['session-alpha']);
-
-  const after = await readArchivedState(home);
-  assert.deepEqual(after.archived, ['session-alpha', 'session-beta'], 'host never rewrites workspace.json directly');
-});
-
-test('releases a live session then deletes it', async () => {
-  const { home, project, cache } = await makeHome();
-  const alphaDir = await makeSession(project, 'session-alpha', 256);
-  await makeCache(cache, 'session-alpha', 'Alpha');
-  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
-
-  let detached = false;
-  const store = new Map([
-    ['session-alpha', { id: 'session-alpha', detach: () => { detached = true; store.delete('session-alpha'); } }],
-  ]);
-  const live = { id: 'session-alpha', header: { id: 'session-alpha' } };
-  const handlers = createHandlers({
-    home,
-    sessions: {
-      get: (id) => (id === 'session-alpha' && store.size > 0 ? live : undefined),
-      store,
-      flush: async () => true,
-    },
-    agents: { list: () => [], store: new Map() },
-    workspaceRegistry: makeRegistry(['session-alpha']).registry,
-    sessionPersistence: undefined,
-  });
-  const result = await handlers.remove(['session-alpha']);
-  assert.equal(result.ok, true);
-  assert.equal(result.deleted, 1);
-  assert.equal(result.results[0].released, true);
-  assert.equal(detached, true, 'live session entry is detached before removal');
-  await assert.rejects(fsp.stat(alphaDir), /ENOENT/);
-});
-
-test('released live session projection cache is swept after the lifecycle commits it', async () => {
-  const { home, project, cache } = await makeHome();
-  await makeSession(project, 'session-alpha', 128);
-  await makeCache(cache, 'session-alpha', 'Alpha');
-  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
-
-  let detached = false;
-  const store = new Map([
-    ['session-alpha', { id: 'session-alpha', detach: () => { detached = true; store.delete('session-alpha'); } }],
-  ]);
-  const live = { id: 'session-alpha', header: { id: 'session-alpha' } };
-  const handlers = createHandlers({
-    home,
-    sessions: {
-      get: (id) => (id === 'session-alpha' && store.size > 0 ? live : undefined),
-      store,
-      // A released live session commits one final projection row while draining.
-      flush: async () => { await makeCache(cache, 'session-alpha', 'Alpha final'); return true; },
-    },
-    agents: { list: () => [], store: new Map() },
-    workspaceRegistry: makeRegistry(['session-alpha']).registry,
-    sessionPersistence: undefined,
-  });
-  const result = await handlers.remove(['session-alpha']);
-  assert.equal(result.ok, true);
-  assert.equal(detached, true);
-  await assert.rejects(fsp.stat(path.join(cache, 'session-alpha.json')), /ENOENT/);
-});
-
-test('refuses a live session it cannot release and leaves its files alone', async () => {
-  const { home, project, cache } = await makeHome();
-  const alphaDir = await makeSession(project, 'session-alpha', 256);
-  await makeCache(cache, 'session-alpha', 'Alpha');
-  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
-
-  // A store entry without a detach hook: the plugin must not delete a live
-  // session it cannot release, or the store would re-create it afterwards.
-  const handlers = createHandlers({
-    home,
-    sessions: {
-      get: (id) => (id === 'session-alpha' ? { id } : undefined),
-      store: new Map([['session-alpha', { id: 'session-alpha' }]]),
-    },
-    agents: { list: () => [], store: new Map() },
-    workspaceRegistry: makeRegistry(['session-alpha']).registry,
-    sessionPersistence: undefined,
-  });
-  const result = await handlers.remove(['session-alpha']);
-  assert.equal(result.ok, false);
-  assert.equal(result.failed, 1);
-  assert.equal(result.results[0].code, 'release-failed');
-  assert.ok((await fsp.stat(alphaDir)).isDirectory());
-});
-
-test('delete announces api-session/removed for both id spellings', async () => {
-  const { home, project, cache } = await makeHome();
-  await makeSession(project, 'session-alpha', 64);
-  await makeCache(cache, 'session-alpha', 'Alpha');
-  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+test('remove announces api-session/removed for both id spellings（本仓补丁）', async () => {
+  const { home } = await makeHome();
+  await prepare(home, ['session-alpha']);
   const events = [];
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
-    agents: { list: () => [], store: new Map() },
+    activity: async () => [],
     workspaceRegistry: makeRegistry(['session-alpha']).registry,
     sessionPersistence: undefined,
     emit: (event, payload) => events.push([event, payload]),
   });
   const result = await handlers.remove(['session-alpha']);
   assert.equal(result.ok, true);
+  assert.equal(result.deleted, 1);
   const removed = events.filter(([event]) => event === 'api-session/removed').map(([, id]) => id);
   assert.ok(removed.includes('session-alpha'), 'canonical spelling announced');
   assert.ok(removed.includes('alpha'), 'raw-uuid spelling announced');
 });
 
-test('announce replays stale client removals', async () => {
+test('announce replays stale client removals and skips malformed ids（本仓补丁）', async () => {
   const { home } = await makeHome();
   const events = [];
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
-    agents: { list: () => [], store: new Map() },
+    activity: async () => [],
     workspaceRegistry: makeRegistry([]).registry,
     sessionPersistence: undefined,
     emit: (event, payload) => events.push([event, payload]),
   });
   const result = handlers.announce(['session-stale', 'bad/id']);
   assert.equal(result.ok, true);
-  assert.equal(result.announced, 2, 'one valid id announces both spellings; invalid ids are skipped');
+  assert.equal(result.announced, 2, 'one valid id announces both spellings; malformed ids are skipped');
   assert.deepEqual(events.map(([, id]) => id).sort(), ['session-stale', 'stale'].sort());
 });
 
-test('rejects malformed ids and non-archived ids', async () => {
-  const { home, project } = await makeHome();
-  await makeSession(project, 'session-alpha', 32);
-  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
+test('a throwing event bus never fails the deletion（本仓补丁）', async () => {
+  const { home } = await makeHome();
+  await prepare(home, ['session-alpha']);
   const handlers = createHandlers({
     home,
     sessions: { get: () => undefined },
+    activity: async () => [],
     workspaceRegistry: makeRegistry(['session-alpha']).registry,
     sessionPersistence: undefined,
+    emit: () => { throw new Error('event bus down'); },
   });
-
-  for (const bad of ['..', '../../etc', 'a/b', 'C:\\x', '', 'session.alpha']) {
-    const result = await handlers.remove([bad]);
-    assert.equal(result.ok, false);
-    assert.equal(result.code, 'invalid-request', `id ${JSON.stringify(bad)} must be rejected`);
-  }
-
-  const notArchived = await handlers.remove(['session-missing']);
-  assert.equal(notArchived.ok, false);
-  assert.equal(notArchived.code, 'not-archived');
-});
-
-test('uses the durable accounting slot even when the projection dropped the id', async () => {
-  const { home, project, cache } = await makeHome();
-  await makeSession(project, 'session-alpha', 64);
-  await makeCache(cache, 'session-alpha', 'Alpha');
-  await writeRegistry(home, ['session-alpha'], ['session-alpha']);
-
-  const { registry, detached, unarchived } = makeRegistry([]);
-  const handlers = createHandlers({
-    home,
-    sessions: { get: () => undefined },
-    workspaceRegistry: registry,
-    sessionPersistence: undefined,
-  });
-
   const result = await handlers.remove(['session-alpha']);
   assert.equal(result.ok, true);
-  assert.deepEqual(detached, ['session-alpha']);
-  assert.deepEqual(unarchived, ['session-alpha']);
-});
-
-test('cascades archived parents into subagent-origin descendants only', async () => {
-  const { home, project, cache } = await makeHome();
-  const parentDir = await makeSession(project, 'session-parent', 128);
-  const childDir = await makeSession(project, 'session-child', 64);
-  const forkDir = await makeSession(project, 'session-fork', 64);
-  await makeCache(cache, 'session-parent', 'Parent');
-  await writeRegistry(home, ['session-parent'], ['session-parent']);
-
-  const snapshots = [
-    { header: { id: 'session-parent', isSeeded: false } },
-    { header: { id: 'session-child', isSeeded: false, origin: 'subagent', parentSession: 'session-parent' } },
-    { header: { id: 'session-fork', isSeeded: false, parentSession: 'session-parent' } },
-  ];
-  const handlers = createHandlers({
-    home,
-    sessions: { get: () => undefined },
-    workspaceRegistry: makeRegistry(['session-parent']).registry,
-    sessionPersistence: { list: async () => snapshots },
-  });
-
-  const result = await handlers.remove(['session-parent']);
-  assert.equal(result.ok, true);
-  await assert.rejects(fsp.stat(parentDir));
-  await assert.rejects(fsp.stat(childDir), 'subagent child must be removed with the parent');
-  assert.ok((await fsp.stat(forkDir)).isDirectory(), 'ordinary fork must survive');
-});
-
-test('scanSessionDirs indexes every project directory', async () => {
-  const { home } = await makeHome();
-  const second = path.join(home, 'sessions', '--C-other--');
-  await fsp.mkdir(second, { recursive: true });
-  await makeSession(path.join(home, 'sessions', '--C-tmp-proj--'), 'session-a');
-  await makeSession(second, 'session-a');
-  const map = await scanSessionDirs(path.join(home, 'sessions'));
-  assert.equal(map.get('session-a').length, 2);
+  assert.equal(result.deleted, 1);
 });

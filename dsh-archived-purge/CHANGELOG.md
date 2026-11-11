@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0-vendored.1 (2026-11-11)
+
+- **整体升级到上游 1.3.0**（https://github.com/5D-artist/dsh-archived-purge @ 58a73c9，2026-11-07，MIT），基线从 1.0.0（6c484e69）跨过 1.0.1 / 1.0.2 / 1.1.0 / 1.2.0 / 1.3.0：
+  - 驻留但空闲的归档会话可删（1.0.1）：`workspace/session-activity` waterfall 判定「是否真有活」，替代本仓旧的 release-then-delete；
+  - 删除后的驻留会话不再掉进「未分组」（1.0.2）：记账与归档标记延后到下次启动由 `finalizePending()` 回收；
+  - 引用感知的附件清理（1.1.0）：先读日志收集引用，再删孤儿对象，读不全就整次放弃；
+  - 删除产物的 manifest + 历史残留扫描（1.2.0）：`POST /leftovers` 与 `POST /purge-leftovers`；
+  - `everything` 语义、定时任务清理、页面重设计（1.3.0）；`attachments:false` 显式退出（58a73c9）。
+- **保留本地增强**：删除后为每个 id 的两种拼写补播 `api-session/removed`；新增 `POST /plugins/archived-purge/announce`；客户端删除成功后 `sessions.refresh()`。
+- **移除本地旧实现**：release-then-delete（停 agent → flush → detach live 条目）不再保留——上游 1.0.1 的方案更稳（不强行 detach 内存中的会话，避免与宿主存储层竞争）。
+- 测试：上游 5 个测试文件 39 条 + 本仓补丁 3 条 = 42 条全过；`npm run check` 验证门通过。
+- 真机（DSH 0.2.2-rc.1）：`GET /state` 返回 1.3.0 字段（`activity` / `resident` / `scheduleCount` / `pendingFinalize`），`/scan`、`/leftovers`、`/gc`(dryRun)、`/announce` 均可用；`activity` 无 `activityUnknown` 标记 = rc.1 的 `workspace/session-activity` waterfall 正常应答。删除链路未在本轮真机执行（19 条归档会话是真实数据，不冒险）。
+
 ## 1.0.0-vendored.3 (2026-11-06 00:20)
 
 - 仅验证记录，无代码改动：DSH 升级到 **0.2.2-rc.1** 后**全链路复验通过**——单测 11/11、`/state` 真机可用、rc.1 的 `workspace/archiveSession`+`unarchiveSession` 存在、**真机删除成功**（`deleted:1 / released:true / failed:0 / removedBytes:6034`，目录与投影缓存消失、10 秒不重建、归档集归零）。方法与临时验证路由的撤销证据见 README 文末。

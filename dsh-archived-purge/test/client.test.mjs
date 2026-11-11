@@ -1,0 +1,393 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { promises as fsp } from 'node:fs';
+
+/**
+ * The Settings page is plain React loaded through `window.__ModuleLoader__`.
+ * This harness supplies a minimal hook runtime and a stubbed `fetch`, so the
+ * real `client.js` can be mounted and clicked without a browser: it catches a
+ * render crash and pins the deep-clean request body.
+ */
+
+const ROUTE = '/plugins/archived-purge';
+
+function makeRuntime() {
+  const slots = [];
+  const effects = [];
+  const callbacks = new Map();
+  let cursor = 0;
+  let dirty = false;
+  let mounted;
+
+  const React = {
+    createElement(type, props, ...children) {
+      return { type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false) };
+    },
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = typeof initial === 'function' ? initial() : initial;
+      return [slots[index], (next) => {
+        slots[index] = typeof next === 'function' ? next(slots[index]) : next;
+        dirty = true;
+      }];
+    },
+    useRef(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = { current: initial };
+      return slots[index];
+    },
+    useMemo(factory) {
+      cursor += 1;
+      return factory();
+    },
+    useCallback(factory) {
+      const index = cursor++;
+      if (!callbacks.has(index)) callbacks.set(index, factory);
+      return callbacks.get(index);
+    },
+    useEffect(fn, deps) {
+      const index = cursor++;
+      const key = `${index}:${JSON.stringify(deps ?? null)}`;
+      if (!effects.some((entry) => entry.key === key)) effects.push({ key, fn });
+    },
+  };
+
+  function renderOnce() {
+    cursor = 0;
+    effects.length = 0;
+    return mounted();
+  }
+
+  async function settle(tree, limit = 40) {
+    let current = tree;
+    for (let step = 0; step < limit; step += 1) {
+      const due = effects.splice(0, effects.length);
+      for (const entry of due) await entry.fn();
+      await new Promise((resolve) => setImmediate(resolve));
+      if (!dirty && effects.length === 0) return current;
+      if (dirty) {
+        dirty = false;
+        current = renderOnce();
+      }
+    }
+    return current;
+  }
+
+  return {
+    React,
+    mount(component) {
+      mounted = component;
+      return renderOnce();
+    },
+    settle,
+    rerender() {
+      dirty = false;
+      return renderOnce();
+    },
+  };
+}
+
+function walk(node, visit) {
+  if (!node || typeof node !== 'object') return;
+  visit(node);
+  for (const child of node.children ?? []) walk(child, visit);
+}
+
+function find(node, predicate) {
+  const hits = [];
+  walk(node, (child) => {
+    if (predicate(child)) hits.push(child);
+  });
+  return hits;
+}
+
+function textOf(node) {
+  if (typeof node === 'string') return node;
+  if (!node || typeof node !== 'object') return '';
+  return (node.children ?? []).map(textOf).join('');
+}
+
+function hasClass(node, className) {
+  return typeof node.props?.className === 'string' && node.props.className.split(/\s+/).includes(className);
+}
+
+async function mountPanel(responses) {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const body = init?.body ? JSON.parse(init.body) : undefined;
+    calls.push({ url: String(url), body });
+    const route = String(url).slice(ROUTE.length);
+    const payload = responses[route]?.(body) ?? {};
+    return { ok: true, status: 200, json: async () => payload };
+  };
+  const { React, mount, settle } = makeRuntime();
+  let definition;
+  globalThis.window = {
+    addEventListener() {},
+    removeEventListener() {},
+    __ModuleLoader__: { load(spec) { definition = spec; } },
+  };
+  const source = await fsp.readFile(new URL('../client.js', import.meta.url), 'utf8');
+  new Function('window', source)(globalThis.window);
+  const module = definition.factory((id) => {
+    assert.equal(id, 'react');
+    return React;
+  });
+
+  let Panel;
+  const strings = {};
+  module.apply({
+    effect(fn) {
+      fn();
+    },
+    locale: {
+      register() {},
+      bind() {
+        return (key) => key;
+      },
+    },
+    slots: {
+      inject(_slot, load) {
+        load();
+      },
+      register(_spec, component) {
+        Panel = component;
+        return () => {};
+      },
+    },
+  });
+  assert.ok(Panel, 'the settings section was registered');
+  const first = mount(Panel);
+  const tree = await settle(first);
+  return { tree, calls, restore: () => { globalThis.fetch = original; }, settle, strings };
+}
+
+const stateResponse = () => ({
+  items: [
+    {
+      id: 'session-a',
+      title: 'Alpha',
+      workspaceId: 'w1',
+      workspaceTitle: 'demo-workspace',
+      workspacePath: 'C:\\ws',
+      sizeBytes: 4096,
+      cacheBytes: 512,
+      lastActivity: 1_700_000_000_000,
+      exists: true,
+      active: false,
+      activity: [],
+      activityUnknown: false,
+      resident: true,
+    },
+  ],
+  archivedCount: 1,
+  pendingFinalize: 0,
+  totalBytes: 4096,
+});
+
+test('the settings page renders, then deletes the whole derived scope by default', async () => {
+  const responses = {
+    '/state': stateResponse,
+    '/scan': () => ({
+      ok: true,
+      attachments: { objects: 2, bytes: 200, orphanObjects: 1, orphanBytes: 100, keptObjects: 1, blocked: undefined },
+      requestImages: { files: 1, bytes: 50 },
+      artifacts: [{ path: 'C:\\ws\\report.md', bytes: 10, mtime: 1, tools: ['write'], sessions: ['session-a'] }],
+      schedules: { available: true, count: 1, items: [{ id: 'schedule-1', title: 'Later' }] },
+      unreadableSessions: [],
+    }),
+    '/delete': () => ({
+      ok: true,
+      deleted: 1,
+      failed: 0,
+      deferred: [],
+      removedBytes: 4096,
+      artifacts: { deleted: 1, bytes: 10, results: [] },
+      schedules: { deleted: 1, failed: 0, tasks: 1 },
+      gc: { removedObjects: 1, removedBytes: 100 },
+    }),
+  };
+  const panel = await mountPanel(responses);
+  try {
+    // Listing renders the archived Session row.
+    const rows = find(panel.tree, (node) => hasClass(node, 'ap-row'));
+    assert.equal(rows.length, 1);
+    assert.match(textOf(rows[0]), /Alpha/);
+
+    // Select all, then open the confirmation dialog: the dialog asks /scan.
+    const selectAll = find(panel.tree, (node) => node.props?.type === 'checkbox' && node.props?.['aria-label'] === 'selectAll')[0];
+    selectAll.props.onChange();
+    let tree = await panel.settle(panel.tree);
+    const deleteButton = find(tree, (node) => node.type === 'button' && textOf(node) === 'delete')[0];
+    assert.ok(deleteButton, 'the delete button exists');
+    deleteButton.props.onClick();
+    tree = await panel.settle(tree);
+    assert.ok(panel.calls.some((call) => call.url.endsWith('/scan')), 'opening the dialog scans first');
+
+    // Every scope category is summarised; the file list starts collapsed.
+    const deep = find(tree, (node) => hasClass(node, 'ap-deep'))[0];
+    assert.ok(deep, 'the scope block rendered');
+    assert.match(textOf(deep), /scopeSession/);
+    assert.match(textOf(deep), /scopeFiles/);
+    assert.match(textOf(deep), /scopeAttachments/);
+    assert.match(textOf(deep), /scopeSchedules/);
+    assert.doesNotMatch(textOf(deep), /report\.md/);
+
+    const show = find(deep, (node) => node.type === 'button' && textOf(node) === 'showFiles')[0];
+    assert.ok(show, 'the file list can be opened');
+    show.props.onClick();
+    tree = await panel.settle(tree);
+    assert.match(textOf(tree), /report\.md/);
+
+    const confirm = find(tree, (node) => node.type === 'button' && textOf(node) === 'confirm')[0];
+    assert.ok(confirm, 'the confirm button exists');
+    confirm.props.onClick();
+    tree = await panel.settle(tree);
+
+    const del = panel.calls.find((call) => call.url.endsWith('/delete'));
+    assert.deepEqual(del.body.sessionIds, ['session-a']);
+    assert.equal(del.body.everything, true, 'the untouched scope asks the Host to derive everything');
+    assert.equal(del.body.files, undefined);
+    assert.equal(del.body.attachments, true);
+    assert.equal(del.body.requestImages, false);
+    assert.match(textOf(tree), /noticeDeleted/);
+  } finally {
+    panel.restore();
+  }
+});
+
+test('unticking a produced file narrows the delete to the remaining paths', async () => {
+  const responses = {
+    '/state': stateResponse,
+    '/scan': () => ({
+      ok: true,
+      attachments: { objects: 1, bytes: 10, orphanObjects: 0, orphanBytes: 0, keptObjects: 1, blocked: undefined },
+      requestImages: { files: 0, bytes: 0 },
+      artifacts: [
+        { path: 'C:\\ws\\keep.md', bytes: 10, mtime: 1, tools: ['write'], sessions: ['session-a'] },
+        { path: 'C:\\ws\\drop.md', bytes: 20, mtime: 2, tools: ['edit'], sessions: ['session-a'] },
+      ],
+      schedules: { available: true, count: 0, items: [] },
+      unreadableSessions: [],
+    }),
+    '/delete': () => ({ ok: true, deleted: 1, failed: 0, deferred: [], removedBytes: 4096, artifacts: { deleted: 1, bytes: 10, results: [] } }),
+  };
+  const panel = await mountPanel(responses);
+  try {
+    const selectAll = find(panel.tree, (node) => node.props?.type === 'checkbox' && node.props?.['aria-label'] === 'selectAll')[0];
+    selectAll.props.onChange();
+    let tree = await panel.settle(panel.tree);
+    find(tree, (node) => node.type === 'button' && textOf(node) === 'delete')[0].props.onClick();
+    tree = await panel.settle(tree);
+    find(tree, (node) => node.type === 'button' && textOf(node) === 'showFiles')[0].props.onClick();
+    tree = await panel.settle(tree);
+
+    const rows = find(tree, (node) => hasClass(node, 'ap-file'));
+    assert.equal(rows.length, 2);
+    const drop = rows.find((row) => textOf(row).includes('drop.md'));
+    assert.ok(drop, 'each file is listed');
+    find(drop, (node) => node.props?.type === 'checkbox')[0].props.onChange();
+    tree = await panel.settle(tree);
+
+    find(tree, (node) => node.type === 'button' && textOf(node) === 'confirm')[0].props.onClick();
+    await panel.settle(tree);
+    const del = panel.calls.find((call) => call.url.endsWith('/delete'));
+    assert.equal(del.body.everything, undefined);
+    assert.deepEqual(del.body.files, ['C:\\ws\\keep.md']);
+  } finally {
+    panel.restore();
+  }
+});
+
+test('the leftover scan renders its categories and purges the selection', async () => {
+  let purged = null;
+  const responses = {
+    '/state': stateResponse,
+    '/leftovers': () => ({
+      ok: true,
+      files: [{
+        path: 'C:\\ws\\old.md',
+        bytes: 12,
+        mtime: 1,
+        changed: false,
+        sessionId: 'session-gone',
+        title: 'Gone',
+        at: 1,
+      }],
+      logs: [{ path: 'C:\\home\\sessions\\--x--\\session-gone', bytes: 40 }],
+      caches: [{ path: 'C:\\home\\caches\\session-gone.json', bytes: 8 }],
+      accounting: [],
+      archived: [],
+      attachments: { objects: 3, bytes: 300, orphanObjects: 2, orphanBytes: 200 },
+      requestImages: { files: 1, bytes: 50 },
+      totalBytes: 310,
+      manifestRecords: 1,
+    }),
+    '/purge-leftovers': (body) => {
+      purged = body;
+      return { ok: true, bytes: 310, files: { deleted: 1, bytes: 12 }, logs: [], caches: [] };
+    },
+  };
+  const panel = await mountPanel(responses);
+  try {
+    const button = find(panel.tree, (node) => node.type === 'button' && textOf(node) === 'leftovers')[0];
+    assert.ok(button, 'the leftover scan button exists');
+    button.props.onClick();
+    let tree = await panel.settle(panel.tree);
+    assert.match(textOf(tree), /leftoversTitle/);
+    assert.match(textOf(tree), /old\.md/);
+
+    const confirm = find(tree, (node) => node.type === 'button' && textOf(node) === 'leftoverPurge')[0];
+    assert.ok(confirm, 'the purge button rendered');
+    confirm.props.onClick();
+    tree = await panel.settle(tree);
+
+    assert.deepEqual(purged.files, ['C:\\ws\\old.md']);
+    assert.equal(purged.logs, true);
+    assert.equal(purged.caches, true);
+    assert.equal(purged.accounting, false);
+    assert.equal(purged.attachments, true);
+    assert.equal(purged.requestImages, true);
+    assert.match(textOf(tree), /leftoverDone/);
+  } finally {
+    panel.restore();
+  }
+});
+
+test('the orphan-attachment sweep asks before deleting anything', async () => {
+  let executed = false;
+  const responses = {
+    '/state': stateResponse,
+    '/gc': (body) => {
+      if (body?.dryRun === false) executed = true;
+      return {
+        ok: true,
+        dryRun: body?.dryRun !== false,
+        orphanObjects: 3,
+        orphanBytes: 300,
+        requestImages: { files: 2, bytes: 80 },
+        removedObjects: 3,
+        removedBytes: 300,
+      };
+    },
+  };
+  const panel = await mountPanel(responses);
+  try {
+    const button = find(panel.tree, (node) => node.type === 'button' && textOf(node) === 'orphanGc')[0];
+    assert.ok(button, 'the sweep button exists');
+    button.props.onClick();
+    let tree = await panel.settle(panel.tree);
+    assert.equal(executed, false, 'the first request is a dry run');
+    assert.match(textOf(tree), /orphanGcFound/);
+
+    const confirm = find(tree, (node) => node.type === 'button' && textOf(node) === 'orphanGcConfirm')[0];
+    assert.ok(confirm, 'the inline confirmation rendered');
+    confirm.props.onClick();
+    tree = await panel.settle(tree);
+    assert.equal(executed, true);
+    assert.match(textOf(tree), /orphanGcDone/);
+  } finally {
+    panel.restore();
+  }
+});
