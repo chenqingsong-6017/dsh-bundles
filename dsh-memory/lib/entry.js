@@ -5,6 +5,7 @@
  */
 import { CURATOR_STALE_GRACE_DAYS, DATE_ONLY, DEFAULT_SCOPE_ROOTS, IMPORTANCE_BASE, KIND_REFERENCE, RECENCY_DECAY_PER_HOUR, REFERENCE_STALE_DAYS } from './constants.js'
 import { textSimilarity } from './text.js'
+import { entityKey } from './entity.js'
 
 /** 只写日期的字段（staleAfter / invalidAt）→ 本地日历日零点的毫秒时间戳；非法返回 NaN。 */
 function localDayStart(stamp) {
@@ -249,15 +250,18 @@ export function entityIndex(entries) {
  */
 export function entityCoccur(entries, target) {
   const result = new Map()
-  const targetKey = String(target ?? '').trim()
+  // v4.10：比对用归一 key（Alice / alice / 我的同事 Alice 视为同一实体），返回显示用原标签。
+  const targetKey = entityKey(String(target ?? '')) || String(target ?? '').trim()
   if (targetKey === '') return result
   for (const entry of entries) {
     if (!Array.isArray(entry?.entities)) continue
     const entities = [...new Set(entry.entities.map((e) => String(e).trim()).filter((e) => e !== ''))]
-    if (!entities.includes(targetKey)) continue
-    for (const peer of entities) {
-      if (peer === targetKey) continue
-      result.set(peer, (result.get(peer) ?? 0) + 1)
+    const keys = entities.map((label) => entityKey(label) || label)
+    if (!keys.includes(targetKey)) continue
+    for (let i = 0; i < entities.length; i += 1) {
+      if (keys[i] === targetKey) continue
+      const label = entities[i]
+      result.set(label, (result.get(label) ?? 0) + 1)
     }
   }
   return result

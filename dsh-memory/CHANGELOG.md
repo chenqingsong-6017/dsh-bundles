@@ -3,6 +3,17 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.10.0（2026-11-11）
+
+实体解析（entity resolution）——零 LLM，图仍是派生视图（不建第二权威源）。
+
+- 新增 `lib/entity.js`：称谓前缀规范化（我的同事X / my coworker X → X）、归一 key、别名表、疑似重复候选、健康度统计。
+- 写入路径：memory_add / memory_update 的 entities 经 `resolveEntities`（规范化 + 别名归并 + 去重）。
+- 检索路径：memory_search 的 entity 用 `expandEntityKeys` 展开别名；`entityCoccur` 改归一比对（修 Alice / alice 漏匹配）。
+- 新增 3 个工具：`memory_entity_status`（健康度）/ `memory_entity_resolve`（单实体视图）/ `memory_entity_merge`（合并，confirm 门）。
+- 别名表落旁路文件 `entity-aliases.json`（与 aliases.json 同模式，对旧版本不可见，免疫「未知字段被洗掉」）。
+- 修：`entityStats` 用归一 key，大小写不同算同一实体（原按 normalizeEntity 计，会虚高）。
+- 测试：新增 `_selftest/tests/memory-entity.test.mjs`（10 组断言）；旧 144 项 + oracle 12 项保持通过。
 ## v4.9.0 — 2026-11-10
 
 标题：「完整 curator」——信任增量（dedup→confidence++）+ 矛盾浮现（surface contradictions）。

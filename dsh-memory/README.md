@@ -9,6 +9,21 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
 - **版本 / 引擎**：v4.4.0（2026-11-05）。v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
+
+## 实体解析（v4.10）
+
+实体标签是手动给的，写法差异会把图打散（「Alice」vs「我的同事 Alice」）。v4.10 在写入/检索两端做解析：
+
+| 环节 | 做什么 |
+| --- | --- |
+| 写入 | `resolveEntities`：剥离称谓前缀（我的同事/我老板/my coworker…）→ 查别名表 → 去重 |
+| 检索 | `expandEntityKeys`：查询展开成 canonical + 全部别名；`entityCoccur` 归一比对 |
+| 合并 | `memory_entity_merge {canonical, aliases, confirm:true}`：登记别名 + 改写已有记忆的等价标签 |
+| 诊断 | `memory_entity_status`（健康度）/ `memory_entity_resolve`（单实体视图 + 疑似重复候选） |
+
+取舍：**自动只做确定性的（前缀剥离 + 别名表）**；相似/包含关系只列为候选，由 agent/人确认后 merge——自动合并不确定的东西会误伤（「大肥鱼」≠「大黄鱼」）。
+别名表落 `entity-aliases.json` 旁路（与 aliases.json 同模式），旧版本看不到它，不会在 normalize 时洗掉。
+
 ## 代码结构（v4.3.0 起）
 
 | 文件 | 职责 |

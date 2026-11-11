@@ -143,6 +143,64 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     aliasesSidecar = next
     saveAliases()
   }
+  // v4.10：实体别名旁路（entity resolution）——与 aliases.json 同一模式。
+  // 主源是实体解析结果，旁路文件对旧版本不可见，免疫「未知字段被洗掉」。
+  const entityAliasesFile = path.join(storeDir, 'entity-aliases.json')
+  let entityAliasesSidecar = {}
+
+  /** 读实体别名旁路；坏 JSON 先留证再当空（不静默覆盖原文）。 */
+  function loadEntityAliases() {
+    let raw = ''
+    try {
+      raw = readFileSync(entityAliasesFile, 'utf8')
+    } catch (error) {
+      return {}
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      const map = parsed && typeof parsed === 'object' && parsed.aliases && typeof parsed.aliases === 'object' ? parsed.aliases : null
+      if (map === null) return {}
+      const clean = {}
+      for (const [canonical, list] of Object.entries(map)) {
+        const key = String(canonical).trim()
+        if (key === '') continue
+        const items = (Array.isArray(list) ? list : []).map((item) => (typeof item === 'string' ? item.trim() : '')).filter((item) => item !== '')
+        clean[key] = [...new Set(items)]
+      }
+      entityAliasesSidecar = clean
+      return clean
+    } catch (error) {
+      try {
+        copyFileSync(entityAliasesFile, `${entityAliasesFile}.corrupt-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}`)
+      } catch (inner) {
+        // 留证失败不阻断启动
+      }
+      return {}
+    }
+  }
+
+  /** 写实体别名旁路；传 map 则覆盖，不传则按 memory 里的 state.entityAliases 落盘。 */
+  function saveEntityAliases(map) {
+    try {
+      if (map && typeof map === 'object' && !Array.isArray(map)) entityAliasesSidecar = map
+      atomicWriteText(
+        entityAliasesFile,
+        JSON.stringify(
+          {
+            version: 1,
+            note: '实体别名旁路：canonical -> [alias...]。改这里不动 memory.json；插件启动时加载进 state.entityAliases。',
+            aliases: entityAliasesSidecar,
+          },
+          null,
+          2,
+        ),
+        { backup: false },
+      )
+      return true
+    } catch (error) {
+      return false
+    }
+  }
   const candidateFile = path.join(storeDir, 'candidates.json')
 
   // v4.0：新库直接以当前 schema 版本开局；老库在 load() 里由 migrateState 升级。
@@ -1688,6 +1746,7 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   resetHistoryBaseline()
   loadAliases()
   applyAliases()
+  state.entityAliases = loadEntityAliases()
   if (backend === 'sqlite' && db !== null) {
     ensureSqliteIndex()
     syncSqliteAliases()
@@ -1923,6 +1982,7 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     historyFile,
     load,
     persist,
+    saveEntityAliases,
     persistCandidates,
     loadCandidates,
     refreshBeforeWrite,

@@ -34,6 +34,7 @@ import { fail, text } from './lib/util.js'
 import { createStore } from './lib/store.js'
 import { MEMORY_STATUS, cardMarkdown, cleanAliases, cleanEntities, cleanSources, memoryEntrySchema, normalizeEntry, normalizeScope, slugOf } from './lib/schema.js'
 import { trustMark } from './lib/render.js'
+import { buildAliasMap, entityKey, entityStats, expandEntityKeys, findAliasCandidates, normalizeEntity, resolveEntities } from './lib/entity.js'
 import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 
 export const name = 'dsh-memory'
@@ -89,6 +90,7 @@ export function apply(ctx, config) {
     load,
     persist,
     persistCandidates,
+    saveEntityAliases,
     loadCandidates,
     refreshBeforeWrite,
     refreshSqliteState,
@@ -373,7 +375,8 @@ export function apply(ctx, config) {
         const activeEntries = state.entries.filter((entry) => isTrueAt(entry, atTime))
         const entityFilter = typeof args?.entity === 'string' && args.entity !== '' ? args.entity.trim() : ''
         const slotFilter = typeof args?.slot === 'string' && args.slot !== '' ? args.slot.trim() : ''
-        let searchable = entityFilter === '' ? activeEntries : activeEntries.filter((entry) => Array.isArray(entry.entities) && entry.entities.includes(entityFilter))
+        const entityKeySet = entityFilter === '' ? null : expandEntityKeys(entityFilter, state.entityAliases)
+        let searchable = entityKeySet === null ? activeEntries : activeEntries.filter((entry) => Array.isArray(entry.entities) && entry.entities.some((label) => entityKeySet.has(entityKey(label))))
         if (slotFilter !== '') searchable = slotFilter === 'all' ? searchable.filter((entry) => typeof entry.slot === 'string' && entry.slot !== '') : searchable.filter((entry) => entry.slot === slotFilter)
         const idHits = [...new Set(query.match(/m\d+/g) ?? [])]
           .map((id) => searchable.find((entry) => entry.id === id))
@@ -834,7 +837,7 @@ export function apply(ctx, config) {
           ...(typeof args?.staleAfter === 'string' && args.staleAfter !== '' ? { staleAfter: args.staleAfter } : {}),
           ...(derivedStale !== '' ? { staleAfter: derivedStale } : {}),
           ...(Array.isArray(args?.sources) ? { sources: args.sources } : {}),
-          ...(Array.isArray(args?.entities) ? { entities: args.entities } : {}),
+          ...(Array.isArray(args?.entities) ? { entities: resolveEntities(args.entities, state.entityAliases) } : {}),
           ...(typeof args?.invalidAt === 'string' && args.invalidAt !== '' ? { invalidAt: args.invalidAt } : {}),
           ...(typeof args?.validFrom === 'string' && args.validFrom !== '' ? { validFrom: args.validFrom } : {}),
           ...(typeof args?.softDeadline === 'string' && args.softDeadline !== '' ? { softDeadline: args.softDeadline } : {}),
@@ -1157,7 +1160,7 @@ export function apply(ctx, config) {
         }
         // v4.0：实体标签与失效时刻（两条都是「今天不存、将来补不回来」的信息）。
         if (Array.isArray(args?.entities)) {
-          const entities = cleanEntities(args.entities)
+          const entities = resolveEntities(args.entities, state.entityAliases)
           if (entities.length > 0) entry.entities = entities
           else delete entry.entities
         }
@@ -2418,8 +2421,216 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.9.0-curator',
+          codeFingerprint: '4.10.0-entity',
         }
+      },
+    }),
+  )
+
+  // ==== v4.10：实体解析（entity resolution）——零 LLM、图是派生视图 ====
+
+  // 实体健康度：实体总数 / 覆盖条目 / Top 实体 / 别名数 / 疑似重复候选数。只读。
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_entity_status',
+      description: '实体健康度（v4.10）：实体总数、覆盖条目数、Top 实体、别名数、疑似重复候选数。只读；用在「实体图是不是被写法差异打散了」的诊断上。',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            entities: { type: 'integer' },
+            entriesWithEntities: { type: 'integer' },
+            entries: { type: 'integer' },
+            aliasCount: { type: 'integer' },
+            candidates: { type: 'integer' },
+            top: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  entity: { type: 'string' },
+                  entries: { type: 'integer' },
+                },
+                required: ['entity', 'entries'],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ['entities', 'entriesWithEntities', 'entries', 'aliasCount', 'candidates', 'top'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          const top = value.top.slice(0, 5).map((item) => item.entity + '(' + item.entries + ')').join('、')
+          return [text('实体 ' + value.entities + ' 个 / 覆盖 ' + value.entriesWithEntities + '/' + value.entries + ' 条；别名 ' + value.aliasCount + ' 个；疑似重复 ' + value.candidates + ' 组 | Top：' + (top || '无'))]
+        },
+      },
+      async execute() {
+        return entityStats(state.entries, state.entityAliases)
+      },
+    }),
+  )
+
+  // 单实体解析视图：规范名 + 别名 + 相关记忆 + 共现 + 疑似重复候选。只读。
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_entity_resolve',
+      description: '查一个实体的解析视图（v4.10）：规范名、别名、相关记忆、共现实体、疑似重复候选。别名展开后再过滤，所以「Alice」和「我的同事 Alice」会命中同一组记忆。',
+      parameters: {
+        type: 'object',
+        properties: {
+          entity: { type: 'string', description: '实体标签（可以是别名，如「我的同事 Alice」）' },
+        },
+        required: ['entity'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            entity: { type: 'string' },
+            canonical: { type: 'string' },
+            aliases: { type: 'array', items: { type: 'string' } },
+            entries: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  text: { type: 'string' },
+                },
+                required: ['id', 'text'],
+                additionalProperties: false,
+              },
+            },
+            coccurring: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  entity: { type: 'string' },
+                  count: { type: 'integer' },
+                },
+                required: ['entity', 'count'],
+                additionalProperties: false,
+              },
+            },
+            candidates: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  a: { type: 'string' },
+                  b: { type: 'string' },
+                  similarity: { type: 'number' },
+                  reason: { type: 'string' },
+                },
+                required: ['a', 'b', 'similarity', 'reason'],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: ['entity', 'canonical', 'aliases', 'entries', 'coccurring', 'candidates'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          const head = value.entity + ' -> ' + value.canonical + (value.aliases.length > 0 ? '（别名：' + value.aliases.join('、') + '）' : '')
+          const list = value.entries.slice(0, 5).map((item) => '  - ' + item.id + ' ' + item.text).join('\n')
+          const cand = value.candidates.length > 0 ? '；疑似重复：' + value.candidates.map((item) => item.a + '~' + item.b).join('、') : ''
+          return [text(head + ' | 记忆 ' + value.entries.length + ' 条，共现 ' + value.coccurring.length + ' 个' + cand + (list ? '\n' + list : ''))]
+        },
+      },
+      async execute(args) {
+        const raw = typeof args?.entity === 'string' ? args.entity.trim() : ''
+        if (raw === '') throw fail('MEMORY_ARG_MISSING', 'memory_entity_resolve 需要 entity。')
+        const aliasMap = buildAliasMap(state.entityAliases)
+        const canonical = aliasMap.get(entityKey(raw)) ?? normalizeEntity(raw)
+        const aliases = state.entityAliases && Array.isArray(state.entityAliases[canonical]) ? state.entityAliases[canonical] : []
+        const keys = expandEntityKeys(raw, state.entityAliases)
+        const active = state.entries.filter((entry) => isTrueAt(entry))
+        const hits = active.filter((entry) => Array.isArray(entry.entities) && entry.entities.some((label) => keys.has(entityKey(label))))
+        const coccurring = [...entityCoccur(active, canonical).entries()].sort((a, b) => b[1] - a[1]).map(([entity, count]) => ({ entity, count }))
+        const candidates = findAliasCandidates(state.entries, { limit: 10 }).filter((item) => item.a === canonical || item.b === canonical || item.a === raw || item.b === raw)
+        return {
+          entity: raw,
+          canonical,
+          aliases,
+          entries: hits.slice(0, 20).map((entry) => ({ id: entry.id, text: String(entry.text).slice(0, 120) })),
+          coccurring,
+          candidates,
+        }
+      },
+    }),
+  )
+
+  // 合并实体：把 aliases 归到 canonical（改已有记忆的标签 + 落别名表）。危险动作要 confirm。
+  ctx.effect(() =>
+    tools.register({
+      name: 'memory_entity_merge',
+      description: '合并实体（v4.10）：把 aliases 登记到 canonical 名下，并把已有记忆里的等价标签改成 canonical。危险动作必须 confirm:true；不确定的相似实体先用 memory_entity_resolve 看候选，别猜。',
+      parameters: {
+        type: 'object',
+        properties: {
+          canonical: { type: 'string', description: '规范名（保留这个名字）' },
+          aliases: { type: 'array', items: { type: 'string' }, description: '要归并进来的别名/写法' },
+          confirm: { type: 'boolean', description: '必须为 true 才真的写' },
+        },
+        required: ['canonical', 'confirm'],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            ok: { type: 'boolean' },
+            canonical: { type: 'string' },
+            aliases: { type: 'array', items: { type: 'string' } },
+            entriesUpdated: { type: 'integer' },
+          },
+          required: ['ok', 'canonical', 'aliases', 'entriesUpdated'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          return [text('已合并到 ' + value.canonical + '：别名 ' + value.aliases.length + ' 个，更新记忆 ' + value.entriesUpdated + ' 条')]
+        },
+      },
+      async execute(args) {
+        const canonicalRaw = typeof args?.canonical === 'string' ? args.canonical.trim() : ''
+        if (canonicalRaw === '') throw fail('MEMORY_ARG_MISSING', 'memory_entity_merge 需要 canonical。')
+        if (args?.confirm !== true) throw fail('MEMORY_CONFIRM_REQUIRED', 'memory_entity_merge 会改记忆里的实体标签，必须传 confirm:true。')
+        requireWritable()
+        refreshBeforeWrite()
+        const canonical = normalizeEntity(canonicalRaw)
+        const incoming = Array.isArray(args?.aliases) ? args.aliases.filter((a) => typeof a === 'string' && a.trim() !== '').map((a) => normalizeEntity(a)) : []
+        const aliasSet = new Set(incoming.filter((a) => a !== '' && entityKey(a) !== entityKey(canonical)))
+        const existing = state.entityAliases && Array.isArray(state.entityAliases[canonical]) ? state.entityAliases[canonical] : []
+        for (const item of existing) aliasSet.add(item)
+        const aliases = [...aliasSet]
+        if (!state.entityAliases || typeof state.entityAliases !== 'object' || Array.isArray(state.entityAliases)) state.entityAliases = {}
+        state.entityAliases[canonical] = aliases
+        const keyMap = new Map()
+        keyMap.set(entityKey(canonical), canonical)
+        for (const item of aliases) keyMap.set(entityKey(item), canonical)
+        let entriesUpdated = 0
+        for (const entry of state.entries) {
+          if (!Array.isArray(entry.entities)) continue
+          const next = []
+          const seen = new Set()
+          let touched = false
+          for (const label of entry.entities) {
+            const mapped = keyMap.get(entityKey(label)) ?? label
+            if (mapped !== label) touched = true
+            const dedupe = entityKey(mapped)
+            if (seen.has(dedupe)) { touched = true; continue }
+            seen.add(dedupe)
+            next.push(mapped)
+          }
+          if (touched) { entry.entities = next; entriesUpdated += 1 }
+        }
+        const saved = saveEntityAliases(state.entityAliases)
+        if (!saved) throw fail('MEMORY_STORE_WRITE_FAILED', '别名旁路落盘失败，本次合并未生效。')
+        if (entriesUpdated > 0) persist()
+        return { ok: true, canonical, aliases: state.entityAliases[canonical] ?? [], entriesUpdated }
       },
     }),
   )
