@@ -1,0 +1,19 @@
+# dsh-negative-asset bundle patch.
+#
+# P0 只读：只注册 asset_scan / asset_status，没有任何删除、移动、改名能力。
+# 不写死任何绝对路径：数据默认落 D:\AI\dsh-data\negative-asset（本机约定不落 C 盘），
+# 换机器时自动退到 DSH_PROFILE_DIR 或 ~/.dsh/dsh-negative-asset。
+#
+# 想加扫描根、改默认阈值、或追加自己的红线目录，在 profile 的 cordis.patch.yml 里覆盖：
+#
+#   - id: negative-asset
+#     name: "@local/dsh-negative-asset"
+#     config:
+#       storeDir: 'D:\AI\dsh-data\negative-asset'
+#       roots:
+#         - 'D:\AI\dsh-data\tmp'
+#       protectDirs:
+#         - 'E:\某个不许动的目录'
+- insert:
+    - id: negative-asset
+      name: '@local/dsh-negative-asset'

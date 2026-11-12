@@ -1,0 +1,30 @@
+{
+  "name": "@local/dsh-negative-asset",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
+  },
+  "type": "module",
+  "description": "Negative-asset scanner for project-level leftovers: empty dirs, zero-byte files, stale temp artifacts, duplicate copies, split-volume residue and replica names. Read-only (P0): reports candidates with signal + reason + three-check layering (safe / doubt / ask), never deletes.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "lib/*.js"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "main": "index.js"
+}

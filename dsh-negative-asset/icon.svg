@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="Negative asset scan">
+  <rect x="2" y="2" width="44" height="44" rx="10" fill="#1f2937"/>
+  <path d="M13 12.5h11.2l4.3 4.3V27a2 2 0 0 1-2 2H13a2 2 0 0 1-2-2V14.5a2 2 0 0 1 2-2z" fill="#f4c542"/>
+  <path d="M24 12.5l4.5 4.5H24z" fill="#e8b429"/>
+  <g stroke="#1f2937" stroke-width="1.8" stroke-linecap="round">
+    <path d="M15.5 19.5h9"/>
+    <path d="M15.5 23h6"/>
+  </g>
+  <circle cx="30.5" cy="29.5" r="6.5" fill="none" stroke="#fdf6e3" stroke-width="2.4"/>
+  <path d="M35.2 34.2l4.1 4.1" stroke="#fdf6e3" stroke-width="2.6" stroke-linecap="round"/>
+  <path d="M27.8 29.5h5.4" stroke="#fdf6e3" stroke-width="2.2" stroke-linecap="round"/>
+</svg>

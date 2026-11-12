@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Negative-asset scan (read-only)",
+    "description": "Read-only scan for project-level leftovers: empty dirs, zero-byte files, stale temp artifacts, duplicate copies, split-volume residue and replica-name copies. Every candidate carries a signal, a reason and a three-check layer (safe / doubt / ask); protected roots stay excluded fail-closed. P0 never deletes, moves or renames anything."
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "@local/dsh-projcache-delta",
+  "version": "0.2.2-rc.1-delta.1",
+  "private": true,
+  "engines": {
+    "node": ">=23.4.0",
+    "dsh": ">=0.2.0 <0.3.0"
+  },
+  "type": "module",
+  "description": "Delta-journal forks of the official storage stack (storage-json + storage-domain + session-projection-cache): incremental projection-cache checkpoints instead of whole-record rewrites.",
+  "main": "./lib/session-projection-cache.js",
+  "exports": {
+    "./lib/*.js": "./lib/*.js"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "install.mjs",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/schemastery": "~3.19.0",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-storage": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-storage-domain": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-util-values": "0.2.2-rc.1",
+    "zod": "4.4.3"
+  }
+}
