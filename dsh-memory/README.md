@@ -7,10 +7,55 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
 - **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
-- **版本 / 引擎**：v4.15.0（2026-11-12）。v4.15.0 把**存储预算拆成热层/冷层**（`maxBytes` 只管进 prompt 的条目，`maxColdBytes` 管只检索的条目，见下节「分层预算」）；v4.14.0 加**淘汰可观测 + 可审计**（每次维护运行都留痕 / 归档写 manifest / budget 状态与 health 同源，见 CHANGELOG 与下节）；v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+- **版本 / 引擎**：v4.16.0（2026-11-12）。v4.16.0 把**淘汰判据从「只认 staleAfter」改成「锚点 vs 动态窗口」**（治 67 条无 staleAfter 条目永久 notDue、archived=0），并给注入收益度量补 `indexedIfFullChars`（见下节「淘汰判据覆盖 100%」）；v4.15.0 把**存储预算拆成热层/冷层**（`maxBytes` 只管进 prompt 的条目，`maxColdBytes` 管只检索的条目，见下节「分层预算」）；v4.14.0 加**淘汰可观测 + 可审计**（每次维护运行都留痕 / 归档写 manifest / budget 状态与 health 同源，见 CHANGELOG 与下节）；v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
 
 
+## 淘汰判据覆盖 100% + 注入收益度量补数（v4.16 · 2026-11-12）
+
+> 取经：Hermes 三档淘汰（archive→prune→VACUUM）+ 锚点 vs 动态窗口；Google ADK `_prompt_chars_saved` 的收益度量思想。
+> 前情：六家大厂调研（`_research/six-lab-memory-survey-2026-11-12.md`）→ 模仿总规划（`_research/memory-mimicry-master-plan-2026-11-12.md`）P0-1 / P0-2。
+
+### 根因（实测，不是推断）
+
+- `curationDecision` 以 `staleAfter` 为入口（`lib/entry.js`）；库里 106 条中 **67 条没有 `staleAfter`** → 永远 `notDue`。
+- 观测值：`memory_status.maintenance` 显示维护在跑（`checked=97`）但 `archived=0`、`skipped.notDue=66` —— **跑着等于空转**。
+
+### 改法
+
+1. **入口换成「锚点 vs 动态窗口」**：`ageDays = now − (lastUsedAt ?? updatedAt ?? addedAt)`，每次现算，任何条目无逃逸；`staleAfter` 只保留为「该复核」旁证（到期 + 宽限期仍优先归档，原语义不回归）。
+2. **窗口参数**（`lib/constants.js`）：`EVICTION_WINDOW_DAYS = { fact: 90, note: 30, reference: 180 }`；不在表里的 kind（rule / procedure / state / identity 等）**不参与时间淘汰**。
+3. **五道护栏**：`usedCount ≥ 3` / `importance ≥ 8` / 最近 7 天动过 / pinned / rule / draft / identity 槽 / 正文含 `vault://` 指针 —— 命中任一不自动动。
+4. **单轮上限** `EVICTION_MAX_PER_RUN = 5`，超出留到下一轮（`skipped.capped`）。
+5. **可观测三态**：`maintenance.lastSummary.{state:executed|noCandidates|untracked, ids, freedChars, skipped}`；`skipped` 拆出 `window`（窗口未到）/ `offWindow`（不参与）/ `grace`（有理由豁免）/ `capped`。
+6. **只读预览**：`memory_audit.evictionCandidates` 列出「若现在跑维护会归档谁 + 为什么」，不写数据。
+7. **注入收益度量补数**（P0-1）：`memory_list.injectStats.indexedIfFullChars` = 索引批若全量展开的字符数；与 `indexedChars` 的差 = 索引层替我们省下的量（原有 `fullChars` / `indexedChars` / `droppedFullChars` 不动）。
+
+### 验证记录（真机，2026-11-12 16:2x，HMR 重载后实调）
+
+| 观测 | 改前 | 改后（真机） |
+|---|---|---|
+| `maintenance.checked` | 97 | **108**（覆盖全部生效条目） |
+| `skipped.notDue` | 66 | **0**（判据不再漏判） |
+| `skipped.offWindow` | —（无此桶） | **60**（kind 不参与时间淘汰，有理由） |
+| `skipped.grace` | 0 | **16**（最近 7 天保护 + stale 宽限） |
+| `maintenance.lastSummary.state` | —（无此字段） | **noCandidates** + note「判据覆盖 108 条，不是没跑」 |
+| `memory_audit.evictionCandidates` | —（无此字段） | **20 条**，每条带 ageDays/windowDays/candidate/reason |
+| `injectStats.indexedIfFullChars` | —（无此字段） | **3954**（`indexedChars=1369` → 索引层省 **2585** 字符） |
+
+**诚实说明**：真机 `archived` 仍为 0 —— 库龄只有 18 天，而窗口是 fact 90 天 / note 30 天 / reference 180 天，**不是判据没生效，是还没有到窗口的条目**。
+归档链路由受控集成测试证明（临时库造 10 条 100 天前低价值事实 → 归档 ≤5 条、保护类 0 误伤、restore 可恢复）。
+
+### 测试
+
+- `_selftest/tests/memory-eviction-v416.test.mjs`：6 组纯函数断言（窗口/锚点/无 staleAfter 进候选/护栏/stale 不回归/有效重要度）。
+- `_selftest/tests/memory-eviction-integration.test.mjs`：4 组真实链路断言（走 `apply(ctx)` → memory.json → runMaintenance → archive → restore）。
+- 全量回归：`memory.test.mjs` 154 项通过；`memory-bench` Recall@5 = 1.000（21/21）。
+
+### 边界与回滚
+
+- 只归档不物理删；`memory_restore` 逐条回；`archive-manifest.jsonl` 留痕。
+- 不动检索打分 / 注入预算 / SQLite schema；回滚 = 单 commit revert。
 ## 分层预算（v4.15 · 2026-11-12）
 
 **问题**：113 条生效 / 11886 字符撞上单预算 12000，`memory_add` 只剩 114 字符；但其中 60 条 / 5872 字符是 `inject:false`（只参与 `memory_search`，**根本不进 prompt**）。curator 也腾不出空间（pinned 20 / rule 19 / notDue 74）——删不得，也不该被挡。

@@ -3,7 +3,7 @@
  *
  * 只管「一条记忆在某一刻算什么状态」，不碰存储与渲染。
  */
-import { CURATOR_STALE_GRACE_DAYS, DATE_ONLY, DEFAULT_SCOPE_ROOTS, IMPORTANCE_BASE, KIND_REFERENCE, RECENCY_DECAY_PER_HOUR, REFERENCE_STALE_DAYS } from './constants.js'
+import { CURATOR_STALE_GRACE_DAYS, DATE_ONLY, DEFAULT_SCOPE_ROOTS, EVICTION_MIN_IMPORTANCE_GUARD, EVICTION_MIN_USES_GUARD, EVICTION_RECENT_GUARD_DAYS, EVICTION_WINDOW_DAYS, IMPORTANCE_BASE, KIND_REFERENCE, RECENCY_DECAY_PER_HOUR, REFERENCE_STALE_DAYS } from './constants.js'
 import { textSimilarity } from './text.js'
 import { entityKey } from './entity.js'
 
@@ -55,14 +55,54 @@ export function eliminationSignal(entry, today = localDateOf()) {
  *   理由：stale 只是「到期该复核」，不是「该扔」；还在被检索命中的事实大概率仍为真，误杀损失大。
  *   没有 lastUsedAt 的（从未命中）回退到 updatedAt / addedAt。
  */
+/** v4.16：条目参与「时间淘汰」的窗口天数；返回 null = 该类条目永不自动淘汰。
+ *  与 store.js 的 isEliminationProtected 分工：那边管 pinned/draft/vault 指针等「运行期保护」，
+ *  这里管「按 kind 决定能不能被时间淘汰」——两处都判，单测可分别覆盖。
+ */
+export function evictionWindowDays(entry) {
+  const kind = typeof entry?.kind === 'string' ? entry.kind : ''
+  if (entry?.pinned === true) return null
+  if (entry?.slot === 'identity') return null
+  if (entry?.status === 'draft') return null
+  // vault:// 指针是知识入口：自动归档会让指针断链，必须人工处理（2026-11-12 集成测试误归档过）。
+  if (String(entry?.text ?? '').includes('vault://')) return null
+  return Object.prototype.hasOwnProperty.call(EVICTION_WINDOW_DAYS, kind) ? EVICTION_WINDOW_DAYS[kind] : null
+}
+
+/** v4.16：淘汰判据的锚点（最后一次被使用或改动）；无效返回 NaN（= 无法证明年龄，不动）。 */
+export function evictionAnchor(entry) {
+  return parseTimestamp(entry?.lastUsedAt) || parseTimestamp(entry?.updatedAt) || parseTimestamp(entry?.addedAt)
+}
+
+/**
+ * v4.4 curator 归档判据（纯函数，供维护循环与单测复用）。
+ * v4.16 重写入口：原来「没有 staleAfter 就 return false」让 67 条存量永久免死；现在两条判据取并集——
+ *   ① stale 到期（原语义不变）：到期 + 宽限期内无使用/更新 → 归档；
+ *   ② 锚点窗口（新增）：age ≥ kind 窗口 且 usedCount < 3 且 importance < 8 且最近 7 天没动 → 归档。
+ * 返回 `{ archive, reason }`；reason 空串 = 未到期（调用方计 notDue），非空且 archive=false = 有理由的豁免。
+ */
 export function curationDecision(entry, today = localDateOf(), now = Date.now()) {
-  if (!isStaleEntry(entry, today)) return { archive: false, reason: '' }
-  const ref = entry?.lastUsedAt ?? entry?.updatedAt ?? entry?.addedAt
-  const stamp = Date.parse(String(ref ?? ''))
-  if (Number.isFinite(stamp) && now - stamp < CURATOR_STALE_GRACE_DAYS * 86400000) {
-    return { archive: false, reason: 'stale 但宽限期内仍被使用/更新，活跃豁免' }
+  // ① stale 到期（原语义，不回归）：到期 + 宽限期内无复核/使用 → 归档
+  if (isStaleEntry(entry, today)) {
+    const ref = entry?.lastUsedAt ?? entry?.updatedAt ?? entry?.addedAt
+    const stamp = Date.parse(String(ref ?? ''))
+    if (Number.isFinite(stamp) && now - stamp < CURATOR_STALE_GRACE_DAYS * 86400000) {
+      return { archive: false, reason: 'stale 但宽限期内仍被使用/更新，活跃豁免' }
+    }
+    return { archive: true, reason: `staleAfter ${entry.staleAfter} 已过且 ${CURATOR_STALE_GRACE_DAYS} 天未使用未复核` }
   }
-  return { archive: true, reason: `staleAfter ${entry.staleAfter} 已过且 ${CURATOR_STALE_GRACE_DAYS} 天未使用未复核` }
+  // ② 锚点窗口（v4.16 新增）：治「无 staleAfter 则永久 notDue」
+  const windowDays = evictionWindowDays(entry)
+  if (windowDays === null) return { archive: false, reason: `no-window kind=${typeof entry?.kind === 'string' && entry.kind !== '' ? entry.kind : '(空)'} 不参与时间淘汰` }
+  if ((entry?.usedCount ?? 0) >= EVICTION_MIN_USES_GUARD) return { archive: false, reason: `usedCount≥${EVICTION_MIN_USES_GUARD}，仍在被用，保护` }
+  if (effectiveImportance(entry, now) >= EVICTION_MIN_IMPORTANCE_GUARD) return { archive: false, reason: `importance≥${EVICTION_MIN_IMPORTANCE_GUARD}，高价值，保护` }
+  const anchor = evictionAnchor(entry)
+  if (!Number.isFinite(anchor)) return { archive: false, reason: '' }
+  const ageDays = (now - anchor) / 86400000
+  // 最近 7 天动过也写理由（不写空串）：否则维护统计会把它混进 notDue，看起来像「判据没覆盖」。
+  if (ageDays < EVICTION_RECENT_GUARD_DAYS) return { archive: false, reason: `recent age ${Math.floor(ageDays)}d < ${EVICTION_RECENT_GUARD_DAYS}d 保护` }
+  if (ageDays < windowDays) return { archive: false, reason: `window age ${Math.floor(ageDays)}d < ${entry.kind} ${windowDays}d` }
+  return { archive: true, reason: `age ${Math.floor(ageDays)}d ≥ ${entry.kind} 窗口 ${windowDays}d 且 usedCount<${EVICTION_MIN_USES_GUARD}` }
 }
 
 /**

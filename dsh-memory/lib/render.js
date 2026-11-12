@@ -385,6 +385,9 @@ export function renderMemory(allEntries, options) {
     statsOut.fullChars = sizeOf(full, lineFull)
     statsOut.indexedChars = sizeOf(indexed, lineIndex) + sizeOf(compact, lineIndexCompact)
     statsOut.droppedFullChars = sizeOf(dropped, lineFull)
+    // 2026-11-12（P0-1）：只报 indexedChars 看不出「索引层替我们省了多少」——补「索引批若全量展开」的字符数。
+    // 判据：indexedIfFullChars >= indexedChars；差值 = 本轮索引层省下的字符。
+    statsOut.indexedIfFullChars = sizeOf(indexed, lineFull) + sizeOf(compact, lineFull)
   }
 
   return built.block

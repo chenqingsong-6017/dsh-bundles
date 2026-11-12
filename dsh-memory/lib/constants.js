@@ -263,3 +263,17 @@ export const CONVERGE_MAX_USES = 2 // usedCount ≤ 2 才算低价值（3 次以
 export const CONVERGE_MIN_AGE_DAYS = 3 // 至少 3 天没动过（防止刚写的条目被后续写入挤掉）
 export const CONVERGE_MAX_PER_CALL = 10 // 单次最多归档 10 条，宁可多写几次也不一次清空
 
+// ── v4.16（P0-2）淘汰判据覆盖 100%（取经 Hermes 三档淘汰 + 锚点 vs 动态窗口，2026-11-12）──
+// 根因（实测）：`curationDecision` 以 staleAfter 为入口；库里 106 条中 67 条没有 staleAfter，
+//   于是永远走 notDue —— maintenance 跑着（checked=97）但等于空转，archived 长期为 0。
+// 改法：入口改为「锚点 vs 动态窗口」——ageDays = now - (lastUsedAt ?? updatedAt ?? addedAt)，
+//   每次现算，任何条目无逃逸；staleAfter 只保留为「该复核」的旁证（到期 + 宽限期仍优先归档）。
+// 窗口取 Hermes 三档的保守版（归档前还有 usedCount / importance / 最近更新三道护栏）：
+export const EVICTION_WINDOW_DAYS = { fact: 90, note: 30, reference: 180 }
+// 不参与自动淘汰的 kind（rule=长期约定 / procedure=验证过的流程 / state=进行中状态 / identity/preference 画像）：
+//   用「不在 EVICTION_WINDOW_DAYS 里 = 不淘汰」表达，避免第二个名单漂移。
+export const EVICTION_MAX_PER_RUN = 5 // 单次维护最多归档 5 条（设计稿 §3.3 T1 上限）
+export const EVICTION_MIN_USES_GUARD = 3 // usedCount ≥ 3 = 仍在被用，保护
+export const EVICTION_MIN_IMPORTANCE_GUARD = 8 // importance ≥ 8 = 高价值，保护
+export const EVICTION_RECENT_GUARD_DAYS = 7 // 最近 7 天更新/使用过，保护（与 ROOM_MIN_AGE_DAYS 同口径）
+

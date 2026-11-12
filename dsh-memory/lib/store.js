@@ -8,8 +8,8 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSy
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { ARCHIVE_MANIFEST_MAX_BYTES, BACKUP_KEEP, BM25_ALIAS_WEIGHT, BUDGET_DEGRADED_RATIO, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, CONSOLIDATE_MIN_USES, CONVERGE_MAX_PER_CALL, CONVERGE_MAX_USES, CONVERGE_MIN_AGE_DAYS, CURATOR_INTERVAL_MS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
-import { curationDecision, detectScope, effectiveImportance, eliminationSignal, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
+import { ARCHIVE_MANIFEST_MAX_BYTES, BACKUP_KEEP, BM25_ALIAS_WEIGHT, BUDGET_DEGRADED_RATIO, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, CONSOLIDATE_MIN_USES, CONVERGE_MAX_PER_CALL, CONVERGE_MAX_USES, CONVERGE_MIN_AGE_DAYS, CURATOR_INTERVAL_MS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, EVICTION_MAX_PER_RUN, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
+import { curationDecision, detectScope, effectiveImportance, eliminationSignal, evictionAnchor, evictionWindowDays, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
 import { canonicalJson, migrateState, normalizeEntry, schemaTooNewError } from './schema.js'
 import { fail, text } from './util.js'
 import { atomicWriteText } from '../../_lib/store.mjs'
@@ -1992,6 +1992,36 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
     }
   }
 
+  /**
+   * v4.16（P0-2）：淘汰候选只读预览（memory_audit.evictionCandidates 用）。
+   * 不写任何数据；回答「若现在跑维护，哪些条目会被归档、哪些被护栏挡住、为什么」。
+   */
+  const evictionPreview = (limit = 20) => {
+    const today = localDateOf()
+    const now = Date.now()
+    const rows = []
+    for (const entry of activeEntries()) {
+      if (isEliminationProtected(entry)) continue
+      const anchor = evictionAnchor(entry)
+      const windowDays = evictionWindowDays(entry)
+      const decision = curationDecision(entry, today, now)
+      rows.push({
+        id: entry.id,
+        kind: typeof entry.kind === 'string' ? entry.kind : '',
+        ageDays: Number.isFinite(anchor) ? Math.floor((now - anchor) / 86400000) : null,
+        usedCount: Number(entry.usedCount ?? 0),
+        windowDays,
+        candidate: decision.archive === true,
+        reason: decision.reason,
+      })
+    }
+    rows.sort((a, b) => {
+      if (a.candidate !== b.candidate) return a.candidate ? -1 : 1
+      return (b.ageDays ?? -1) - (a.ageDays ?? -1)
+    })
+    return rows.slice(0, limit)
+  }
+
   // ── v4.4 维护循环（对齐 Hermes curator + 「越用越好用」）──
   // 读路径顺带跑，CURATOR_INTERVAL_MS 节流。两件事：
   //   1) consolidate（上）：draft 未证实条目被命中 ≥ CONSOLIDATE_MIN_USES 次 → 升 stable（越用越证实）。
@@ -2008,7 +2038,8 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
     // v4.14：统计口径 = 本轮「看过 / 归档 / 巩固 / 为什么跳过」，每次运行都落盘。
     // 没有这组计数，lastRunAt 只会停在「上次真的动过」的时刻，分不清「没跑」和「跑了没事可做」
     // （Hermes 用 no-op 原因日志解决同一个问题；2026-11-12 取经）。
-    const skipped = { pinned: 0, rule: 0, draft: 0, notDue: 0, grace: 0 }
+    // v4.16：window = 窗口未到；capped = 达单轮上限留待下轮（都可解释，不再合并进 notDue）。
+    const skipped = { pinned: 0, rule: 0, draft: 0, notDue: 0, grace: 0, window: 0, offWindow: 0, capped: 0 }
     const archivedRows = []
     let checked = 0
     let promoted = 0
@@ -2037,9 +2068,16 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
       }
       const decision = curationDecision(entry, today, now)
       if (!decision.archive) {
-        // curationDecision 只在「stale 但宽限期内仍活跃」时给理由；空串 = 还没到期。
-        if (decision.reason !== '') skipped.grace += 1
+        // v4.16：reason 区分「窗口未到」（window ...）/「有理由的豁免」（stale 宽限、usedCount/importance 护栏）。
+        if (decision.reason.startsWith('window ')) skipped.window += 1
+        else if (decision.reason.startsWith('no-window ')) skipped.offWindow += 1
+        else if (decision.reason !== '') skipped.grace += 1
         else skipped.notDue += 1
+        continue
+      }
+      // v4.16：单次维护归档上限（设计稿 §3.3 T1）；超出留到下一轮，不一次清空。
+      if (archivedRows.length >= EVICTION_MAX_PER_RUN) {
+        skipped.capped += 1
         continue
       }
       // 信号必须在改状态之前算（判据读的是条目自己的时间戳，不依赖 status，但先算更稳）。
@@ -2050,13 +2088,26 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
       archivedRows.push({ ts: entry.archivedAt, by: 'curator', id: entry.id, reason: entry.archiveReason, signal, chars: entry.text.length })
     }
     const archived = archivedRows.length
+    // v4.16 三态：executed（有动作）/ noCandidates（跑了没候选，带原因分布）；untracked = 节流内没跑（runMaintenance 提前返回）。
     maintenanceStats = {
       lastRunAt: new Date(now).toISOString(),
       checked,
       archived,
       promoted,
       skipped,
-      note: archived === 0 && promoted === 0 ? '本次没有可归档条目（staleAfter 未到期或仍在宽限期内）——不是没跑' : '',
+      lastSummary: {
+        state: archived > 0 ? 'executed' : 'noCandidates',
+        at: new Date(now).toISOString(),
+        checked,
+        archived,
+        promoted,
+        ids: archivedRows.map((row) => row.id),
+        freedChars: archivedRows.reduce((sum, row) => sum + Number(row.chars ?? 0), 0),
+        skipped,
+      },
+      note: archived === 0 && promoted === 0
+        ? `本次没有归档（窗口未到 ${skipped.window} / 不参与 ${skipped.offWindow} / 其它豁免 ${skipped.grace} / 保护 ${skipped.pinned + skipped.rule + skipped.draft} / 无理由 ${skipped.notDue}）——判据覆盖 ${checked} 条，不是没跑`
+        : '',
     }
     try {
       ensureStoreDir()
@@ -2220,6 +2271,7 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
     pendingCandidates,
     addCandidate,
     runMaintenance,
+    evictionPreview,
     budgetState,
     maintenanceFile,
     manifestFile,

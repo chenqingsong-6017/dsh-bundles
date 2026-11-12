@@ -41,7 +41,7 @@ import { gateDecision, relevanceCoverage, scoreEntries } from './lib/score.js'
 export const name = 'dsh-memory'
 export const inject = ['tools', 'systemPrompt', 'workingDirectory']
 
-export { isStaleEntry, isArchivedEntry, isInvalidEntry, isNotYetValid, isTrueAt, parseTimestamp, entityIndex, entityCoccur, profileView, detectContradictions, applicableAt, curationDecision, deriveStaleAfter, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
+export { isStaleEntry, isArchivedEntry, isInvalidEntry, isNotYetValid, isTrueAt, parseTimestamp, entityIndex, entityCoccur, profileView, detectContradictions, applicableAt, curationDecision, deriveStaleAfter, evictionAnchor, evictionWindowDays, localDateOf, importanceOf, effectiveImportance, eliminationSignal, recencyOf, detectScope } from './lib/entry.js'
 export { bigramSet, textSimilarity, stripHarnessBlocks, tokenize, suggestAliases, expandQuery, contentUnitsOf, queryClauses } from './lib/text.js'
 export { queryIdfSum, scoreEntries, scoreEntriesStrict, gateDecision, relevanceCoverage, scoreMemory } from './lib/score.js'
 export { trustMark, renderMemory } from './lib/render.js'
@@ -179,6 +179,8 @@ export function apply(ctx, config) {
         fullChars: listStats.fullChars ?? 0,
         indexedChars: listStats.indexedChars ?? 0,
         droppedFullChars: listStats.droppedFullChars ?? 0,
+        // 2026-11-12（P0-1，取经 ADK 收益度量）：索引批若全量展开的字符数；与 indexedChars 的差即索引层省下的量。
+        indexedIfFullChars: listStats.indexedIfFullChars ?? 0,
         indexedCount: (Array.isArray(listStats.indexed) ? listStats.indexed.length : 0) + (Array.isArray(listStats.compact) ? listStats.compact.length : 0),
         richIndexCount: Array.isArray(listStats.indexed) ? listStats.indexed.length : 0,
         compactCount: Array.isArray(listStats.compact) ? listStats.compact.length : 0,
@@ -217,6 +219,7 @@ export function apply(ctx, config) {
           fullChars: { type: 'integer' },
           indexedChars: { type: 'integer' },
           droppedFullChars: { type: 'integer' },
+          indexedIfFullChars: { type: 'integer' },
           indexedCount: { type: 'integer' },
           richIndexCount: { type: 'integer' },
           compactCount: { type: 'integer' },
@@ -1948,9 +1951,27 @@ export function apply(ctx, config) {
               additionalProperties: false,
             },
             contradictions: { type: 'array', items: { type: 'object', properties: { entity: { type: 'string' }, a: { type: 'string' }, b: { type: 'string' }, aText: { type: 'string' }, bText: { type: 'string' } } } },
+            // v4.16（P0-2）：淘汰候选只读预览——「若现在跑维护会归档谁、谁被护栏挡住」。
+            evictionCandidates: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  kind: { type: 'string' },
+                  ageDays: { type: 'integer' },
+                  usedCount: { type: 'integer' },
+                  windowDays: { type: 'integer' },
+                  candidate: { type: 'boolean' },
+                  reason: { type: 'string' },
+                },
+                required: ['id', 'kind', 'ageDays', 'usedCount', 'windowDays', 'candidate', 'reason'],
+                additionalProperties: false,
+              },
+            },
             schemaVersion: { type: 'integer' },
           },
-          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget', 'growth', 'schemaVersion'],
+          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget', 'growth', 'evictionCandidates', 'schemaVersion'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -1967,6 +1988,12 @@ export function apply(ctx, config) {
             `别名覆盖：${value?.aliases?.withAliases ?? 0} 条有 / ${value?.aliases?.missing ?? 0} 条缺${(value?.aliases?.missingIds ?? []).length > 0 ? ' —— ' + value.aliases.missingIds.join(' ') : ''}（缺别名的条目在换皮问法下召回不到，用 memory_update 补）`,
             `（未证实条目在注入时带 ❓，过期待重验带 ⏰；复核后用 memory_update verified:true 清除标记）`,
             `最常用：${mostUsed.map((item) => `${item.id}×${item.usedCount}`).join(' ') || '（还没有使用记录）'}`,
+            (() => {
+              const list = Array.isArray(value?.evictionCandidates) ? value.evictionCandidates : []
+              const candidates = list.filter((row) => row.candidate === true)
+              if (list.length === 0) return '淘汰候选（只读）：无可检查条目（全部受保护或已归档）'
+              return `淘汰候选（只读）：候选 ${candidates.length} / 共检查 ${list.length}${candidates.length > 0 ? ' —— ' + candidates.slice(0, 8).map((row) => `${row.id}(${row.ageDays}d)`).join(' ') : '（都在窗口内或被护栏挡住）'}`
+            })(),
             (() => {
               const growth = value?.growth
               if (!growth) return ''
@@ -2081,6 +2108,16 @@ export function apply(ctx, config) {
             }
           })(),
           contradictions: contradictions.slice(0, limit),
+          // v4.16（P0-2）：只读候选清单——不写数据；candidate=true 的才是「现在跑维护会归档」。
+          evictionCandidates: store.evictionPreview(limit).map((row) => ({
+            id: row.id,
+            kind: row.kind,
+            ageDays: Number.isFinite(row.ageDays) ? row.ageDays : -1,
+            usedCount: row.usedCount,
+            windowDays: Number.isFinite(row.windowDays) ? row.windowDays : -1,
+            candidate: row.candidate === true,
+            reason: String(row.reason ?? ''),
+          })),
           schemaVersion: Number.isInteger(state.version) && state.version > 0 ? state.version : SCHEMA_VERSION,
         }
       },
@@ -2536,8 +2573,25 @@ export function apply(ctx, config) {
                     draft: { type: 'integer' },
                     notDue: { type: 'integer' },
                     grace: { type: 'integer' },
+                    window: { type: 'integer' },
+                    offWindow: { type: 'integer' },
+                    capped: { type: 'integer' },
                   },
                   additionalProperties: false,
+                },
+                // v4.16（P0-2）：三态 + 原因分布 + 归档明细（executed / noCandidates）。
+                lastSummary: {
+                  type: 'object',
+                  properties: {
+                    state: { type: 'string', enum: ['executed', 'noCandidates', 'untracked'] },
+                    at: { type: 'string' },
+                    checked: { type: 'integer' },
+                    archived: { type: 'integer' },
+                    promoted: { type: 'integer' },
+                    ids: { type: 'array', items: { type: 'string' } },
+                    freedChars: { type: 'integer' },
+                  },
+                  additionalProperties: true,
                 },
                 note: { type: 'string' },
               },
