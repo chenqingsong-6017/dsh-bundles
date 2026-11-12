@@ -1,5 +1,11 @@
 # CHANGELOG — dsh-path-rules
 
+## 1.1.0 — 2026-11-12
+
+- **常驻预算按工作区覆盖**：新增 `maxAlwaysCharsByWorkspace`（配置在 `cordis.patch.yml`）——本开发工作区 3000、其余工作区仍 2000；键按绝对路径归一（正/反斜杠、尾斜杠、大小写都命中），未命中回默认。
+- **诊断与行为一致**：`path_rules_status` 的 `alwaysBudget.maxChars` / `maxAlwaysChars` 报「当前会话 cwd 的生效值」，不再只报基准 2000（否则配置生效了状态还报旧值，属「诊断是假证据」）。
+- 依据 `_research/decisions/0003-fast-gate-and-workspace-budget.md`；`_selftest/tests/path-rules.test.mjs` 补 6 条断言（命中 / 未命中 / 归一 / 默认）。
+
 ## 1.0.2 — 2026-11-02
 
 - **Windows 大小写不敏感匹配**：`ruleMatches` 归一化为小写后再匹配——`paths: "D:/AI/Dsh-Bundles/**"` 与实际路径 `D:/AI/dsh-bundles/...` 能命中，路径规则不再靠大小写运气（误报扫描 #16）。

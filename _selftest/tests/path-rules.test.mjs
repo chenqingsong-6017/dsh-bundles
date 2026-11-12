@@ -282,6 +282,24 @@ try {
     ok('默认预算：核心层 2000、路径层 3000，空规则不注入')
   }
 
+  // ---- 9b) 常驻预算按工作区覆盖（2026-11-12：开发工作区 3000，其余仍 2000） ----
+  {
+    const byWorkspace = {
+      maxAlwaysChars: 2000,
+      maxAlwaysCharsByWorkspace: {
+        'D:/AI-date/dsh-date/dsh-创建': 3000,
+        'C:\\Work\\Other': 2500,
+      },
+    }
+    assert.equal(mod.resolveAlwaysBudget(byWorkspace, 'D:/AI-date/dsh-date/dsh-创建'), 3000)
+    assert.equal(mod.resolveAlwaysBudget(byWorkspace, 'D:\\AI-date\\dsh-date\\dsh-创建\\'), 3000, '反斜杠/尾斜杠归一后命中')
+    assert.equal(mod.resolveAlwaysBudget(byWorkspace, 'C:/Users/cqs6017/other'), 2000, '未命中回默认 2000')
+    assert.equal(mod.resolveAlwaysBudget(byWorkspace, 'C:/Work/Other'), 2500, '大小写/斜杠归一')
+    assert.equal(mod.resolveAlwaysBudget({}, 'D:/x'), 2000, '无配置回默认')
+    assert.equal(mod.resolveAlwaysBudget({ maxAlwaysCharsByWorkspace: {} }, 'D:/x'), 2000, '空表回默认')
+    ok('常驻预算按工作区覆盖；反斜杠/尾斜杠/大小写归一；未命中回默认')
+  }
+
   // ---- 10) 端到端：always 装配时就注入，路径规则触碰后才注入（v2 新增） ----
   {
     const projectDir = path.join(rootTmp, 'proj-always')

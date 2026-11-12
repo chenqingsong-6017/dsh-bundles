@@ -443,6 +443,32 @@ export function composeInjection(entries, options = {}) {
 
 // ---------- 插件 ----------
 
+/** 工作区路径归一：绝对路径 + 正斜杠 + 小写（比较用，不做 IO）。 */
+export const normalizeWorkspaceKey = (value) => {
+  if (typeof value !== 'string' || value.trim() === '') return ''
+  try {
+    return path.resolve(value).replace(/\\/g, '/').toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 常驻规则预算：默认 maxAlwaysChars；命中 maxAlwaysCharsByWorkspace 的工作区用覆盖值。
+ * 2026-11-12：开发工作区需要更多硬规则，又不想污染其它工作区（最小常驻原则）。
+ */
+export const resolveAlwaysBudget = (config, cwd) => {
+  const base = positiveInt(config?.maxAlwaysChars, DEFAULT_MAX_ALWAYS_CHARS)
+  const byWorkspace = config?.maxAlwaysCharsByWorkspace
+  if (byWorkspace === null || typeof byWorkspace !== 'object' || Array.isArray(byWorkspace)) return base
+  const key = normalizeWorkspaceKey(cwd)
+  if (key === '') return base
+  for (const [workspace, value] of Object.entries(byWorkspace)) {
+    if (normalizeWorkspaceKey(workspace) === key) return positiveInt(value, base)
+  }
+  return base
+}
+
 export function apply(ctx, config) {
   if (config?.enabled === false) return
   const maxChars = positiveInt(config?.maxChars, DEFAULT_MAX_CHARS)
@@ -563,7 +589,7 @@ export function apply(ctx, config) {
       const session = context?.agent?.session
       const cwd = resolveCwd(session)
       if (cwd === '') return ''
-      return composeInjection(collectEntries(session, cwd), { cwd, maxChars, maxAlwaysChars }).text
+      return composeInjection(collectEntries(session, cwd), { cwd, maxChars, maxAlwaysChars: resolveAlwaysBudget(config, cwd) }).text
     } catch {
       return ''
     }
@@ -760,7 +786,8 @@ export function apply(ctx, config) {
         const resolved = resolveCwd(session)
         const cwd = resolved === '' ? process.cwd() : resolved
         const scanned = scanRules(cwd)
-        const composed = composeInjection(collectEntries(session, cwd), { cwd, maxChars, maxAlwaysChars })
+        const effectiveAlways = resolveAlwaysBudget(config, cwd)
+        const composed = composeInjection(collectEntries(session, cwd), { cwd, maxChars, maxAlwaysChars: effectiveAlways })
         // #18/#19：认不出的 always 值、读失败或超限被跳过的规则文件——不能静默消失。
         const warnings = []
         for (const rule of scanned) {
@@ -830,7 +857,7 @@ export function apply(ctx, config) {
           ruleDirs: dirs,
           totalRules: dirs.reduce((sum, entry) => sum + entry.rules, 0),
           maxChars,
-          maxAlwaysChars,
+          maxAlwaysChars: effectiveAlways,
           layers,
           alwaysBudget: composed.always,
           pathBudget: composed.path,

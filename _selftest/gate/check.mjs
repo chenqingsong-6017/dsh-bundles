@@ -9,8 +9,11 @@
  * 四道门，先快后慢：
  *   1. 语法门：`node --check` 每个插件入口与它的 lib/ 模块（< 1 秒）
  *   2. 结构门：manifest / patch / 入口导出合规（< 1 秒）
- *   3. 测试门：全量跑 _selftest/tests/*.test.mjs（实测约 8 秒）
+ *   3. 测试门：全量跑 _selftest/tests/*.test.mjs（2026-11-12 实测约 50 秒 / 45 个测试）
  *   4. 标准门：report-only（规则见工作区 工业级标准.md）
+ *
+ * --fast 快门（2026-11-12）：跳过测试门，给「每次编辑都跑」（dsh-proof 的 check）用，实测 ~3s；
+ *   全门用 npm run check:full——本脚本不带参数 = 全量，行为与改动前一致。
  *
  * 第五道「性能基线慢门」默认关闭，只有显式 `--perf` 才跑：
  *   - 门跑完后调 `_ops/baselines.mjs --compare`，比对本次自测指标与 _reports/baselines.json；
@@ -47,6 +50,8 @@ const MAX_OUTPUT_LINES = 60
 
 // --perf 慢门用的基线脚本（DSH_BASELINES 可覆盖，便于换机；默认按本机绝对路径）。
 const PERF = process.argv.includes('--perf')
+// --fast 快门（2026-11-12）：跳过测试门，给「每轮编辑都跑」用（dsh-proof）。全门用 npm run check:full。
+const FAST = process.argv.includes('--fast')
 const PERF_SCRIPT = process.env.DSH_BASELINES ?? 'D:\\AI-date\\dsh-date\\dsh-创建\\_ops\\baselines.mjs'
 
 const node = process.execPath
@@ -295,6 +300,10 @@ const noTestWithEntry = []
 const usedTestFiles = new Set()
 let testMs = 0
 
+// --fast 快门：测试门整段跳过（全门 npm run check:full 负责全量 45 个测试）。
+// 块内保持原缩进，避免为加一层花括号产生 80 行纯缩进 diff（改动可在 git 里一眼看清）。
+if (FAST) lines.push('测试门：fast 模式跳过（npm run check:full 跑全量）')
+else {
 for (const bundle of bundles) {
   const dir = path.join(BUNDLES_DIR, bundle)
   const short = bundle.replace(/^dsh-/, '')
@@ -365,6 +374,7 @@ for (const bundle of uncovered) {
 }
 if (staleAllow.length > 0) {
   lines.push('测试门：baseline 可收紧（已有测试可移出）—— ' + staleAllow.join(', '))
+}
 }
 
 // ---- 阶段 4：标准门（report-only，规则见工作区 工业级标准.md） ----
