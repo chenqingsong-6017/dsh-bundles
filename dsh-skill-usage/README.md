@@ -3,7 +3,7 @@
 DSH bundle（Host 侧插件）：统计每个 skill 被加载了多少次、最后一次是什么时候，标出长期没用的技能供人工复核。
 
 - **安装位置**：`D:\AI\dsh-bundles\dsh-skill-usage`（D 盘，不在任何工作区里，工作区删除/移动不影响它）
-- **数据位置**：`D:\AI\dsh-data\skill-usage\usage.json`（bundle patch 里的 `storeDir`，不落 C 盘）
+- **数据位置**：`D:\AI\dsh-data\skill-usage\usage.json`（账本）+ 同目录 `archive-manifest.jsonl`（归档审计，超 2MiB 轮转成 `.1`）；bundle patch 里的 `storeDir`，不落 C 盘
 - **生效范围**：desktop profile 的 bundle 列表，**所有会话、所有工作目录**都生效（与 cwd 无关）
 
 参考 Hermes Agent 的 Curator（用量驱动的技能生命周期），但按 DSH 的边界做了两处降级：**只统计与标注，从不删除、不改写任何 skill**；不往系统提示里注入内容（每步改 prompt 会破坏前缀缓存）。
@@ -12,9 +12,9 @@ DSH bundle（Host 侧插件）：统计每个 skill 被加载了多少次、最�
 
 | 工具 | 作用 |
 |---|---|
-| `skill_usage` | 列出用量与状态。`filter` = `all`（默认）/ `used` / `unused` / `attention`（陈旧 + 可归档），`limit` 默认 40。输出面向人：状态写成【常用】/【从未用过】/【陈旧】/【建议归档】，不暴露内部枚举值 |
+| `skill_usage` | 列出用量与状态。`filter` = `all`（默认）/ `used` / `unused` / `attention`（陈旧 + 可归档），`limit` 默认 40；`dryRun: true` 只读预演「会归档谁」（见下「淘汰三件套」）。输出面向人：状态写成【常用】/【从未用过】/【陈旧】/【建议归档】，不暴露内部枚举值 |
 | `skill_usage_mark` | 标记"已复核"（可带 ≤200 字备注）。复核会给提醒续期，而不是永久压掉 |
-| `skill_usage_status` | 只读诊断：数据目录**真的可写**（写探针文件再删）、`usage.json` 能否解析、账本条数与目录技能数、阈值与计数。`ready:false` 时给 `unavailableReason` + `code` |
+| `skill_usage_status` | 只读诊断：数据目录**真的可写**（写探针文件再删）、`usage.json` 能否解析、账本条数与目录技能数、阈值与计数、`lastCuration`（最近一次自动归档的动作 + 跳过原因，可为 `null`）。`ready:false` 时给 `unavailableReason` + `code` |
 
 ## 状态机
 
@@ -53,6 +53,20 @@ DSH bundle（Host 侧插件）：统计每个 skill 被加载了多少次、最�
 - 只统计当前 profile + 当前工作目录视图里可见的技能；
 - 不做系统提示注入：需要在会话里看用量时，让模型调 `skill_usage`；
 - 不做自动归档：DSH 的技能目录是只读视图，删除应当由用户或另一个显式工具完成。
+
+## 淘汰三件套：可预演 / 可观测 / 可审计（v1.1.0，2026-11-12）
+
+Curator 会自己归档（`archivedAt`），但「它准备干什么」原本只能靠读代码猜。这一版把删除侧的三个缺口补上：
+
+| 能力 | 接口 | 判据 |
+|---|---|---|
+| **可预演** | `skill_usage { dryRun: true }` → `dryRun:true` + `wouldArchive:[{name,reason,days,uses}]` | 语义是**只读**：不刷目录（否则改 `catalogSeenAt`）、不跑 curator（否则写 `archivedAt`）、不落盘。返回后 `usage.json` 逐字节不变 |
+| **可观测** | `skill_usage_status.lastCuration = {at, archived, archivedNames, skipped}` | `skipped` 四桶：`alreadyArchived` / `catalogUntrusted` / `notDue` / `neverUsed`，全部取自 `decideCuration` 的 `skip`（即 `classifyUsage` 的真实判定），不另造口径 |
+| **可审计** | `<storeDir>/archive-manifest.jsonl`，一行一条 | 字段固定 `ts, by:'curator', name, reason, days, uses`；超过 2MiB 先 rename 成 `.1` 再新写（只留一份历史）；写失败只记 `stats.lastError`，不阻断归档 |
+
+**为什么干跑必须真的不落盘**：一个会「顺手写一下」的 dry-run 就是执行，用户以为在预演、账本已经变了——那比没有 dry-run 更坏。所以 `runCurator` 与 dry-run 共用 `planCuration`（先算后动），而不是各写一套判断。
+
+**目录名单不可信时不瞎判**：`catalogAt` 缺失（目录刷新从未成功）时 `decideCuration` 一律不归档，于是 `wouldArchive` 必然为空——这时必须报 `dryRunReason: 'catalog-untrusted'`，否则「空」会被误读成「没有可归档的」。
 
 ## 验证记录（2026-10-25，本机 desktop profile）
 
@@ -116,3 +130,16 @@ plugin_manager action=remove_bundle target=@local/dsh-skill-usage
 **与 Hermes 对照**：阈值 14/30、自动运行、自动推进、不删除可恢复、只动自己的数据——五项对齐；差一项：Hermes 能归档**技能文件**，我们只能归档**账本条目**（技能目录只读，这是 DSH 的能力边界，不是偷懒）。
 
 **验证**：`skill-usage.test.mjs` 20 项（新增 5 条纯函数判据 + 端到端自动归档/filter=archived/restore）；真机 `skill_usage` 输出「已归档 0」，13 条无异常归档。
+
+## 验证记录（v1.1.0，2026-11-12）
+
+| 项 | 观测值 |
+|---|---|
+| `node --check index.js` | 通过（exit 0，无输出） |
+| `node _selftest/tests/skill-usage.test.mjs` | **28 项通过**（原 20 + 新增 8），exit 0 |
+| dry-run 只读 | 前后 `usage.json` 逐字节相同、`mtimeMs` 不变、`lastCuration` 不变、无 `archive-manifest.jsonl` |
+| manifest | 真归档 2 个 → 恰好 2 行，每行字段为 `by/days/name/reason/ts/uses`；`Stale40` 行 `days:40, uses:2` |
+| 轮转 | 预置 2MiB+ 历史 → 整份进 `.1`（字节不变、旧 `.1` 被替换），新文件只有本轮 2 行 |
+| 写失败 | 把 manifest 路径占成目录 → `stats.lastError` 以 `manifest: ` 开头，归档仍写入 `archivedReason` |
+| `lastCuration.skipped` | 挂载时目录不可信：`{alreadyArchived:1, catalogUntrusted:2, notDue:0, neverUsed:1}`（`neverUsed` 由构造的无人使用技能给出） |
+| 宿主 schema 契约 | 用 `dsh-tools/lib/types/json-schema.js`（宿主真实校验器）对 4 个工具的输出 schema + 真实返回值校验，violations 全为 `[]` |

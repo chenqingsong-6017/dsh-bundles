@@ -8,9 +8,12 @@
  *
  * 数据落在 `config.storeDir`（默认 `~/.dsh/dsh-skill-usage/usage.json`）。
  *
- * 两个工具：
- *   - `skill_usage`      查看用量与状态（attention 优先），可选 filter；
+ * 工具：
+ *   - `skill_usage`      查看用量与状态（attention 优先），可选 filter；`dryRun:true` 只读预演
  *   - `skill_usage_mark` 标记"已复核"（可带备注），把该技能从 attention 里暂时摘掉。
+ *
+ * 淘汰的三件配套（v1.1.0）：可预演（dryRun，绝不落盘）、可观测（lastCuration 带跳过原因）、
+ * 可审计（真归档追加 `storeDir/archive-manifest.jsonl`，>2MiB 轮转成 .1）。
  *
  * 状态机（阈值可配：staleAfterDays / archiveAfterDays）：
  *   new              目录里有、从没被加载过
@@ -26,7 +29,7 @@
  *     主动调 `skill_usage`。
  */
 
-import { writeFileSync, readFileSync, renameSync, mkdirSync, existsSync, statSync, unlinkSync } from 'node:fs'
+import { writeFileSync, readFileSync, appendFileSync, renameSync, mkdirSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 
@@ -119,20 +122,26 @@ export function classifyUsage(record, now, thresholds) {
  * @param {number} now epoch ms
  * @param {{staleAfterDays:number,archiveAfterDays:number}} thresholds
  * @param {string|null} catalogAtIso 账本级目录刷新时间
- * @returns {{action:'archive'|'none', reason?:string}}
+ * @returns {{action:'archive'|'none', reason?:string, skip?:'alreadyArchived'|'catalogUntrusted'|'notDue'|'neverUsed'}}
  */
 export function decideCuration(record, now, thresholds, catalogAtIso) {
   if (record === null || typeof record !== 'object') return { action: 'none' }
-  if (typeof record.archivedAt === 'string' && record.archivedAt !== '') return { action: 'none' }
+  // 跳过原因回在返回值里：lastCuration 要按同一套判据分桶，
+  // 调用方再去猜「为什么没归档」就等于造了第二套口径。
+  if (typeof record.archivedAt === 'string' && record.archivedAt !== '') return { action: 'none', skip: 'alreadyArchived' }
   const catAt = typeof catalogAtIso === 'string' ? Date.parse(catalogAtIso) : NaN
   const seenAt = typeof record.catalogSeenAt === 'string' ? Date.parse(record.catalogSeenAt) : NaN
   const inCatalog = Number.isFinite(catAt) && Number.isFinite(seenAt) ? seenAt >= catAt : null
   if (inCatalog === false) return { action: 'archive', reason: 'not-in-catalog' }
   const state = classifyUsage(record, now, thresholds)
-  if (state.state !== 'archive-candidate') return { action: 'none' }
+  if (state.state !== 'archive-candidate') {
+    // new = 从没被加载过（firstSeenAt 不冒充锚点）：这种技能不该按「陈旧」记账，
+    // 所以单独一桶，方便看出「账本里躺着的其实是从没用过的」。
+    return { action: 'none', skip: state.state === 'new' ? 'neverUsed' : 'notDue' }
+  }
   if (inCatalog === true) return { action: 'archive', reason: 'stale-' + thresholds.archiveAfterDays + 'd' }
   // inCatalog === null：目录名单不可信，不归档（宁可漏，不误伤）
-  return { action: 'none' }
+  return { action: 'none', skip: 'catalogUntrusted' }
 }
 
 /** 技能名归一化：去首尾空白 + 大小写折叠（用于宽容匹配，不改存储里的原名）。 */
@@ -352,20 +361,108 @@ export function apply(ctx, config) {
   let curatorTimer = null
   const curatorLog = []
   let lastCuration = null
-  function runCurator(now = Date.now()) {
-    const archived = []
+
+  const MANIFEST_FILE = path.join(storeDir, 'archive-manifest.jsonl')
+  const MANIFEST_MAX_BYTES = 2 * 1024 * 1024
+
+  /**
+   * 审计旁路：真归档才追加一行 JSON（字段固定 ts/by/name/reason/days/uses）。
+   * 为什么用 JSONL：一行一条，外部脚本 grep / 逐行解析不用先读整个文件。
+   * 为什么超过 2MiB 先轮转：无界追加会让审计文件陪账本长成几十 MB，而回看只需要
+   * 「当前 + 上一份」——只留 .1 一份历史，够回查又不长成负资产。
+   * 为什么吞掉所有错误：审计是旁路不是主流程。写不进去要留痕（stats.lastError），
+   * 但绝不能反过来让归档失败——那等于审计把业务毁了。
+   */
+  function appendArchiveManifest(entries, nowMs) {
+    if (entries.length === 0) return
+    try {
+      mkdirSync(storeDir, { recursive: true })
+      let size = 0
+      try {
+        size = statSync(MANIFEST_FILE).size
+      } catch {
+        size = 0
+      }
+      if (size > MANIFEST_MAX_BYTES) {
+        const history = MANIFEST_FILE + '.1'
+        try {
+          renameSync(MANIFEST_FILE, history)
+        } catch {
+          // Windows 上目标被占用时 rename 会失败：删掉旧历史再试一次；
+          // 再失败就跳过轮转继续追加——宁可文件变大，也不丢审计行。
+          try {
+            unlinkSync(history)
+            renameSync(MANIFEST_FILE, history)
+          } catch {
+            // 轮转失败不阻断归档，审计行照写
+          }
+        }
+      }
+      const ts = new Date(nowMs).toISOString()
+      const lines = entries.map((item) =>
+        JSON.stringify({
+          ts,
+          by: 'curator',
+          name: item.name,
+          reason: item.reason,
+          days: Number.isFinite(item.days) ? item.days : null,
+          uses: Number.isInteger(item.uses) && item.uses > 0 ? item.uses : 0,
+        }),
+      )
+      appendFileSync(MANIFEST_FILE, lines.join('\n') + '\n', 'utf8')
+    } catch (error) {
+      stats.lastError = 'manifest: ' + (error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  /**
+   * 预演一次 curator：只算不动。runCurator 与 skill_usage { dryRun: true } 共用它，
+   * 保证「预演说会归档谁」和「真跑会归档谁」是同一套判据，不另造口径。
+   * 跳过原因直接取 decideCuration 的 skip 字段（那来自 classifyUsage 的真实判定），
+   * 不在这里按天数二次推断。
+   */
+  function planCuration(now) {
+    const wouldArchive = []
+    const skipped = { alreadyArchived: 0, catalogUntrusted: 0, notDue: 0, neverUsed: 0 }
     for (const [skillName, record] of records) {
       const decision = decideCuration(record, now, thresholds, catalogAt)
-      if (decision.action !== 'archive') continue
-      record.archivedAt = new Date(now).toISOString()
-      record.archivedReason = decision.reason
-      archived.push({ name: skillName, reason: decision.reason })
+      if (decision.action === 'archive') {
+        const state = classifyUsage(record, now, thresholds)
+        wouldArchive.push({
+          name: skillName,
+          reason: decision.reason,
+          days: Number.isFinite(state.days) ? state.days : null,
+          uses: Number.isInteger(record.uses) && record.uses > 0 ? record.uses : 0,
+        })
+        continue
+      }
+      if (decision.skip !== undefined && Object.hasOwn(skipped, decision.skip)) skipped[decision.skip] += 1
     }
-    lastCuration = { at: new Date(now).toISOString(), archived: archived.length, names: archived.map((item) => item.name) }
-    if (archived.length > 0) {
-      curatorLog.push({ at: lastCuration.at, archived })
+    return { wouldArchive, skipped }
+  }
+
+  function runCurator(now = Date.now()) {
+    const plan = planCuration(now)
+    const at = new Date(now).toISOString()
+    if (plan.wouldArchive.length > 0) {
+      for (const item of plan.wouldArchive) {
+        const record = records.get(item.name)
+        if (record === undefined) continue
+        record.archivedAt = at
+        record.archivedReason = item.reason
+      }
+      appendArchiveManifest(plan.wouldArchive, now)
+      curatorLog.push({ at, archived: plan.wouldArchive })
       if (curatorLog.length > 20) curatorLog.shift()
       schedulePersist()
+    }
+    // 可观测：只说「归档了几个」等于没信息——没归档的那批因为什么不动，
+    // 才是排查「为什么我的技能还在」时真正要看的。
+    lastCuration = {
+      at,
+      archived: plan.wouldArchive.length,
+      archivedNames: plan.wouldArchive.map((item) => item.name),
+      skipped: plan.skipped,
     }
     return lastCuration
   }
@@ -407,6 +504,11 @@ export function apply(ctx, config) {
             description: 'all (default) | used (uses > 0) | unused (never loaded) | attention (stale or archive-candidate) | archived (curator 已归档，可 restore)',
           },
           limit: { type: 'integer', description: 'Max rows to return (default 40).' },
+          dryRun: {
+            type: 'boolean',
+            description:
+              'Preview only: report what the curator would archive (wouldArchive) without refreshing the catalog, running the curator, or writing usage.json.',
+          },
         },
         additionalProperties: false,
       },
@@ -457,6 +559,22 @@ export function apply(ctx, config) {
                 additionalProperties: false,
               },
             },
+            dryRun: { type: 'boolean' },
+            dryRunReason: { type: 'string' },
+            wouldArchive: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string' },
+                  reason: { type: 'string' },
+                  days: { oneOf: [{ type: 'number' }, { type: 'null' }] },
+                  uses: { type: 'integer' },
+                },
+                required: ['name', 'reason', 'days', 'uses'],
+                additionalProperties: false,
+              },
+            },
           },
           required: ['total', 'counts', 'thresholds', 'rows'],
           additionalProperties: false,
@@ -472,7 +590,18 @@ export function apply(ctx, config) {
             return '未知'
           }
           const head = `技能 ${value?.total ?? 0} 个：常用 ${counts.used ?? 0}，从未用过 ${counts.unused ?? 0}，陈旧 ${counts.stale ?? 0}，建议归档 ${counts.archiveCandidates ?? 0}，已归档 ${counts.archived ?? 0}（阈值 ${value?.thresholds?.staleAfterDays ?? '?'} 天 / ${value?.thresholds?.archiveAfterDays ?? '?'} 天）`
-          if (rows.length === 0) return [text(`${head}\n没有符合条件的技能。`)]
+          const would = Array.isArray(value?.wouldArchive) ? value.wouldArchive : []
+          let dryHead = ''
+          if (value?.dryRun === true) {
+            dryHead = `\n【预演，只读，不落盘】将归档 ${would.length} 个技能`
+            if (typeof value.dryRunReason === 'string' && value.dryRunReason !== '') {
+              dryHead += `——目录名单不可信（${value.dryRunReason}），这次不做预判`
+            }
+            for (const item of would) {
+              dryHead += `\n- ${item.name}：${item.reason}，${item.days === null ? '时间未知' : `${item.days} 天未动`}，用过 ${item.uses} 次`
+            }
+          }
+          if (rows.length === 0) return [text(`${head}${dryHead}\n没有符合条件的技能。`)]
           const lines = rows.map((row) => {
             const bits = [`【${label(row.state)}】${row.name}`]
             if (row.uses > 0) bits.push(`用过 ${row.uses} 次`)
@@ -481,13 +610,20 @@ export function apply(ctx, config) {
             if (row.note) bits.push(`备注：${row.note}`)
             return `- ${bits.join(' · ')}`
           })
-          return [text(`${head}\n${lines.join('\n')}`)]
+          return [text(`${head}${dryHead}\n${lines.join('\n')}`)]
         },
       },
       async execute(args, exec) {
-        await refreshCatalog(exec?.agent ? { scope: exec.agent } : {})
+        // dry-run 的语义是「先看看会归档谁」，任何副作用都会把预演变成执行：
+        // 刷目录会改 catalogSeenAt、跑 curator 会写 archivedAt、落盘会改 usage.json。
+        // 所以只读模式下这三件一律不做，返回后 usage.json 必须逐字节不变。
+        const dryRun = args?.dryRun === true
         const now = Date.now()
-        runCurator(now)
+        if (!dryRun) {
+          await refreshCatalog(exec?.agent ? { scope: exec.agent } : {})
+          runCurator(now)
+        }
+        const planned = dryRun ? planCuration(now) : null
         const all = classifyAll(now)
         const activeRows = all.filter((row) => !row.archivedAt)
         const archivedRows = all.filter((row) => row.archivedAt)
@@ -524,6 +660,15 @@ export function apply(ctx, config) {
             ...(row.archivedAt ? { archivedAt: row.archivedAt } : {}),
             ...(row.archivedReason ? { archivedReason: row.archivedReason } : {}),
           })),
+          ...(planned === null
+            ? {}
+            : {
+                dryRun: true,
+                wouldArchive: planned.wouldArchive,
+                // 目录名单不可信时如实说：wouldArchive 空不是「没有可归档的」，而是「不敢判」。
+                // decideCuration 在 catalogAt 缺失时一律不归档，所以这里必然也是空数组。
+                ...(catalogAt === null ? { dryRunReason: 'catalog-untrusted' } : {}),
+              }),
         }
       },
     }),
@@ -705,6 +850,32 @@ export function apply(ctx, config) {
             skillErrors: { type: 'integer' },
             lastError: { type: 'string' },
             configWarning: { type: 'string' },
+            lastCuration: {
+              oneOf: [
+                {
+                  type: 'object',
+                  properties: {
+                    at: { type: 'string' },
+                    archived: { type: 'integer' },
+                    archivedNames: { type: 'array', items: { type: 'string' } },
+                    skipped: {
+                      type: 'object',
+                      properties: {
+                        alreadyArchived: { type: 'integer' },
+                        catalogUntrusted: { type: 'integer' },
+                        notDue: { type: 'integer' },
+                        neverUsed: { type: 'integer' },
+                      },
+                      required: ['alreadyArchived', 'catalogUntrusted', 'notDue', 'neverUsed'],
+                      additionalProperties: false,
+                    },
+                  },
+                  required: ['at', 'archived', 'archivedNames', 'skipped'],
+                  additionalProperties: false,
+                },
+                { type: 'null' },
+              ],
+            },
           },
           required: [
             'ready',
@@ -719,16 +890,24 @@ export function apply(ctx, config) {
             'toolResults',
             'skillLoads',
             'skillErrors',
+            'lastCuration',
           ],
           additionalProperties: false,
         },
         render(_args, value) {
           if (value?.ready === false) return [text('不可用：' + (value?.unavailableReason || '未知原因'))]
+          const curation = value?.lastCuration
+          const curationLine =
+            curation === null || curation === undefined
+              ? '\n自动归档：还没跑过（lastCuration=null）。'
+              : `\n自动归档 ${curation.at}：归档 ${curation.archived} 个` +
+                `（跳过：已归档 ${curation.skipped?.alreadyArchived ?? 0} / 目录不可信 ${curation.skipped?.catalogUntrusted ?? 0} / 未到阈值 ${curation.skipped?.notDue ?? 0} / 从未用过 ${curation.skipped?.neverUsed ?? 0}）。`
           return [
             text(
               `技能用量可用：账本 ${value?.records ?? 0} 条 / 目录 ${value?.catalogSize ?? 0} 个技能` +
                 `（阈值 ${value?.thresholds?.staleAfterDays ?? '?'} 天 / ${value?.thresholds?.archiveAfterDays ?? '?'} 天），` +
-                `已计 ${value?.skillLoads ?? 0} 次加载，存档 ${value?.storeFile ?? '?'}。`,
+                `已计 ${value?.skillLoads ?? 0} 次加载，存档 ${value?.storeFile ?? '?'}。` +
+                curationLine,
             ),
           ]
         },
@@ -798,6 +977,7 @@ export function apply(ctx, config) {
           skillErrors: stats.skillErrors,
           ...(typeof stats.lastError === 'string' && stats.lastError !== '' ? { lastError: stats.lastError } : {}),
           ...(configWarnings.length > 0 ? { configWarning: configWarnings.join('；') } : {}),
+          lastCuration: lastCuration ?? null,
         }
       },
     }),

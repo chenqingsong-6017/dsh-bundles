@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import * as mod from '../../dsh-skill-usage/index.js'
@@ -125,6 +125,193 @@ ok('无任何时间锚点 = unknown')
   assert.equal(after.rows.find((row) => row.name === 'Gamma').state, 'new')
   await new Promise((resolve) => setTimeout(resolve, 250))
   rmSync(storeDir, { recursive: true, force: true })
+}
+
+
+// ── v1.1.0：可预演（dryRun 只读）/ 可观测（lastCuration + 跳过原因）/ 可审计（archive-manifest.jsonl） ──
+{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const daysAgo = (days) => new Date(Date.now() - days * DAY).toISOString()
+  /** 造一份账本：key 是技能名，值直接按 usage.json 的 skills 形状写（不经过插件，等价于历史存档）。 */
+  const makeStore = (skills) => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'skill-usage-v11-'))
+    writeFileSync(path.join(dir, 'usage.json'), JSON.stringify({ version: 1, skills }), 'utf8')
+    return dir
+  }
+
+  // —— A. dry-run 只读 + lastCuration 观测 + manifest 审计（一条链路跑通） ——
+  {
+    const storeDir = makeStore({
+      Stale40: { uses: 2, firstSeenAt: daysAgo(90), lastUsedAt: daysAgo(40), catalogSeenAt: daysAgo(40) },
+      Stale35: { uses: 0, firstSeenAt: daysAgo(90), lastUsedAt: daysAgo(35), catalogSeenAt: daysAgo(40) },
+      NeverUsed: { uses: 0, firstSeenAt: daysAgo(60), catalogSeenAt: daysAgo(40) },
+      ArchivedOld: { uses: 1, firstSeenAt: daysAgo(90), lastUsedAt: daysAgo(60), catalogSeenAt: daysAgo(40), archivedAt: daysAgo(5), archivedReason: 'stale-30d' },
+    })
+    const { ctx, registered } = makeMockContext()
+    let catalogCalls = 0
+    // 第一次目录刷新失败 = 真实的「目录名单不可信」：挂载时 curator 必须如实跳过，不许瞎归档。
+    ctx.skills = {
+      list: async () => {
+        catalogCalls += 1
+        if (catalogCalls === 1) throw new Error('catalog down')
+        return [{ name: 'Stale40' }, { name: 'Stale35' }, { name: 'NeverUsed' }, { name: 'ArchivedOld' }]
+      },
+    }
+    mod.apply(ctx, { storeDir })
+    const toolOf = (name) => registered.find((tool) => tool.name === name)
+    const usageTool = toolOf('skill_usage')
+    const markTool = toolOf('skill_usage_mark')
+    const statusTool = toolOf('skill_usage_status')
+    const usageFile = path.join(storeDir, 'usage.json')
+    const manifestFile = path.join(storeDir, 'archive-manifest.jsonl')
+    await sleep(250) // 等挂载时那次 refreshCatalog + runCurator 落定
+
+    const mountStatus = await statusTool.execute({})
+    assert.deepEqual(
+      mountStatus.lastCuration.skipped,
+      { alreadyArchived: 1, catalogUntrusted: 2, notDue: 0, neverUsed: 1 },
+      '跳过原因必须按 decideCuration/classifyUsage 的真实判定分桶（2 个目录不可信、1 个从未用过、1 个已归档）',
+    )
+    assert.equal(mountStatus.lastCuration.archived, 0, '目录不可信时一个都不许归档')
+    assert.deepEqual(mountStatus.lastCuration.archivedNames, [])
+    assert.equal(typeof mountStatus.lastCuration.at, 'string')
+    ok('lastCuration：归档 0 + skipped 按真实判据分桶（catalogUntrusted=2 / neverUsed=1 / alreadyArchived=1）')
+
+    // mark 会刷目录（catalogAt 变可信）但**不**跑 curator —— 正好造出「现在能预演」的状态。
+    await markTool.execute({ name: 'NeverUsed' })
+    await sleep(250) // 等 mark 触发的落盘写完，再拿基线
+    const beforeBuf = readFileSync(usageFile)
+    const beforeMtime = statSync(usageFile).mtimeMs
+    const beforeCuration = (await statusTool.execute({})).lastCuration
+
+    const dry = await usageTool.execute({ dryRun: true })
+    assert.equal(dry.dryRun, true)
+    assert.equal(dry.dryRunReason, undefined, '目录名单可信时不该报 reason')
+    assert.deepEqual(dry.wouldArchive.map((item) => item.name).sort(), ['Stale35', 'Stale40'], '只报真正会被归档的；已归档/从未用过/刚复核都不列')
+    assert.deepEqual(dry.wouldArchive.find((item) => item.name === 'Stale40'), { name: 'Stale40', reason: 'stale-30d', days: 40, uses: 2 })
+    ok('dry-run：返回 dryRun:true 与 wouldArchive[{name,reason,days,uses}]')
+
+    await sleep(300) // 给任何「偷偷落盘」的定时器一个机会
+    assert.ok(readFileSync(usageFile).equals(beforeBuf), 'dry-run 不许改 usage.json：必须逐字节相同')
+    assert.equal(statSync(usageFile).mtimeMs, beforeMtime, 'dry-run 连 usage.json 的 mtime 都不许动')
+    assert.deepEqual((await statusTool.execute({})).lastCuration, beforeCuration, 'dry-run 不许跑 curator（lastCuration 不变）')
+    assert.equal(existsSync(manifestFile), false, 'dry-run 不许写审计文件')
+    ok('dry-run 只读：前后 usage.json 逐字节不变、mtime 不变、lastCuration 不变、无 manifest')
+
+    const real = await usageTool.execute({})
+    assert.equal(real.dryRun, undefined, '默认调用不带 dryRun 字段（行为不变）')
+    assert.equal(real.wouldArchive, undefined)
+    const manifestLines = readFileSync(manifestFile, 'utf8').trim().split('\n')
+    assert.equal(manifestLines.length, 2, '真归档两个 → manifest 恰好两行（每行一条）')
+    const entries = manifestLines.map((line) => JSON.parse(line))
+    assert.deepEqual(entries.map((entry) => entry.name).sort(), ['Stale35', 'Stale40'])
+    for (const entry of entries) {
+      assert.deepEqual(Object.keys(entry).sort(), ['by', 'days', 'name', 'reason', 'ts', 'uses'], '字段固定：ts/by/name/reason/days/uses')
+      assert.equal(entry.by, 'curator')
+      assert.equal(entry.reason, 'stale-30d')
+      assert.equal(entry.ts, new Date(entry.ts).toISOString(), 'ts 必须是 ISO 时间')
+    }
+    const entry40 = entries.find((entry) => entry.name === 'Stale40')
+    assert.equal(entry40.days, 40)
+    assert.equal(entry40.uses, 2)
+    ok('archive-manifest：真归档每行一条 JSON，字段与内容正确')
+
+    await sleep(250) // 等 curator 触发的 150ms 防抖落盘真正写完，再验账本
+    const saved = JSON.parse(readFileSync(usageFile, 'utf8'))
+    assert.equal(saved.skills.Stale40.archivedReason, 'stale-30d')
+    assert.equal(typeof saved.skills.Stale40.archivedAt, 'string')
+    const afterStatus = await statusTool.execute({})
+    assert.equal(afterStatus.lastCuration.archived, 2)
+    assert.deepEqual(afterStatus.lastCuration.archivedNames.slice().sort(), ['Stale35', 'Stale40'])
+    // NeverUsed 从没被 skill 工具加载过，复核后 classifyUsage 仍报 new —— 所以它记在 neverUsed 而不是 notDue。
+    assert.deepEqual(afterStatus.lastCuration.skipped, { alreadyArchived: 1, catalogUntrusted: 0, notDue: 0, neverUsed: 1 })
+    ok('lastCuration：归档数/名字/跳过原因与真跑的账本一致')
+
+    await sleep(250)
+    rmSync(storeDir, { recursive: true, force: true })
+  }
+
+  // —— B. 目录名单不可信：dry-run 诚实报空 + reason，绝不瞎判 ——
+  {
+    const storeDir = makeStore({
+      Stale40: { uses: 2, firstSeenAt: daysAgo(90), lastUsedAt: daysAgo(40), catalogSeenAt: daysAgo(40) },
+    })
+    const { ctx, registered } = makeMockContext()
+    ctx.skills = { list: async () => { throw new Error('catalog down') } }
+    mod.apply(ctx, { storeDir })
+    const toolOf = (name) => registered.find((tool) => tool.name === name)
+    const usageTool = toolOf('skill_usage')
+    const statusTool = toolOf('skill_usage_status')
+    const usageFile = path.join(storeDir, 'usage.json')
+    await sleep(250)
+    const beforeBuf = readFileSync(usageFile)
+
+    const dry = await usageTool.execute({ dryRun: true })
+    assert.equal(dry.dryRun, true)
+    assert.deepEqual(dry.wouldArchive, [], 'wouldArchive 空不是「没有可归档的」，是「目录不可信、不敢判」')
+    assert.equal(dry.dryRunReason, 'catalog-untrusted')
+    const mountStatus = await statusTool.execute({})
+    assert.equal(mountStatus.lastCuration.archived, 0)
+    assert.equal(mountStatus.lastCuration.skipped.catalogUntrusted, 1)
+
+    await sleep(300)
+    assert.ok(readFileSync(usageFile).equals(beforeBuf), '目录不可信的 dry-run 同样不许落盘')
+    assert.equal(existsSync(path.join(storeDir, 'archive-manifest.jsonl')), false)
+    ok('目录名单不可信：dry-run 报 wouldArchive:[] + dryRunReason=catalog-untrusted，且不落盘不归档')
+
+    await sleep(250)
+    rmSync(storeDir, { recursive: true, force: true })
+  }
+
+  // —— C. manifest 超过 2MiB：先轮转成 .1（只留一份历史），再写新文件 ——
+  {
+    const storeDir = makeStore({
+      A40: { uses: 1, firstSeenAt: daysAgo(90), lastUsedAt: daysAgo(40), catalogSeenAt: daysAgo(40) },
+      B40: { uses: 3, firstSeenAt: daysAgo(90), lastUsedAt: daysAgo(40), catalogSeenAt: daysAgo(40) },
+    })
+    const manifestFile = path.join(storeDir, 'archive-manifest.jsonl')
+    // 每行 8 字节，凑到刚好超过 2*1024*1024 字节（JSONL 口径：按文件字节算，不按行数）
+    const bigHistory = '{"x":1}\n'.repeat(Math.ceil((2 * 1024 * 1024) / 8) + 100)
+    writeFileSync(manifestFile, bigHistory, 'utf8')
+    writeFileSync(manifestFile + '.1', 'STALE-HISTORY\n', 'utf8')
+    const { ctx, registered } = makeMockContext()
+    ctx.skills = { list: async () => [{ name: 'A40' }, { name: 'B40' }] }
+    mod.apply(ctx, { storeDir })
+    await sleep(300)
+
+    assert.equal(readFileSync(manifestFile + '.1', 'utf8'), bigHistory, '轮转：旧审计整份进 .1，字节不变')
+    const fresh = readFileSync(manifestFile, 'utf8').trim().split('\n')
+    assert.equal(fresh.length, 2, '轮转后新文件只装新归档')
+    assert.deepEqual(fresh.map((line) => JSON.parse(line).name).sort(), ['A40', 'B40'])
+    ok('archive-manifest 超 2MiB 先轮转成 .1（旧历史被替换，只留一份），新文件从零开始')
+
+    await sleep(250)
+    rmSync(storeDir, { recursive: true, force: true })
+  }
+
+  // —— D. manifest 写失败：只记 stats.lastError，绝不影响归档主流程 ——
+  {
+    const storeDir = makeStore({
+      C40: { uses: 1, firstSeenAt: daysAgo(90), lastUsedAt: daysAgo(40), catalogSeenAt: daysAgo(40) },
+    })
+    // 把 manifest 路径占成目录：appendFileSync 必然失败（EISDIR/EPERM）
+    mkdirSync(path.join(storeDir, 'archive-manifest.jsonl'))
+    const { ctx, registered } = makeMockContext()
+    ctx.skills = { list: async () => [{ name: 'C40' }] }
+    mod.apply(ctx, { storeDir })
+    const statusTool = registered.find((tool) => tool.name === 'skill_usage_status')
+    await sleep(300)
+
+    const saved = JSON.parse(readFileSync(path.join(storeDir, 'usage.json'), 'utf8'))
+    assert.equal(saved.skills.C40.archivedReason, 'stale-30d', '审计写失败不许影响归档')
+    const status = await statusTool.execute({})
+    assert.equal(status.lastCuration.archived, 1)
+    assert.match(status.lastError, /^manifest: /, '审计失败必须留痕（stats.lastError）')
+    ok('manifest 写失败只记 lastError：归档照常完成')
+
+    await sleep(250)
+    rmSync(storeDir, { recursive: true, force: true })
+  }
 }
 
 console.log(`skill-usage: ${passed} 项通过`)
