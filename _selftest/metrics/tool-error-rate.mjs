@@ -42,7 +42,10 @@ const WINDOW = SINCE_AT ? ('自 ' + new Date(SINCE).toISOString().slice(0, 16).r
 if (SINCE_AT && Number.isNaN(SINCE)) { console.error('--since 不是合法时间：' + SINCE_AT); process.exit(2) }
 const JSON_OUT = flag('json')
 // --no-write：只做对比/预览，不覆盖权威基线（改前改后的分析不应该改写数据源）。
-const NO_WRITE = flag('no-write')
+// --by-session（2026-11-12）：按会话切分输出，用来回答「摩擦在长会话还是在单任务」——口径与总错误率完全一致，
+// 只是多一个维度；不带该参数时行为不变。带该参数时自动不写基线。
+const NO_WRITE = flag('no-write') || flag('by-session')
+const BY_SESSION = flag('by-session')
 // --split <ISO>：按时间切「改前 / 改后」两段，用同一套口径算复发对比（改规则后证明改对没有）。
 const SPLIT_AT = arg('split', null) ? Date.parse(arg('split', null)) : null
 if (SPLIT_AT !== null && Number.isNaN(SPLIT_AT)) { console.error('--split 不是合法时间'); process.exit(2) }
@@ -121,11 +124,21 @@ let steers = 0
 let abortedTurns = 0
 let fileCount = 0
 
+const perSession = []
 for (const file of listSessionFiles(SESSIONS)) {
   let txt
   try { txt = decodeSession(file) } catch { continue }
   fileCount++
   const localCalls = new Map()
+  // 每个会话一个统计器（--by-session 用；单位与总口径相同：tool/call 与 isError 的 tool/result）
+  const sStat = {
+    session: path.basename(path.dirname(file)),
+    workspace: path.basename(path.dirname(path.dirname(file))),
+    calls: 0,
+    errors: 0,
+    turns: 0,
+    sigs: new Map(),
+  }
   for (const line of txt.split('\n')) {
     if (line.length < 16) continue
     let ev
@@ -136,6 +149,7 @@ for (const file of listSessionFiles(SESSIONS)) {
     if (ev.type === 'tool/call') {
       localCalls.set(d.callId, d.name)
       totalCalls++
+      sStat.calls++
       toolCalls.set(d.name, (toolCalls.get(d.name) || 0) + 1)
       const day = new Date(t).toISOString().slice(0, 10)
       const cur = perDay.get(day) || { calls: 0, errors: 0 }
@@ -151,10 +165,12 @@ for (const file of listSessionFiles(SESSIONS)) {
       if (DENIED.test(text)) { denials++; continue }
       const kind = classify(text)
       totalErrors++
+      sStat.errors++
       kindCount.set(kind, (kindCount.get(kind) || 0) + 1)
       toolErr.set(tool, (toolErr.get(tool) || 0) + 1)
       const sig = signature(text)
       sigCount.set(sig, (sigCount.get(sig) || 0) + 1)
+      sStat.sigs.set(sig, (sStat.sigs.get(sig) || 0) + 1)
       const day = new Date(t).toISOString().slice(0, 10)
       const sd = sigDays.get(sig) || new Map()
       sd.set(day, (sd.get(day) || 0) + 1)
@@ -174,9 +190,11 @@ for (const file of listSessionFiles(SESSIONS)) {
       if (Array.isArray(d.inserted) && d.inserted.length && d.target === 'next-step') steers++
     } else if (ev.type === 'turn/end') {
       const kind = (d.reason && d.reason.kind) || 'completed'
+      sStat.turns++
       if (kind !== 'completed') abortedTurns++
     }
   }
+  perSession.push(sStat)
 }
 
 // fail-safe：会话目录解析失败/为空时，宁可退出也不写 0 基线——空基线会把所有仪表归零，
@@ -210,6 +228,19 @@ const report = {
     const days = [...(sigDays.get(sig) || new Map()).keys()].sort()
     return { count, sig, days: days.length, firstDay: days[0] || null, lastDay: days[days.length - 1] || null }
   }),
+  /** --by-session：按会话切分（同一口径，只按 file 分组；用来判断摩擦是否随会话变长而上升）。 */
+  bySession: perSession
+    .slice()
+    .sort((a, b) => b.calls - a.calls)
+    .map((s) => ({
+      session: s.session,
+      workspace: s.workspace,
+      calls: s.calls,
+      errors: s.errors,
+      rate: +(s.errors / (s.calls || 1)).toFixed(4),
+      turns: s.turns,
+      topSig: [...s.sigs.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null,
+    })),
   /** 稳定性：同一签名跨几天复发（判据登记在 _contracts/metrics.json 的 repeatErrorShare）。 */
   repeat: summarizeRepeat(sigDays),
   ...(SPLIT_AT !== null ? (() => {
@@ -242,6 +273,30 @@ if (JSON_OUT) {
   console.log('')
   console.log('[复发] 签名 ' + rep.signatures + ' 个 · 跨天复发 ' + rep.repeatSignatures + ' 个 · 复发错误占 ' + pct(rep.repeatErrorShare) + ' · 最长 ' + rep.maxDays + ' 天')
   for (const w of rep.worst) console.log('  ' + String(w.count).padStart(3) + ' 次 / ' + w.days + ' 天  ' + w.sig)
+  if (BY_SESSION) {
+    console.log('')
+    console.log('[分会话 · 按调用数降序]')
+    for (const s of report.bySession) {
+      const pctCell = s.calls ? pct(s.rate) : '  —  '
+      console.log(
+        '  ' + String(s.calls).padStart(5) + ' 调用 / ' + String(s.errors).padStart(3) + ' 错 / ' + pctCell +
+          ' · 回合 ' + String(s.turns).padStart(3) + ' · ' + s.session.slice(0, 16) + (s.topSig ? ' · ' + s.topSig.slice(0, 44) : ''),
+      )
+    }
+    console.log('')
+    console.log('[按会话长度分组]')
+    const groups = [
+      ['短（<50 调用）', (s) => s.calls < 50],
+      ['中（50–199）', (s) => s.calls >= 50 && s.calls < 200],
+      ['长（>=200）', (s) => s.calls >= 200],
+    ]
+    for (const [name, pred] of groups) {
+      const g = report.bySession.filter(pred)
+      const c = g.reduce((a, s) => a + s.calls, 0)
+      const e = g.reduce((a, s) => a + s.errors, 0)
+      console.log('  ' + name + '：' + g.length + ' 会话 · 调用 ' + c + ' · 报错 ' + e + ' · 错误率 ' + (c ? pct(e / c) : '—'))
+    }
+  }
   if (report.split) {
     const sp = report.split
     console.log('')
