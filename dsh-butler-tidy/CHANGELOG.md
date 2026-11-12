@@ -2,6 +2,17 @@
 
 本文件于 2026-10-31 按「改到谁补谁」的规则建立；当前版本为存量版本，本节为补记。
 
+## v0.11.5 — 2026-11-12
+
+### Changed（红线两处，来源：2026-11-12 机器体检）
+- **`D:\_archive` 进默认红线**：陛下明示「不动」的归档区（约 8.3GB）此前只靠记忆 m24 约束，代码层没有任何保护——记忆会忘，代码不会。`protectedDirs()` 默认 9→10 项，整理/清理/归档一律不进入。
+- **修复 v0.11.3 引入的 clean 死锁**：`clean` 的 5 个默认安全项（用户临时 / 系统临时 / 更新缓存 / 程序崩溃转储 / 蓝屏转储）路径全在 AppData 或 `C:\Windows` 红线内，v0.11.3 的「clean 红线复核」把它们全部拦死——`tidy_scan` 报「可清 1.1GB」、`tidy_apply clean` 永远「红线内不清」，扫描与执行两套判据打架。现 `junkCatalog` 内置项标 `trusted: true`，clean 对 trusted 项跳过红线复核；配置注入的 `junkDirs` 不标 trusted，仍过红线（防误配指向用户目录）。
+
+### Verification
+- `node --check index.js` / `node --check lib/path-safety.js` 通过。
+- 单测（path-safety）：Temp 目录与子路径、`D:\_archive`、dsh-bundles、deepsek harness、学习空间均判红；普通工作区放行；红线条目 = 10。
+- 真机（2026-11-12，profile 重组后）：`tidy_status.protectCount=10`；`tidy_apply clean` 恢复可用——两次调用累计释放约 2.15 GB（C 盘空闲 223.50→225.65 GB；用户临时 389.2MB→3MB、系统临时→0、蓝屏转储→0）。更新缓存仍余 895.8MB / 83,155 文件，受单次 `maxFiles=2000` 截断，可再执行。
+
 ## v0.11.4 — 2026-11-03
 
 ### Fixed（诊断口径）

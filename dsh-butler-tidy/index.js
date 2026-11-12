@@ -223,7 +223,9 @@ function junkCatalog(extraDirs) {
     { id: 'win-old', label: '旧系统备份 Windows.old', path: path.join(path.dirname(win), 'Windows.old'), policy: 'admin' },
     { id: 'recycle-c', label: 'C 盘回收站', path: 'C:\\$Recycle.Bin', policy: 'cautious' },
     { id: 'recycle-d', label: 'D 盘回收站', path: 'D:\\$Recycle.Bin', policy: 'cautious' },
-  ]
+    // 2026-11-12：内置项 = 管家职责白名单（trusted）。它们全是固定路径的系统垃圾区，
+  // clean 时不再过红线复核；配置注入的 junkDirs 不标 trusted，仍过红线（防误配）。
+  ].map((item) => ({ ...item, trusted: true }))
 
   // 配置注入的可清目录（2026-11-03）：id / path 必填，policy 只认 safe / cautious / admin。
   // 用于机器相关的自定义临时目录；默认 clean 只动 policy=safe 的项，点名要传 targets。
@@ -239,6 +241,7 @@ function junkCatalog(extraDirs) {
         label: typeof item.label === 'string' && item.label.trim() !== '' ? item.label.trim() : itemPath,
         path: path.resolve(itemPath),
         policy,
+        trusted: false,
       })
     }
   }
@@ -1217,7 +1220,7 @@ function doApply(config, args, guard, store) {
     const pending = []
     for (const item of targets) {
       if (!existsSync(item.path)) continue
-      if (isProtected(item.path, guard)) {
+      if (item.trusted !== true && isProtected(item.path, guard)) {
         skipped += 1
         errors.push(`${item.label}：在红线目录内，不清`)
         continue

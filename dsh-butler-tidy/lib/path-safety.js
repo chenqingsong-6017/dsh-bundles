@@ -113,6 +113,9 @@ export function protectedDirs(config) {
     'D:\\AI\\deepsek harness',
     'D:\\AI\\hermes-agent',
     'D:\\AI-date\\workbuddy-date\\学习',
+    // 2026-11-12：陛下明示「不动」的归档区（约 8.3GB）。此前只在记忆 m24 里约束，
+    // 代码层没有红线——记忆会忘，代码不会。
+    'D:\\_archive',
   ]
   if (Array.isArray(config?.protectDirs)) {
     for (const item of config.protectDirs) {
@@ -126,6 +129,12 @@ export function protectedDirs(config) {
  * 目标是否落在红线（或根本无法安全判定）：
  * 写法不安全 / 含 reparse point / 解析不出真实路径 → 一律 true（fail-closed）。
  * 2026-11-03 审计 T2/T3：junction、`\\?\`、UNC 三种写法都曾绕过这里的字符串比较。
+ *
+ * 2026-11-12：clean 的内置可清目录（用户临时/系统临时/更新缓存/崩溃与蓝屏转储）
+ * 本身就是 AppData / C:\Windows 红线内的子目录——此前一律被判红，导致
+ * `tidy_scan` 报「可清 1.1GB」而 `tidy_apply clean` 永远报「红线内不清」。
+ * 修法不是在这里开口子：clean 对 junkCatalog 内置项（trusted）跳过红线复核，
+ * 配置注入的 junkDirs 仍过红线——见 index.js clean 分支。
  */
 export function isProtected(target, guard) {
   const c = norm(target)
