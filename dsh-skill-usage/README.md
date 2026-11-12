@@ -14,6 +14,7 @@ DSH bundle（Host 侧插件）：统计每个 skill 被加载了多少次、最�
 |---|---|
 | `skill_usage` | 列出用量与状态。`filter` = `all`（默认）/ `used` / `unused` / `attention`（陈旧 + 可归档），`limit` 默认 40；`dryRun: true` 只读预演「会归档谁」（见下「淘汰三件套」）。输出面向人：状态写成【常用】/【从未用过】/【陈旧】/【建议归档】，不暴露内部枚举值 |
 | `skill_usage_mark` | 标记"已复核"（可带 ≤200 字备注）。复核会给提醒续期，而不是永久压掉 |
+| `skill_consolidation_plan` | 只读合并建议：把名称/描述词面重合的技能聚成同主题组，给每组一个伞名建议（v1.2.0，见下「合并建议」）。**不改任何技能文件、不刷目录、不落盘** |
 | `skill_usage_status` | 只读诊断：数据目录**真的可写**（写探针文件再删）、`usage.json` 能否解析、账本条数与目录技能数、阈值与计数、`lastCuration`（最近一次自动归档的动作 + 跳过原因，可为 `null`）。`ready:false` 时给 `unavailableReason` + `code` |
 
 ## 状态机
@@ -68,6 +69,28 @@ Curator 会自己归档（`archivedAt`），但「它准备干什么」原本只
 
 **目录名单不可信时不瞎判**：`catalogAt` 缺失（目录刷新从未成功）时 `decideCuration` 一律不归档，于是 `wouldArchive` 必然为空——这时必须报 `dryRunReason: 'catalog-untrusted'`，否则「空」会被误读成「没有可归档的」。
 
+## 合并建议：只读中间档（v1.2.0，2026-11-12）
+
+Hermes 的 curator 除「归档」外还有一档：把同类技能并进 umbrella（`absorbed_into` 必须指向已存在的伞，
+无证据的删除会被拒）。DSH 的技能目录是只读视图，我们**不能**执行合并，只能把「该合并哪几个、证据是什么、
+建议叫什么伞名」算出来，决定权留给人或模型——这是照 Hermes 抄的那一档，按能力边界降级成报告。
+
+| 项 | 值 |
+|---|---|
+| 判据 | 名称+描述的**词面重合**（拉丁词 ≥3 字母去停用词、中文 2-gram）；**刻意不掺用量**（Hermes：use=0 不是跳过合并的理由） |
+| 相似度 | 重叠系数 `shared / min(|A|,|B|)`，不是 Jaccard——技能名短，Jaccard 会把「共享一个主题词」压到 0.17 |
+| 默认阈值 | 0.3（实测：cordis 三件套两两 0.33、无关技能 0；阈值是标定出来的，不是拍的） |
+| 泛词闸 | 出现在 >60% 技能里的词先剔除再算重合（防一个公共词把全库粘成一组） |
+| 聚类 | 单链 Union-Find：A~B、A~C 即可成组（伞名不是两两完全相同，而是共享主题词） |
+| 输出 | `{scanned, threshold, clusters:[{umbrellaHint, similarity, sharedTokens, members:[{name,uses,state,lastUsedAt?}]}]}` |
+| 副作用 | 零：不刷目录（不写 `catalogSeenAt`）、不跑 curator、不落盘、不写 manifest |
+
+### 验证记录（v1.2.0，2026-11-12）
+
+- 单测：`node _selftest/tests/skill-usage.test.mjs` → **33 项通过**（新增 5：拆词 / 三件套聚成一组且伞名=cordis / 阈值 0.9 时散开 / 工具零副作用 / 现读视图不全时用账本快照取并集）。
+- 目录口径：`directory` = `skills.list()` 现读 ∪ 已登记的账本目录快照（实测不带 agent scope 的现读只回 2 个技能，只用它会少报）。
+- 工具零副作用：调用前后 `usage.json` 逐字节相同、mtime 不变、无 `archive-manifest.jsonl`。
+- 真机（HMR 后）：`skill_consolidation_plan` 在真实目录上返回分组；观测值见 CHANGELOG v1.2.0。
 ## 验证记录（2026-10-25，本机 desktop profile）
 
 - 安装 → `application: applied`；工具 `skill_usage` / `skill_usage_mark` 出现在工具表

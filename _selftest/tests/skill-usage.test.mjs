@@ -314,4 +314,122 @@ ok('无任何时间锚点 = unknown')
   }
 }
 
+// ── v1.2.0：合并建议（只读中间档）——纯函数判据 + 工具零副作用 ──
+{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const { planConsolidation, skillTokens, CONSOLIDATION_DEFAULT_THRESHOLD } = mod
+
+  const tokens = skillTokens('cordis-plugin-development')
+  assert.ok(tokens.has('cordis') && tokens.has('plugin') && tokens.has('development'), '连字符要拆成词')
+  assert.ok(!tokens.has('cordis-plugin'), '不该把连字符整串当一个词')
+  ok('skillTokens：连字符拆词、停用词剔除')
+
+  const entries = [
+    { name: 'cordis-plugin-development', description: 'Cordis plugin development guide', uses: 5, state: 'stale', lastUsedAt: ago(14) },
+    { name: 'cordis-composition-reference', description: 'Cordis composition reference', uses: 0, state: 'new' },
+    { name: 'editing-cordis-compositions', description: 'Editing cordis compositions', uses: 2, state: 'active' },
+    { name: 'nvidia-driver-upgrade', description: 'Upgrade NVIDIA driver on Windows', uses: 1, state: 'active' },
+    { name: 'archived-cordis-old', description: 'Cordis plugin development old', archivedAt: ago(5) },
+  ]
+  const plan = planConsolidation(entries)
+  assert.equal(plan.threshold, CONSOLIDATION_DEFAULT_THRESHOLD)
+  assert.equal(plan.scanned, 4, '已归档条目不参与聚类')
+  assert.equal(plan.clusters.length, 1, '只该聚出 cordis 一组')
+  const cluster = plan.clusters[0]
+  assert.deepEqual(
+    cluster.members.map((member) => member.name).sort(),
+    ['cordis-composition-reference', 'cordis-plugin-development', 'editing-cordis-compositions'],
+  )
+  assert.equal(cluster.umbrellaHint, 'cordis', '伞名取组内高频共同词')
+  assert.ok(cluster.sharedTokens.includes('cordis'))
+  assert.ok(cluster.similarity > 0 && cluster.similarity <= 1)
+  ok('planConsolidation：cordis 三件套聚成一组、无关技能不入组、伞名=cordis、已归档排除')
+
+  assert.equal(planConsolidation(entries, { threshold: 0.9 }).clusters.length, 0, '阈值必须真的起作用')
+  ok('planConsolidation：阈值生效（0.9 时同组也散开）')
+
+  // 工具端到端：只读——调用后 usage.json 逐字节不变，且不写 manifest
+  const storeDir = mkdtempSync(path.join(os.tmpdir(), 'skill-usage-v12-'))
+  writeFileSync(
+    path.join(storeDir, 'usage.json'),
+    JSON.stringify({
+      version: 1,
+      skills: {
+        'cordis-plugin-development': { uses: 5, firstSeenAt: ago(30), lastUsedAt: ago(1), catalogSeenAt: ago(0) },
+        'cordis-composition-reference': { uses: 0, firstSeenAt: ago(20), catalogSeenAt: ago(0) },
+        'editing-cordis-compositions': { uses: 2, firstSeenAt: ago(30), lastUsedAt: ago(2), catalogSeenAt: ago(0) },
+        'nvidia-driver-upgrade': { uses: 1, firstSeenAt: ago(30), lastUsedAt: ago(3), catalogSeenAt: ago(0) },
+      },
+    }),
+    'utf8',
+  )
+  const { ctx, registered } = makeMockContext()
+  ctx.skills = {
+    list: async () => [
+      { name: 'cordis-plugin-development', description: 'Cordis plugin development' },
+      { name: 'cordis-composition-reference', description: 'Cordis composition reference' },
+      { name: 'editing-cordis-compositions', description: 'Editing cordis compositions' },
+      { name: 'nvidia-driver-upgrade', description: 'Upgrade NVIDIA driver' },
+    ],
+  }
+  mod.apply(ctx, { storeDir })
+  const planTool = registered.find((tool) => tool.name === 'skill_consolidation_plan')
+  assert.ok(planTool, '必须注册 skill_consolidation_plan')
+  await sleep(250)
+  const usageFile = path.join(storeDir, 'usage.json')
+  const beforeBuf = readFileSync(usageFile)
+  const beforeMtime = statSync(usageFile).mtimeMs
+  const result = await planTool.execute({})
+  assert.equal(result.directory, 4, '目录并集大小应等于登记数')
+  assert.equal(result.scanned, 4)
+  assert.equal(result.clusters.length, 1)
+  assert.deepEqual(
+    result.clusters[0].members.map((member) => member.name).sort(),
+    ['cordis-composition-reference', 'cordis-plugin-development', 'editing-cordis-compositions'],
+  )
+  assert.match(result.note, /只读/)
+  await sleep(300)
+  assert.ok(readFileSync(usageFile).equals(beforeBuf), '合并建议只读：usage.json 必须逐字节不变')
+  assert.equal(statSync(usageFile).mtimeMs, beforeMtime, '连 mtime 都不许动')
+  assert.equal(existsSync(path.join(storeDir, 'archive-manifest.jsonl')), false, '不许写审计文件')
+  await sleep(250)
+  rmSync(storeDir, { recursive: true, force: true })
+  ok('skill_consolidation_plan：真机路径返回分组，且零副作用（usage.json/mtime/manifest 全不变）')
+
+  // 现读视图因 scope 只回部分技能时，必须用账本目录快照补齐，不能少报。
+  {
+    const storeDir2 = mkdtempSync(path.join(os.tmpdir(), 'skill-usage-v12-union-'))
+    const skills = {
+      'cordis-plugin-development': { uses: 3, firstSeenAt: ago(20), lastUsedAt: ago(1), catalogSeenAt: ago(0) },
+      'cordis-composition-reference': { uses: 0, firstSeenAt: ago(20), catalogSeenAt: ago(0) },
+      'editing-cordis-compositions': { uses: 1, firstSeenAt: ago(20), lastUsedAt: ago(2), catalogSeenAt: ago(0) },
+      'nvidia-driver-upgrade': { uses: 1, firstSeenAt: ago(20), lastUsedAt: ago(3), catalogSeenAt: ago(0) },
+    }
+    writeFileSync(path.join(storeDir2, 'usage.json'), JSON.stringify({ version: 1, skills }), 'utf8')
+    const full = [
+      { name: 'cordis-plugin-development', description: 'Cordis plugin development' },
+      { name: 'cordis-composition-reference', description: 'Cordis composition reference' },
+      { name: 'editing-cordis-compositions', description: 'Editing cordis compositions' },
+      { name: 'nvidia-driver-upgrade', description: 'Upgrade NVIDIA driver' },
+    ]
+    let calls = 0
+    const { ctx: ctxU, registered: regU } = makeMockContext()
+    ctxU.skills = {
+      list: async () => {
+        calls += 1
+        return calls === 1 ? full : full.slice(0, 2)
+      },
+    }
+    mod.apply(ctxU, { storeDir: storeDir2 })
+    await sleep(300) // 等挂载时那次 refreshCatalog 把 4 个技能写进快照
+    const tool = regU.find((item) => item.name === 'skill_consolidation_plan')
+    const union = await tool.execute({})
+    assert.equal(union.directory, 4, '现读只回 2 个时，账本快照要补齐到 4——少报等于漏掉该合并的技能')
+    assert.equal(union.clusters.length, 1, '补齐后 cordis 三件套仍应成组')
+    await sleep(250)
+    rmSync(storeDir2, { recursive: true, force: true })
+    ok('skill_consolidation_plan：现读视图不全时用账本快照取并集（不谎报「没有同主题组」）')
+  }
+}
+
 console.log(`skill-usage: ${passed} 项通过`)

@@ -166,6 +166,136 @@ export function resolveSkillName(input, knownNames) {
   return folded ?? ''
 }
 
+// ── v1.2.0：合并建议（只读中间档，对齐 Hermes 的 umbrella consolidation）──
+// Hermes 的 curator 有一档「把同类技能并进 umbrella」，但它能改技能文件；DSH 技能目录是只读视图，
+// 我们能做的是把「哪几个技能该合并、证据是什么、建议叫什么伞名」算出来，决定权留给人或模型。
+// 判据刻意不掺用量：Hermes 明确「use=0 不是跳过合并的理由」，这里同理——聚类只看名称+描述，
+// 用量只作旁注（它是「用得多」的证据，不是「该不该合并」的依据）。
+//
+// 相似度用「重叠系数」(shared / min(|A|,|B|)) 而不是 Jaccard：技能名短，Jaccard 会被词数差压死——
+// 实测 cordis-plugin-development 与 cordis-composition-reference 的 Jaccard 只有 0.17，
+// 但它们共享的恰恰是主题词 cordis。重叠系数给 0.33，才排得进同一组。
+// 0.3 这个默认阈值是本轮实测定的：cordis 三件套两两重合 0.33（共同词只有 cordis），无关技能为 0——刚好卡在中间。
+// 第二道闸：出现在超过 60% 技能里的「泛词」先剔除再算重合，避免一个公共词把全库粘成一组。
+export const CONSOLIDATION_DEFAULT_THRESHOLD = 0.3
+const CONSOLIDATION_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'using', 'use', 'used', 'into', 'when', 'what',
+  'how', 'not', 'are', 'was', 'has', 'have', 'can', 'may', 'all', 'any', 'via', 'per',
+])
+
+/** 把技能名 + 描述切成可比的词集合：拉丁词取长度 ≥3（去停用词），中文取 2-gram。 */
+export function skillTokens(value) {
+  const tokens = new Set()
+  const parts = String(value ?? '').toLowerCase().split(/[^a-z0-9\u4e00-\u9fa5]+/u)
+  for (const part of parts) {
+    if (part === '') continue
+    if (/^[a-z0-9]+$/.test(part)) {
+      if (part.length >= 3 && !CONSOLIDATION_STOPWORDS.has(part)) tokens.add(part)
+      continue
+    }
+    const chars = [...part]
+    for (let i = 0; i + 1 < chars.length; i += 1) tokens.add(chars[i] + chars[i + 1])
+  }
+  return tokens
+}
+
+/** 重叠系数：shared / min(|A|,|B|)。0 = 无共同词，1 = 小集合完全被大集合包含。 */
+function overlapCoefficient(a, b) {
+  if (a.size === 0 || b.size === 0) return 0
+  let shared = 0
+  for (const token of a) if (b.has(token)) shared += 1
+  return shared / Math.min(a.size, b.size)
+}
+
+/**
+ * 纯函数：把技能聚成「同主题组」并给每组一个伞名建议。导出以便单测（不跑插件也能验判据）。
+ *
+ * @param {Array<{name:string, description?:string, uses?:number, lastUsedAt?:string|null, state?:string, archivedAt?:string}>} entries
+ * @param {{threshold?:number}} [opts]
+ * @returns {{threshold:number, scanned:number, clusters:Array<{umbrellaHint:string, similarity:number, sharedTokens:string[], members:Array<{name:string, uses:number, state:string, lastUsedAt?:string}>}>}}
+ */
+export function planConsolidation(entries, opts) {
+  const threshold = Number.isFinite(opts?.threshold) && opts.threshold > 0 ? Math.min(opts.threshold, 0.9) : CONSOLIDATION_DEFAULT_THRESHOLD
+  const rawItems = []
+  for (const raw of Array.isArray(entries) ? entries : []) {
+    if (!raw || typeof raw.name !== 'string' || raw.name.trim() === '') continue
+    if (typeof raw.archivedAt === 'string' && raw.archivedAt !== '') continue
+    const tokens = skillTokens(raw.name + ' ' + String(raw.description ?? ''))
+    if (tokens.size === 0) continue
+    rawItems.push({ ...raw, tokens })
+  }
+  // 文档频次：既是「泛词」判据，也是伞名的排序依据（组内越常见的词越像主题词）。
+  const frequency = new Map()
+  for (const item of rawItems) for (const token of item.tokens) frequency.set(token, (frequency.get(token) ?? 0) + 1)
+  const maxDf = Math.max(3, Math.ceil(rawItems.length * 0.6))
+  const items = rawItems.map((item) => ({
+    ...item,
+    informative: new Set([...item.tokens].filter((token) => (frequency.get(token) ?? 0) <= maxDf)),
+  }))
+  const parent = items.map((_, index) => index)
+  const find = (index) => {
+    let root = index
+    while (parent[root] !== root) root = parent[root]
+    while (parent[index] !== root) {
+      const next = parent[index]
+      parent[index] = root
+      index = next
+    }
+    return root
+  }
+  const similarities = new Map()
+  for (let i = 0; i < items.length; i += 1) {
+    for (let j = i + 1; j < items.length; j += 1) {
+      const sim = overlapCoefficient(items[i].informative, items[j].informative)
+      if (sim <= 0 || sim < threshold) continue
+      similarities.set(i + ':' + j, sim)
+      const a = find(i)
+      const b = find(j)
+      if (a !== b) parent[b] = a
+    }
+  }
+  const groups = new Map()
+  for (let i = 0; i < items.length; i += 1) {
+    const root = find(i)
+    if (!groups.has(root)) groups.set(root, [])
+    groups.get(root).push(i)
+  }
+  const clusters = []
+  for (const members of groups.values()) {
+    if (members.length < 2) continue
+    // 组内两两重合度的均值：用真实边算，不拿阈值当分数，免得所有组看起来一样重要。
+    const sims = []
+    for (let x = 0; x < members.length; x += 1) {
+      for (let y = x + 1; y < members.length; y += 1) {
+        const key = members[x] < members[y] ? members[x] + ':' + members[y] : members[y] + ':' + members[x]
+        if (similarities.has(key)) sims.push(similarities.get(key))
+      }
+    }
+    const similarity = sims.length === 0 ? 0 : Math.round((sims.reduce((sum, value) => sum + value, 0) / sims.length) * 100) / 100
+    // 共同词 = 每个成员都有的词（用剔泛词后的集合）；没有绝对共同词时退回「组内频次 ≥2」的词。
+    let shared = [...items[members[0]].informative].filter((token) => members.every((index) => items[index].informative.has(token)))
+    if (shared.length === 0) {
+      const local = new Map()
+      for (const index of members) for (const token of items[index].informative) local.set(token, (local.get(token) ?? 0) + 1)
+      shared = [...local.entries()].filter(([, count]) => count >= 2).map(([token]) => token)
+    }
+    shared.sort((a, b) => (frequency.get(b) ?? 0) - (frequency.get(a) ?? 0) || a.localeCompare(b))
+    clusters.push({
+      umbrellaHint: shared[0] ?? 'skill',
+      similarity,
+      sharedTokens: shared.slice(0, 5),
+      members: members.map((index) => ({
+        name: items[index].name,
+        uses: Number.isInteger(items[index].uses) && items[index].uses > 0 ? items[index].uses : 0,
+        state: typeof items[index].state === 'string' ? items[index].state : 'unknown',
+        ...(typeof items[index].lastUsedAt === 'string' && items[index].lastUsedAt !== '' ? { lastUsedAt: items[index].lastUsedAt } : {}),
+      })),
+    })
+  }
+  clusters.sort((a, b) => b.similarity - a.similarity || a.umbrellaHint.localeCompare(b.umbrellaHint))
+  return { threshold, scanned: items.length, clusters }
+}
+
 export function apply(ctx, config) {
   const staleAfterDays =
     Number.isFinite(config?.staleAfterDays) && config.staleAfterDays > 0 ? config.staleAfterDays : DEFAULT_THRESHOLDS.staleAfterDays
@@ -791,6 +921,119 @@ export function apply(ctx, config) {
         record.patchCount = (Number.isInteger(record.patchCount) ? record.patchCount : 0) + 1
         schedulePersist()
         return { name: resolved, restored: true, state: classifyUsage(record, Date.now(), thresholds).state }
+      },
+    }),
+  )
+
+  // ---- skill_consolidation_plan：只读合并建议（Hermes umbrella consolidation 的降级版）----
+  ctx.effect(() =>
+    tools.register({
+      name: 'skill_consolidation_plan',
+      description:
+        'Read-only consolidation report: cluster same-topic skills and propose an umbrella name. It never edits, archives, or moves any skill file (the skill catalog is a read-only view); the merge decision stays with the human or model.',
+      parameters: {
+        type: 'object',
+        properties: {
+          threshold: { type: 'number', description: 'Word-overlap (overlap coefficient) threshold 0.1–0.9; default 0.3.' },
+          limit: { type: 'integer', description: 'Max clusters to return (default 10).' },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            scanned: { type: 'integer' },
+            directory: { type: 'integer' },
+            threshold: { type: 'number' },
+            clusters: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  umbrellaHint: { type: 'string' },
+                  similarity: { type: 'number' },
+                  sharedTokens: { type: 'array', items: { type: 'string' } },
+                  members: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        name: { type: 'string' },
+                        uses: { type: 'integer' },
+                        state: { type: 'string' },
+                        lastUsedAt: { type: 'string' },
+                      },
+                      required: ['name', 'uses', 'state'],
+                      additionalProperties: false,
+                    },
+                  },
+                },
+                required: ['umbrellaHint', 'similarity', 'sharedTokens', 'members'],
+                additionalProperties: false,
+              },
+            },
+            note: { type: 'string' },
+          },
+          required: ['scanned', 'directory', 'threshold', 'clusters', 'note'],
+          additionalProperties: false,
+        },
+        render(_args, value) {
+          const clusters = Array.isArray(value?.clusters) ? value.clusters : []
+          const head = `合并建议：目录 ${value?.directory ?? 0} 个 / 判定 ${value?.scanned ?? 0} 个（重合阈值 ${value?.threshold ?? '?'}），发现 ${clusters.length} 组同主题`
+          if (clusters.length === 0) return [text(`${head}\n没有达到阈值的同主题技能组。`)]
+          const lines = clusters.map((cluster) => {
+            const names = cluster.members.map((member) => `${member.name}(${member.state}${member.uses > 0 ? '·' + member.uses + '次' : ''})`).join(' / ')
+            return `- 建议伞名「${cluster.umbrellaHint}」：${names}（重合 ${cluster.similarity}）`
+          })
+          return [text(`${head}\n${lines.join('\n')}\n${value?.note ?? ''}`)]
+        },
+      },
+      async execute(args, exec) {
+        // 只读：不跑 curator、不落盘、不改任何技能文件；目录用 skills.list() 现读（它本身是只读 API，
+        // 不写 catalogSeenAt）——不现读会因挂载时的 scope 视图只看到部分技能，报出假的「没有同主题组」。
+        // 必须带调用者的 agent scope：不带 scope 的视图实测只返回 2 个技能（2026-11-12 真机），会漏掉 preset 层的技能。
+        const threshold = Number.isFinite(args?.threshold) ? Math.min(0.9, Math.max(0.1, args.threshold)) : CONSOLIDATION_DEFAULT_THRESHOLD
+        const limit = Number.isInteger(args?.limit) && args.limit > 0 ? Math.min(args.limit, 20) : 10
+        const now = Date.now()
+        let listed = []
+        try {
+          listed = await skills.list(exec?.agent ? { scope: exec.agent } : {})
+        } catch (error) {
+          stats.lastError = 'consolidation: ' + (error instanceof Error ? error.message : String(error))
+        }
+        // 目录 = 现读结果 ∪ 账本目录快照：现读视图可能因 scope 只回部分（实测无 scope 只回 2 个），
+        // 只用现读会漏掉 preset 层技能、报出假的「没有同主题组」；只用快照又不是最新。取并集最稳。
+        const byName = new Map()
+        for (const [skillName, info] of catalog) byName.set(skillName, { name: skillName, description: info.description ?? '' })
+        for (const summary of Array.isArray(listed) ? listed : []) {
+          if (!summary || typeof summary.name !== 'string' || summary.name === '') continue
+          const known = byName.get(summary.name)
+          byName.set(summary.name, { name: summary.name, description: summary.description ?? known?.description ?? '' })
+        }
+        const directory = [...byName.values()]
+        const items = []
+        for (const summary of directory) {
+          const skillName = summary.name
+          const info = catalog.get(skillName) ?? summary
+          const record = records.get(skillName) ?? {}
+          items.push({
+            name: skillName,
+            description: info.description ?? '',
+            uses: Number.isInteger(record.uses) ? record.uses : 0,
+            lastUsedAt: typeof record.lastUsedAt === 'string' ? record.lastUsedAt : null,
+            state: classifyUsage(record, now, thresholds).state,
+            ...(typeof record.archivedAt === 'string' && record.archivedAt !== '' ? { archivedAt: record.archivedAt } : {}),
+          })
+        }
+        const plan = planConsolidation(items, { threshold })
+        return {
+          scanned: plan.scanned,
+          directory: directory.length,
+          threshold: plan.threshold,
+          clusters: plan.clusters.slice(0, limit),
+          note: '只读报告：不刷目录、不改账本、不动任何技能文件；合不合并由人或模型决定（use=0 既不是不合并的理由，也不是合并的理由）。',
+        }
       },
     }),
   )
