@@ -1981,9 +1981,25 @@ export function apply(ctx, config) {
                 additionalProperties: false,
               },
             },
+            // v4.16.2：未来 N 天会进入淘汰候选的条目（窗口参数的可观测后果，不是预测算法）。
+            evictionForecast: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  kind: { type: 'string' },
+                  ageDays: { type: 'integer' },
+                  windowDays: { type: 'integer' },
+                  daysUntil: { type: 'integer' },
+                },
+                required: ['id', 'kind', 'ageDays', 'windowDays', 'daysUntil'],
+                additionalProperties: false,
+              },
+            },
             schemaVersion: { type: 'integer' },
           },
-          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget', 'growth', 'evictionCandidates', 'schemaVersion'],
+          required: ['total', 'active', 'superseded', 'archived', 'draft', 'recheck', 'byScope', 'aliases', 'duplicates', 'stale', 'mostUsed', 'budget', 'growth', 'evictionCandidates', 'evictionForecast', 'schemaVersion'],
           additionalProperties: false,
         },
         render(_args, value) {
@@ -2005,6 +2021,11 @@ export function apply(ctx, config) {
               const candidates = list.filter((row) => row.candidate === true)
               if (list.length === 0) return '淘汰候选（只读）：无可检查条目（全部受保护或已归档）'
               return `淘汰候选（只读）：候选 ${candidates.length} / 共检查 ${list.length}${candidates.length > 0 ? ' —— ' + candidates.slice(0, 8).map((row) => `${row.id}(${row.ageDays}d)`).join(' ') : '（都在窗口内或被护栏挡住）'}`
+            })(),
+            (() => {
+              const list = Array.isArray(value?.evictionForecast) ? value.evictionForecast : []
+              if (list.length === 0) return '淘汰预测（只读）：未来 30 天无条目进入候选（窗口未到）'
+              return `淘汰预测（只读）：未来 30 天 ${list.length} 条进候选 —— ` + list.slice(0, 6).map((row) => `${row.id}(${row.daysUntil}天后)`).join(' ')
             })(),
             (() => {
               const growth = value?.growth
@@ -2130,6 +2151,8 @@ export function apply(ctx, config) {
             candidate: row.candidate === true,
             reason: String(row.reason ?? ''),
           })),
+          // v4.16.2：窗口参数的可观测后果——未来 30 天谁会进候选；空数组 = 当前参数+库龄下不会有动作（不是判据失效）。
+          evictionForecast: store.evictionForecast(30),
           schemaVersion: Number.isInteger(state.version) && state.version > 0 ? state.version : SCHEMA_VERSION,
         }
       },

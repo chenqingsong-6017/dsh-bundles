@@ -2022,6 +2022,40 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
     return rows.slice(0, limit)
   }
 
+  /**
+   * v4.16.2：淘汰窗口预测（让 90/30/180 这组参数不再是拍脑袋——审计能看到「未来 N 天谁会进候选」）。
+   * 只读。只预测「单纯窗口未到 / 最近 7 天保护」的条目；已候选、受保护、workspace 不匹配、无窗口的都不出现。
+   */
+  const evictionForecast = (days = 30) => {
+    const today = localDateOf()
+    const now = Date.now()
+    const rows = []
+    for (const entry of activeEntries()) {
+      if (isEliminationProtected(entry)) continue
+      const decision = curationDecision(entry, today, now, lastKnownCwd)
+      if (decision.archive) continue
+      const reason = String(decision.reason ?? '')
+      // 只有「窗口未到 / 最近保护」是纯粹的时间问题；被 usedCount/importance/no-window/workspace 挡住的，预测也没意义。
+      if (!(reason === '' || reason.startsWith('window ') || reason.startsWith('recent '))) continue
+      const windowDays = evictionWindowDays(entry)
+      if (windowDays === null) continue
+      const anchor = evictionAnchor(entry)
+      if (!Number.isFinite(anchor)) continue
+      const ageDays = (now - anchor) / 86400000
+      const remaining = windowDays - ageDays
+      if (remaining > days) continue
+      rows.push({
+        id: entry.id,
+        kind: typeof entry.kind === 'string' ? entry.kind : '',
+        ageDays: Math.floor(ageDays),
+        windowDays,
+        daysUntil: Math.max(0, Math.ceil(remaining)),
+      })
+    }
+    rows.sort((a, b) => a.daysUntil - b.daysUntil || b.ageDays - a.ageDays)
+    return rows.slice(0, 50)
+  }
+
   // ── v4.4 维护循环（对齐 Hermes curator + 「越用越好用」）──
   // 读路径顺带跑，CURATOR_INTERVAL_MS 节流。两件事：
   //   1) consolidate（上）：draft 未证实条目被命中 ≥ CONSOLIDATE_MIN_USES 次 → 升 stable（越用越证实）。
@@ -2272,6 +2306,7 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
     addCandidate,
     runMaintenance,
     evictionPreview,
+    evictionForecast,
     budgetState,
     maintenanceFile,
     manifestFile,

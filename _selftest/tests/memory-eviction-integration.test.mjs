@@ -38,6 +38,7 @@ const ruleR = await seed.defs.get('memory_add').execute({ text: '长期约定不
 const vaultR = await seed.defs.get('memory_add').execute({ text: '知识入口见 vault://30-Build/x.md#1', kind: 'fact' })
 const usedR = await seed.defs.get('memory_add').execute({ text: '被检索过很多次的旧事实', kind: 'fact' })
 const otherWs = await seed.defs.get('memory_add').execute({ text: '别的开发区的旧观察记录', kind: 'fact', workspaces: ['D:\\AI\\other-workspace'] })
+const forecast80 = await seed.defs.get('memory_add').execute({ text: '八十天前的旧观察记录', kind: 'fact' })
 
 // 伪造年龄（memory_add 不能写回 100 天前）：直接改 memory.json，再重新加载走真实读路径。
 const file = path.join(tmp, 'memory.json')
@@ -47,6 +48,11 @@ for (const entry of data.entries) {
   if (lowValue.includes(entry.id) || entry.id === vaultR.entry.id || entry.id === usedR.entry.id || entry.id === otherWs.entry.id) {
     entry.addedAt = oldStamp
     entry.updatedAt = oldStamp
+  }
+  if (entry.id === forecast80.entry.id) {
+    const stamp80 = new Date(Date.now() - 80 * 86400000).toISOString()
+    entry.addedAt = stamp80
+    entry.updatedAt = stamp80
   }
   if (entry.id === usedR.entry.id) entry.usedCount = 5
 }
@@ -80,7 +86,13 @@ ok('集成：memory_restore 恢复归档条目，归档数回落')
 const audit = await h.defs.get('memory_audit').execute({ limit: 20 })
 assert.ok(Array.isArray(audit.evictionCandidates) && audit.evictionCandidates.length > 0, 'memory_audit 必须带只读候选清单');
 assert.ok(audit.evictionCandidates.some((row) => row.candidate === true), '归档后仍应剩候选（单轮上限留下的）');
-ok('集成：memory_audit.evictionCandidates 可读（candidate=true 才是会归档的）')
+const forecast = audit.evictionForecast || [];
+const f80 = forecast.find((row) => row.id === forecast80.entry.id);
+assert.ok(f80, '80 天的 fact（窗口 90）必须进未来 30 天预测，实际 ' + JSON.stringify(forecast));
+assert.equal(f80.daysUntil, 10, '80 天 + 90 天窗口 → 还有 10 天，实际 ' + f80.daysUntil);
+assert.ok(!forecast.some((row) => row.id === otherWs.entry.id), '别的工作区的条目不进预测');
+assert.ok(!forecast.some((row) => (status.maintenance.lastSummary.ids || []).includes(row.id)), '已归档的不进预测');
+ok('集成：memory_audit.evictionForecast 可读（80 天 fact → 10 天后触发；已候选/他区不入预测）')
 
 rmSync(tmp, { recursive: true, force: true })
 console.log(`\nmemory-eviction-integration: ${passed} 组断言通过`)
