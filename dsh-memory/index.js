@@ -2408,9 +2408,33 @@ export function apply(ctx, config) {
               type: 'object',
               properties: {
                 lastRunAt: { type: 'string' },
+                checked: { type: 'integer' },
                 archived: { type: 'integer' },
                 promoted: { type: 'integer' },
+                skipped: {
+                  type: 'object',
+                  properties: {
+                    pinned: { type: 'integer' },
+                    rule: { type: 'integer' },
+                    draft: { type: 'integer' },
+                    notDue: { type: 'integer' },
+                    grace: { type: 'integer' },
+                  },
+                  additionalProperties: false,
+                },
+                note: { type: 'string' },
               },
+              additionalProperties: false,
+            },
+            budget: {
+              type: 'object',
+              properties: {
+                used: { type: 'integer' },
+                max: { type: 'integer' },
+                remaining: { type: 'integer' },
+                state: { type: 'string', enum: ['ok', 'degraded', 'full'] },
+              },
+              required: ['used', 'max', 'remaining', 'state'],
               additionalProperties: false,
             },
           },
@@ -2433,13 +2457,23 @@ export function apply(ctx, config) {
         render(_args, value) {
           if (value?.ready === false) return [text('不可用：' + (value?.unavailableReason || '未知原因'))]
           const maint = value?.maintenance
+          // v4.14：维护循环的「检查/归档/跳过原因」与预算状态都要在话说清楚，别让维护像没跑过。
+          const skip = maint?.skipped
+          const skippedLine = skip
+            ? `；跳过 pinned ${skip.pinned ?? 0} / rule ${skip.rule ?? 0} / draft ${skip.draft ?? 0} / 未到期 ${skip.notDue ?? 0} / 宽限期 ${skip.grace ?? 0}`
+            : ''
           const maintLine =
             maint && typeof maint.lastRunAt === 'string' && maint.lastRunAt !== ''
-              ? `\n维护循环：上次 ${maint.lastRunAt.slice(0, 19).replace('T', ' ')} · 归档 ${maint.archived ?? 0} · 巩固 ${maint.promoted ?? 0}`
+              ? `\n维护循环：上次 ${maint.lastRunAt.slice(0, 19).replace('T', ' ')} · 检查 ${maint.checked ?? 0} · 归档 ${maint.archived ?? 0} · 巩固 ${maint.promoted ?? 0}${skippedLine}${maint.note ? '\n' + maint.note : ''}`
               : '\n维护循环：尚未运行（读路径触发，6h 节流）'
+          const budget = value?.budget
+          const budgetLine =
+            budget && budget.state !== 'ok'
+              ? `\n⚠ 存储${budget.state === 'full' ? '已满' : '接近上限'}：${budget.used}/${budget.max} 字符（剩 ${budget.remaining}），新的 memory_add 会被拒绝——先 memory_remove 精简，或调大 maxBytes（配置与代码默认值两处同改）`
+              : ''
           return [
             text(
-              `记忆库可用：${value?.active ?? 0} 条生效 / ${value?.archived ?? 0} 条归档，存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入预算 ${value?.maxInjectChars ?? 0} 字符，库文件 ${value?.storeFile ?? '?'}${maintLine}\n代码指纹 ${value?.codeFingerprint ?? '?'}`,
+              `记忆库可用：${value?.active ?? 0} 条生效 / ${value?.archived ?? 0} 条归档，存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入预算 ${value?.maxInjectChars ?? 0} 字符，库文件 ${value?.storeFile ?? '?'}${maintLine}${budgetLine}\n代码指纹 ${value?.codeFingerprint ?? '?'}`,
             ),
           ]
         },
@@ -2492,6 +2526,10 @@ export function apply(ctx, config) {
         if (!writable.ok) note('MEMORY_STORE_UNWRITABLE', writable.reason)
 
         const ready = problems.length === 0
+        // v4.14：预算状态与健康度同源（2026-11-12 实测：11945/12000 时 health 仍报 ok，
+        // 而 memory_add 已经被拒——诊断说没事、动作却失败，就是假安全）。
+        const budget = store.budgetState()
+        const health = store.storeHealth !== 'ok' ? store.storeHealth : budget.state
         const liveEntries = activeEntries()
         const active = liveEntries.length
         // v4.12：类目分布（tag / scope）。只统计生效条目；tag 只报前 20，避免状态输出膨胀。
@@ -2530,7 +2568,7 @@ export function apply(ctx, config) {
           storeExists,
           storeBytes,
           storeWritable: writable.ok,
-          health: store.storeHealth,
+          health,
           ...(store.corruptCopy !== '' ? { corruptCopy: store.corruptCopy } : {}),
           schemaVersion: Number.isInteger(state.version) ? state.version : SCHEMA_VERSION,
           entries: state.entries.length,
@@ -2543,9 +2581,11 @@ export function apply(ctx, config) {
           facets,
           // v4.4：维护循环（curate 过期归档 / consolidate draft→stable）的上一次运行结果，供诊断「自动生命周期有没有在跑」。
           maintenance: store.maintenance,
+          // v4.14：预算状态——degraded/full 时新的写入会被拒绝，别等撞墙才发现。
+          budget,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.13.0-domains',
+          codeFingerprint: '4.14.0-elimination-observe',
         }
       },
     }),

@@ -3,6 +3,29 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.14.0（2026-11-12）
+
+**淘汰机制补上「可观测 + 可审计 + 不说谎」**——取经 Hermes 的 no-op 原因日志与 run report，起因是 2026-11-12 的真实观测：
+记忆 11945/12000（99.5%）时 `memory_add` 已经被拒，而 `memory_status.health` 仍报 `ok`，`lastRunAt` 仍为空——
+诊断说没事、动作却失败，且分不清「维护没跑」和「跑了没事可做」。
+
+### Added
+- `maintenance.json`（旁路小文件，不碰主库 schema / SQLite 迁移）：每次维护运行都落一条统计——
+  `lastRunAt / checked / archived / promoted / skipped{pinned,rule,draft,notDue,grace} / note`。
+  归档为 0 的那次也写：`note` 说明「不是没跑」，这正是 Hermes no-op 原因日志的作用。
+- `archive-manifest.jsonl`：每条归档一行（`ts/by/id/reason/signal/chars`），append-only；超 2MiB 轮转一份 `.1`。
+  预算腾挪（makeRoom）与 curator 归档同一格式；**主库落盘成功后才追加**，避免「manifest 说归档了、主库没写成功」的假账。
+- `memory_status.budget: {used, max, remaining, state}`：`ok < 95% ≤ degraded`、`used ≥ max` 为 `full`。
+- `memory_status.maintenance` 扩为 `{lastRunAt, checked, archived, promoted, skipped, note}`，重启后从旁路文件恢复。
+
+### Changed
+- `memory_status.health` 不再只看库完整性：预算 degraded/full 时同步报 degraded/full（`ok` 只在真的能正常写时出现）。
+- `memory_status` 渲染行补「检查/归档/巩固/各类跳过原因」与预算告警；写满时直接给出口（memory_remove 精简或调 maxBytes）。
+- 代码指纹 → `4.14.0-elimination-observe`。
+
+### 测试
+- `memory.test.mjs` 146 项全过（+2）：①构造 90 天前到期条目 → 真机路径归档 1 条、rule 计入 skipped、manifest 1 行、重启后统计仍在；
+  ②预算 90%→95%→写满三档：`state`、`health`、`remaining` 与「下一次写入是否被拒」逐档对齐。
 ## v4.13.0（2026-11-11）
 
 **domain 受控词表**——把 155 个自由 tag 收成 12 个可检索的粗分类，不动历史数据。

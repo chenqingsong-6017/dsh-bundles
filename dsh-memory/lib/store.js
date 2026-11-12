@@ -8,7 +8,7 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSy
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { BACKUP_KEEP, BM25_ALIAS_WEIGHT, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, CONSOLIDATE_MIN_USES, CURATOR_INTERVAL_MS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
+import { ARCHIVE_MANIFEST_MAX_BYTES, BACKUP_KEEP, BM25_ALIAS_WEIGHT, BUDGET_DEGRADED_RATIO, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, CONSOLIDATE_MIN_USES, CURATOR_INTERVAL_MS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
 import { curationDecision, detectScope, effectiveImportance, eliminationSignal, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
 import { canonicalJson, migrateState, normalizeEntry, schemaTooNewError } from './schema.js'
 import { fail, text } from './util.js'
@@ -990,6 +990,7 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
       }
       syncAliases()
       recordHistoryDiff()
+      flushManifest()
       return true
     } catch (error) {
       // v4.2.2（H2②）：id 冲突是可重试的并发错误，不是存储损坏 —— 原样上抛，别降级成只读。
@@ -1158,6 +1159,7 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
       // 分类归档理由（对齐 Hermes「每条淘汰都必须带 why」）：有判断信号就写信号，没有才回退到调用方给的通用理由。
       victim.archiveReason = sig.rank <= 1 ? '淘汰·' + sig.reason : fallbackReason
       archived.push(victim.id)
+      queueManifest([{ ts: victim.archivedAt, by: 'makeRoom', id: victim.id, reason: victim.archiveReason, signal: sig.rank <= 1 ? sig.signal : 'none', chars: victim.text.length }])
     }
     return { ok: usedChars() + size <= maxBytes, archived }
   }
@@ -1593,6 +1595,56 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     }
   }
 
+  // ── v4.14：淘汰可观测 + 可审计（取经 Hermes 的 run report / no-op 原因日志，2026-11-12）──
+  // 为什么独立成文件：维护统计不进 state 就不碰主库 schema / SQLite 迁移（数据能活过插件重写），
+  // 也避免「只是为了报个数」每 6h 重写整个记忆库。
+  const maintenanceFile = path.join(storeDir, 'maintenance.json')
+  const manifestFile = path.join(storeDir, 'archive-manifest.jsonl')
+  const emptyMaintenance = () => ({
+    lastRunAt: '',
+    checked: 0,
+    archived: 0,
+    promoted: 0,
+    skipped: { pinned: 0, rule: 0, draft: 0, notDue: 0, grace: 0 },
+    note: '',
+  })
+  let maintenanceStats = emptyMaintenance()
+  let lastMaintenanceAt = 0
+  const loadMaintenance = () => {
+    try {
+      const parsed = JSON.parse(readFileSync(maintenanceFile, 'utf8'))
+      if (parsed === null || typeof parsed !== 'object') return
+      maintenanceStats = {
+        ...emptyMaintenance(),
+        ...parsed,
+        skipped: { ...emptyMaintenance().skipped, ...(parsed.skipped && typeof parsed.skipped === 'object' ? parsed.skipped : {}) },
+      }
+    } catch (error) {
+      // 没有记录 / 损坏：从空开始（下次运行覆盖，不影响主库）
+    }
+  }
+  // 归档审计行先攒着，等主库真的落盘成功再追加 —— 否则「manifest 说归档了、主库其实没写成功」就是假账。
+  let pendingManifest = []
+  const queueManifest = (rows) => {
+    for (const row of rows) pendingManifest.push(row)
+  }
+  const flushManifest = () => {
+    if (pendingManifest.length === 0) return
+    const rows = pendingManifest
+    pendingManifest = []
+    try {
+      ensureStoreDir()
+      try {
+        if (statSync(manifestFile).size > ARCHIVE_MANIFEST_MAX_BYTES) renameSync(manifestFile, manifestFile + '.1')
+      } catch (error) {
+        // 文件还不存在：第一次写
+      }
+      appendFileSync(manifestFile, rows.map((row) => JSON.stringify(row)).join('\n') + '\n', 'utf8')
+    } catch (error) {
+      // 审计写失败不连累主流程；丢的只是这一批审计行
+    }
+  }
+
   function persist() {
     if (backend === 'sqlite') return persistSqlite()
     if (storeHealth === 'corrupt') return false
@@ -1655,6 +1707,8 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
       syncAliases()
       // v3.21：落盘成功后记一次 diff（add/update/remove），形成 append-only 审计链。
       recordHistoryDiff()
+      // v4.14：主库落盘成功后才写归档审计行（假账比没账更糟）。
+      flushManifest()
       return true
     } catch (error) {
       if (
@@ -1742,6 +1796,8 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
 
   load()
   loadArchive()
+  // v4.14：上次维护结果（含「什么都没做」）从旁路文件恢复，重启后仍可观测。
+  loadMaintenance()
   // v3.21：历史 diff 的基线要取「刚加载完」的状态，否则第一次写会把所有存量都记成 add。
   resetHistoryBaseline()
   loadAliases()
@@ -1775,6 +1831,14 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   const isActive = (entry) => !isArchivedEntry(entry)
   const activeEntries = () => state.entries.filter(isActive)
   const usedChars = () => activeEntries().reduce((sum, entry) => sum + entry.text.length, 0)
+  // v4.14：预算状态（体检/工具同一口径，避免「health 报 ok、写入却被拒」的假安全）。
+  // degraded = 已用 ≥95%（新写入随时可能失败）；full = 已经写不进去（除删除/更新变短外无解）。
+  const budgetState = () => {
+    const used = usedChars()
+    const ratio = maxBytes > 0 ? used / maxBytes : 1
+    const state = used >= maxBytes ? 'full' : ratio >= BUDGET_DEGRADED_RATIO ? 'degraded' : 'ok'
+    return { used, max: maxBytes, remaining: Math.max(0, maxBytes - used), state }
+  }
   const publicEntry = (entry) => ({ ...entry })
   const renderOnce = (query, stats, scope, cwd) =>
     renderMemory(state.entries, {
@@ -1823,8 +1887,6 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   //   2) curate（下）：staleAfter 到期 + 宽限期未复核未使用 → 归档（不过时；status=deprecated + archivedAt，可 memory_restore）。
   // 不变量：只归档不删；pinned / kind=rule 豁免一切自动迁移；draft 只走 consolidate、不自动归档；
   //   维护写失败 try/catch 吞掉，绝不打断读路径（系统提示装配 / memory_list 都要继续）。
-  let lastMaintenanceAt = 0
-  let maintenanceStats = { lastRunAt: '', archived: 0, promoted: 0 }
   const runMaintenance = (force = false) => {
     const now = Date.now()
     if (!force && now - lastMaintenanceAt < CURATOR_INTERVAL_MS) {
@@ -1832,30 +1894,67 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     }
     lastMaintenanceAt = now
     const today = localDateOf()
-    let archived = 0
+    // v4.14：统计口径 = 本轮「看过 / 归档 / 巩固 / 为什么跳过」，每次运行都落盘。
+    // 没有这组计数，lastRunAt 只会停在「上次真的动过」的时刻，分不清「没跑」和「跑了没事可做」
+    // （Hermes 用 no-op 原因日志解决同一个问题；2026-11-12 取经）。
+    const skipped = { pinned: 0, rule: 0, draft: 0, notDue: 0, grace: 0 }
+    const archivedRows = []
+    let checked = 0
     let promoted = 0
     for (const entry of state.entries) {
       if (isArchivedEntry(entry)) continue
+      checked += 1
       // draft（未证实）只走 consolidate：被命中够多次 → 升 stable；不参与 curate（该由人确认，不是时间淘汰）。
       if (entry.status === 'draft') {
         if ((entry.usedCount ?? 0) >= CONSOLIDATE_MIN_USES) {
           entry.status = 'stable'
           entry.updatedAt = new Date(now).toISOString()
           promoted += 1
+        } else {
+          skipped.draft += 1
         }
         continue
       }
       // 硬规则 / 规则永不自动迁移（Hermes：pinned 豁免一切；rule 是「怎么做事」的长期约定）。
-      if (entry.pinned === true || entry.kind === 'rule') continue
+      if (entry.pinned === true) {
+        skipped.pinned += 1
+        continue
+      }
+      if (entry.kind === 'rule') {
+        skipped.rule += 1
+        continue
+      }
       const decision = curationDecision(entry, today, now)
-      if (!decision.archive) continue
+      if (!decision.archive) {
+        // curationDecision 只在「stale 但宽限期内仍活跃」时给理由；空串 = 还没到期。
+        if (decision.reason !== '') skipped.grace += 1
+        else skipped.notDue += 1
+        continue
+      }
+      // 信号必须在改状态之前算（判据读的是条目自己的时间戳，不依赖 status，但先算更稳）。
+      const signal = eliminationSignal(entry, today).signal
       entry.status = 'deprecated'
       entry.archivedAt = new Date(now).toISOString()
       entry.archiveReason = 'curator·' + decision.reason
-      archived += 1
+      archivedRows.push({ ts: entry.archivedAt, by: 'curator', id: entry.id, reason: entry.archiveReason, signal, chars: entry.text.length })
+    }
+    const archived = archivedRows.length
+    maintenanceStats = {
+      lastRunAt: new Date(now).toISOString(),
+      checked,
+      archived,
+      promoted,
+      skipped,
+      note: archived === 0 && promoted === 0 ? '本次没有可归档条目（staleAfter 未到期或仍在宽限期内）——不是没跑' : '',
+    }
+    try {
+      ensureStoreDir()
+      atomicWriteText(maintenanceFile, JSON.stringify(maintenanceStats, null, 2), { backup: false })
+    } catch (error) {
+      // 观测落盘失败不打断读路径；内存里的 stats 仍然是对的
     }
     if (archived > 0 || promoted > 0) {
-      maintenanceStats = { lastRunAt: new Date(now).toISOString(), archived, promoted }
+      queueManifest(archivedRows)
       try {
         persist()
       } catch (error) {
@@ -2004,6 +2103,9 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     pendingCandidates,
     addCandidate,
     runMaintenance,
+    budgetState,
+    maintenanceFile,
+    manifestFile,
     injectedBlock,
     get storeHealth() {
       return storeHealth

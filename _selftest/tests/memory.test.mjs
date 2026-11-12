@@ -1539,6 +1539,74 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   rmSync(mTmp, { recursive: true, force: true })
   ok('维护循环：draft 被命中 ≥3 次自动巩固为 stable')
 }
+// ---- v4.14 淘汰可观测 + 可审计：每次运行都留痕、归档写 manifest、预算状态不说谎 ----
+{
+  const obsTmp = makeTmp('dsh-memory-elimination-obs')
+  const old = new Date(Date.now() - 90 * 86400000).toISOString()
+  const seedHost = host(obsTmp)
+  await seedHost.defs.get('memory_add').execute({ text: '到期该被归档的旧事实', kind: 'fact' })
+  await seedHost.defs.get('memory_add').execute({ text: '钉住的硬规则不该动', kind: 'rule' })
+  await seedHost.defs.get('memory_add').execute({ text: '还没到期的普通事实', kind: 'fact' })
+  // memory_add 不能伪造「90 天前写入」，只能从存储侧构造到期条件（真实归档路径不打折扣）。
+  const obsFile = path.join(obsTmp, 'memory.json')
+  const obsData = JSON.parse(readFileSync(obsFile, 'utf8'))
+  for (const entry of obsData.entries) {
+    if (entry.text === '到期该被归档的旧事实') {
+      entry.staleAfter = '2026-01-01'
+      entry.addedAt = old
+      entry.updatedAt = old
+      entry.lastUsedAt = old
+    }
+  }
+  writeFileSync(obsFile, JSON.stringify(obsData, null, 2), 'utf8')
+
+  const obs = host(obsTmp)
+  obs.layers[0].text({}) // 触发 runMaintenance
+  const firstStatus = await obs.defs.get('memory_status').execute({})
+  assert.ok(typeof firstStatus.maintenance.lastRunAt === 'string' && firstStatus.maintenance.lastRunAt !== '', '维护必须留下运行时间（即使归档为 0 也要留）')
+  assert.ok(firstStatus.maintenance.checked >= 3, '检查数应覆盖全部生效条目，实际 ' + firstStatus.maintenance.checked)
+  assert.equal(firstStatus.maintenance.archived, 1, '只有到期那条该被归档')
+  assert.ok(firstStatus.maintenance.skipped.rule >= 1, 'kind=rule 必须计入跳过原因')
+  const manifestRows = readFileSync(path.join(obsTmp, 'archive-manifest.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  assert.equal(manifestRows.length, 1, '每条归档都应有 manifest 行')
+  assert.equal(manifestRows[0].by, 'curator')
+  assert.ok(String(manifestRows[0].reason).startsWith('curator·'), 'manifest 必须带可复核的归档理由')
+  assert.ok(typeof manifestRows[0].id === 'string' && manifestRows[0].id !== '', 'manifest 必须能指回条目 id')
+  // 重启后仍可观测：统计落旁路文件，不靠进程内存。
+  const reloadedObs = host(obsTmp)
+  const reloadStatus = await reloadedObs.defs.get('memory_status').execute({})
+  assert.equal(reloadStatus.maintenance.lastRunAt, firstStatus.maintenance.lastRunAt, '重载后应读回上次运行统计')
+  rmSync(obsTmp, { recursive: true, force: true })
+  ok('v4.14 维护每次运行都留痕（checked/skipped/archived）+ 归档写 manifest + 重启后可观测')
+}
+
+// ---- v4.14 预算状态：degraded / full 都与实际写入能力一致，不再报 ok ----
+{
+  // degraded：90/100 = 90% < 95% 仍 ok；95/100 = 95% 起报 degraded。
+  const dTmp = makeTmp('dsh-memory-budget-degraded')
+  const dHost = host(dTmp, { maxBytes: 100 })
+  await dHost.defs.get('memory_add').execute({ text: 'a'.repeat(90), kind: 'rule' })
+  assert.equal((await dHost.defs.get('memory_status').execute({})).budget.state, 'ok', '90% 仍 ok')
+  await dHost.defs.get('memory_add').execute({ text: 'b'.repeat(5), kind: 'rule' })
+  const near = await dHost.defs.get('memory_status').execute({})
+  assert.equal(near.budget.state, 'degraded', '已用 95% 应报 degraded')
+  assert.equal(near.health, 'degraded', 'health 不许在预算吃紧时还说 ok')
+  assert.equal(near.budget.remaining, 5)
+  rmSync(dTmp, { recursive: true, force: true })
+
+  // full：写到上限即 full，且下一次写入必然被拒（rule 豁免自动迁移，撞墙无候选可腾）。
+  const fTmp = makeTmp('dsh-memory-budget-full')
+  const fHost = host(fTmp, { maxBytes: 40 })
+  await fHost.defs.get('memory_add').execute({ text: 'c'.repeat(20), kind: 'rule' })
+  await fHost.defs.get('memory_add').execute({ text: 'd'.repeat(20), kind: 'rule' })
+  const full = await fHost.defs.get('memory_status').execute({})
+  assert.equal(full.budget.used, 40)
+  assert.equal(full.budget.state, 'full')
+  assert.equal(full.health, 'full')
+  await assert.rejects(() => fHost.defs.get('memory_add').execute({ text: 'e'.repeat(10), kind: 'rule' }))
+  rmSync(fTmp, { recursive: true, force: true })
+  ok('v4.14 预算状态：ok→degraded→full 与 health 同源，撞墙时状态不再说谎')
+}
 
 // ---- v3.19 自动入库 + 预算保护：真跑一遍 turn-stopping（闭包逻辑的集成测试） ----
 {

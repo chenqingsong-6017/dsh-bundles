@@ -171,6 +171,13 @@ export const CURATOR_STALE_GRACE_DAYS = 30
 //   用「读路径顺带跑 + 6h 节流」替代 Hermes 的「空闲触发」——每次读都扫全库写盘不可接受。
 export const CURATOR_INTERVAL_MS = 6 * 3600 * 1000
 
+// ── v4.14 淘汰可观测（取经 Hermes 的 no-op 原因日志 / run report，2026-11-12 取经）──
+// BUDGET_DEGRADED_RATIO：存储用到这个比例就报 degraded（默认 95% = 剩余不足 5%，新写入随时可能被拒）。
+//   为什么不是 100%：等写满才报警，用户已经撞墙了——2026-11-12 实测 11945/12000（99.5%）时 health 仍报 ok。
+export const BUDGET_DEGRADED_RATIO = 0.95
+// 归档审计文件单文件上限；超了先轮转成 .1（只留最近一份历史，不无限增长）。
+export const ARCHIVE_MANIFEST_MAX_BYTES = 2 * 1024 * 1024
+
 export const MAX_CANDIDATES_PER_TURN = 2
 
 export const CANDIDATE_TTL_DAYS = 7

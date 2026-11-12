@@ -7,8 +7,29 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
 - **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
-- **版本 / 引擎**：v4.4.0（2026-11-05）。v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+- **版本 / 引擎**：v4.14.0（2026-11-12）。v4.14.0 加**淘汰可观测 + 可审计**（每次维护运行都留痕 / 归档写 manifest / budget 状态与 health 同源，见 CHANGELOG 与下节）；v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
+
+## 淘汰可观测 + 可审计（v4.14 · 2026-11-12）
+
+起因是一次真实观测：记忆 11945/12000（99.5%）时 `memory_add` 已被拒，`memory_status.health` 仍报 `ok`、`lastRunAt` 仍为空。
+三个观测值连起来说明两件事：**诊断会说谎**（说 ok 却写不进）、**维护无法区分「没跑」和「跑了没事可做」**。
+取经 Hermes Agent 的 no-op 原因日志与 curator run report（`agent/curator.py`、`agent/context_compressor_prune.py`）后补上：
+
+| 文件 / 字段 | 内容 | 为什么这么设计 |
+| --- | --- | --- |
+| `maintenance.json`（旁路小文件） | 每次运行都写 `lastRunAt / checked / archived / promoted / skipped{pinned,rule,draft,notDue,grace} / note` | 不进主库 state：不碰 schema / SQLite 迁移，也不为报个数重写整个记忆库；归档为 0 也写，`note` 明说「不是没跑」 |
+| `archive-manifest.jsonl` | 每条归档一行：`ts/by/id/reason/signal/chars`；超 2MiB 轮转 `.1` | 审计要能回答「为什么是它」；**主库落盘成功后才追加**，杜绝假账 |
+| `memory_status.budget` | `{used, max, remaining, state}`，`degraded`=≥95%，`full`=已写满 | 与 `health` 同源：`degraded/full` 时 `health` 不再报 ok |
+
+### 验证记录（真机，2026-11-12）
+
+- 单测：`node _selftest/tests/memory.test.mjs` → **146 项通过，退出码 0**（新增 2 项：维护留痕 + manifest + 重启可观测；预算三档 ok→degraded→full 与写入能力逐档对齐）。
+- 真机（2026-11-12 12:33，`apply-check.mjs --reload` 后实测）：
+  `codeFingerprint = 4.14.0-elimination-observe`（证明进程里是新代码）；
+  `health = degraded`（旧版此处报 ok）；`budget = {used:11945, max:12000, remaining:55, state:"degraded"}`；
+  `maintenance = {lastRunAt:"2026-11-12T04:33:29.343Z", checked:113, archived:0, skipped:{pinned:20,rule:19,draft:0,notDue:74,grace:0}, note:"本次没有可归档条目…——不是没跑"}`。
+  这一组数正是这次要修的假安全：**同一时刻，旧的 health 报 ok，而 memory_add 已被拒**。
 
 ## 实体解析（v4.10）
 
