@@ -1,5 +1,5 @@
 // 路径安全 + 红线目录 + 存储位置。
-// 机械复制自 dsh-butler-tidy/lib/path-safety.js（2026-11-12）：红线清单（9 项）、fail-closed、
+// 机械复制自 dsh-butler-tidy/lib/path-safety.js（2026-11-12）：红线清单（10 项，与源逐项一致）、fail-closed、
 // junction / UNC / \\?\ 防护逐字节保留；唯一差异是 storeLocation（子目录名 tidy → negative-asset，返回字段只留 dir / lastScan）。
 // 未使用的 lockHint / isUnder 也一并保留：与源文件 diff 审计时能一眼看出偏差。
 import { lstatSync, realpathSync, existsSync } from 'node:fs'
@@ -116,6 +116,7 @@ export function protectedDirs(config) {
     'D:\\AI\\deepsek harness',
     'D:\\AI\\hermes-agent',
     'D:\\AI-date\\workbuddy-date\\学习',
+    'D:\\_archive',
   ]
   if (Array.isArray(config?.protectDirs)) {
     for (const item of config.protectDirs) {

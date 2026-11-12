@@ -118,7 +118,7 @@ ok('源码零删除/移动/改名 API（unlink / rm / rmdir / rename / copy 全�
 // ── 3) 红线 fail-closed：UNC / 设备路径 / junction / 空值 ──
 const safety = await import(pathToFileURL(path.join(BUNDLE, 'lib', 'path-safety.js')).href)
 const guard = safety.protectedDirs({})
-assert.equal(guard.length, 9, '默认红线必须 9 项')
+assert.ok(guard.length >= 9, '默认红线不得少于 9 项（实际 ' + guard.length + '；权威判据是下面第 4 节与 dsh-butler-tidy 逐项一致，别在这里写死数字）')
 assert.equal(safety.isProtected('\\\\?\\D:\\AI\\dsh-bundles\\x', guard), true, '\\?\ 设备路径必须 fail-closed')
 assert.equal(safety.isProtected('\\\\server\\share\\x', guard), true, 'UNC 必须 fail-closed')
 assert.equal(safety.isProtected('D:\\AI\\dsh-bundles\\dsh-memory\\index.js', guard), true, '红线内子路径必须命中')
@@ -387,7 +387,7 @@ const statusScan = mockStatus.registered.find((definition) => definition.name ==
 const fresh = await statusTool.execute({})
 assert.equal(fresh.ready, true)
 assert.equal(fresh.lastScanAt, '')
-assert.equal(fresh.protectCount, 9)
+assert.equal(fresh.protectCount, guard.length, 'protectCount 必须等于默认红线数（与 dsh-butler-tidy 一致，不写死）')
 assert.equal(fresh.storeDir, STORE_STATUS)
 assert.equal(fresh.lastError, '')
 assert.match(fresh.pathSafety, /path-safety/)
