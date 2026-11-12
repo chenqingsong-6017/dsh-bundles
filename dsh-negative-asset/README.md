@@ -102,3 +102,5 @@ lib/path-safety.js 是机械复制（红线 9 项、fail-closed、junction/UNC �
 ## 9. 回滚
 
 整体删插件目录即可（或 plugin_manager remove_bundle）；数据目录删 D:\AI\dsh-data\negative-asset；P0 不产生任何「需要回滚的删除」。
+
+> **能力边界（与相邻插件的分工）以工作区权威源 `_contracts/plugin-boundaries.md` 为准**（2026-11-12 立；与 tidy 的语义差异见该文件 §2 与本文 §0）。

@@ -226,3 +226,5 @@ Hazel / File Juggler（按类型、日期、名称匹配）。
 ## 2026-11-02 升级记录
 
 - 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：红线保护目录当前不存在时 tidy_status 点名告警（#37）。
+
+> **能力边界（与相邻插件的分工）以工作区权威源 `_contracts/plugin-boundaries.md` 为准**（2026-11-12 立；与 negative-asset 的语义差异见该文件 §2）。

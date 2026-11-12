@@ -119,3 +119,5 @@ plugin_manager action=remove_bundle target=@local/dsh-checkpoint
 ## 2026-11-02 升级记录
 
 - 按 `_reports/plugin-falsepositive-scan-2026-11-01.md` 修：restore/forget/diff 严格匹配：歧义命中 ≥2 个直接拒绝并列出候选（#29，高）。
+
+> **能力边界（与相邻插件的分工）以工作区权威源 `_contracts/plugin-boundaries.md` 为准**（2026-11-12 立；与 batch-write / tidy / negative-asset 等的关系见该文件 §2）。

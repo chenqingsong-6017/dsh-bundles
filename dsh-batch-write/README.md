@@ -34,3 +34,4 @@
 ## 验证
 
 见 `_selftest/tests/batch-write.test.mjs`（本插件自己的行为断言）。
+> **能力边界（与相邻插件的分工）以工作区权威源 `_contracts/plugin-boundaries.md` 为准**（2026-11-12 立；与 checkpoint 的关系见该文件 §2）。
