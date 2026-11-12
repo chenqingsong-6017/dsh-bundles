@@ -2,6 +2,29 @@
 
 本文件于 2026-10-31 按「改到谁补谁」的规则建立；当前版本为存量版本，本节为补记。
 
+## v1.2.1（2026-11-12）
+
+**修误归档事故：分 scope 的目录视图把「这次没看见」当成「目录里没了」，10 个仍在目录里的技能被归档。**
+
+### 事故（真机数据）
+- 账本里 10 条 `archivedReason=not-in-catalog` 记录全部还在目录里、`catalogSeenAt` 非空——被错误归档。
+- 根因：`refreshCatalog` 每次刷新都把 `catalogAt` 推到当下；`skills.list()` 是分 scope 的视图，
+  一次只回 2 个技能的视图让另外 10 个的 `catalogSeenAt < catalogAt`，`decideCuration` 判 not-in-catalog 归档。
+
+### Fixed
+- `decideCuration`：「目录里已经没了」= **连续缺席 ≥2 次 + 最后一次缺席满 7 天**，且目录刷新不超过 7 天；
+  从未见过的记录（别的 scope / preset 层）保持不判。单次没看见不再构成归档理由。
+- `refreshCatalog`：空视图不算有效刷新；看到清零 `catalogMissCount`，没看到只累加并记 `lastCatalogMissAt`。
+- 新增持久化字段 `catalogMissCount` / `lastCatalogMissAt`（旧账本按 0 处理，向后兼容）。
+- 合并建议加硬闸：必须共享至少一个**名字词**才可能成组（真机曾按描述通用词聚出 official-plugins + personalized-pages 假组）。
+
+### 数据修复
+- 10 条误归档全部 `skill_usage_restore`，`archived` 10 → 0。
+
+### 验证
+- 单测 40 项通过（+7）。
+- 真机：恢复后 `skill_usage` counts `{used:7, unused:10, archived:0}`；`skill_consolidation_plan` 由
+  `scanned=2, clusters=[]` 变为 `scanned=12, clusters=[office 组(4) / office 工具组(3)]`。
 ## v1.2.0（2026-11-12）
 
 **合并建议：淘汰机制的「中间档」**——照 Hermes 的 umbrella consolidation 抄判据，按 DSH 能力边界降级成只读报告。

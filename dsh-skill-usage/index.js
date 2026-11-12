@@ -109,19 +109,26 @@ export function classifyUsage(record, now, thresholds) {
   return { state, days: Math.round(days * 10) / 10, anchoredAt: new Date(anchor).toISOString(), firstSeenDays }
 }
 
+// 「目录里已经没了」的判定门槛（2026-11-12 事故后的修正）：
+// 旧逻辑拿「单次刷新没看见」当 removal，但 DSH 的目录视图是分 scope 的——
+// 一次只回 2 个技能的视图会把 catalogAt 推到当下，另外 10 个仍在目录里的技能被误判 not-in-catalog 归档。
+// 现在要求「连续缺席 ≥2 次 + 最后一次缺席满 7 天」，且刷新过的目录才算可信。
+export const NOT_IN_CATALOG_MIN_MISSES = 2
+export const NOT_IN_CATALOG_MISS_DAYS = 7
+
 /**
  * 纯函数：账本条目该不该被自动归档（Curator 动作的唯一判据，导出以便单测）。
  *
  * 与 Hermes Curator 对齐的部分：14/30 天阈值、从不删除（只打 archivedAt，可 restore）、只动自己的账本
  * （技能文件是只读视图，一个字都不碰）。
  * 多出来的两条（因为 DSH 没有 gateway 定时器，必须自己判断得更稳）：
- *   - 目录里已经没了的技能直接归档（not-in-catalog）——它永远等不到使用记录，留着只会干扰判断；
- *   - 目录名单不可信（catalogAt 缺失）时**不归档**，宁可漏也不误伤。
+ *   - 「目录里已经没了」= 连续缺席 ≥2 次且满 7 天（单次没看见不算——scope 视图会少报）；
+ *   - 目录名单不可信（没刷新过 / 刷新超过 7 天 / 这条从未被见过）时**不归档**，宁可漏也不误伤。
  *
- * @param {{uses?:number,firstSeenAt?:string,lastUsedAt?:string,reviewedAt?:string,catalogSeenAt?:string,archivedAt?:string}} record
+ * @param {{uses?:number,firstSeenAt?:string,lastUsedAt?:string,reviewedAt?:string,catalogSeenAt?:string,catalogMissCount?:number,lastCatalogMissAt?:string,archivedAt?:string}} record
  * @param {number} now epoch ms
  * @param {{staleAfterDays:number,archiveAfterDays:number}} thresholds
- * @param {string|null} catalogAtIso 账本级目录刷新时间
+ * @param {string|null} catalogAtIso 账本级「最近一次成功目录刷新」时间
  * @returns {{action:'archive'|'none', reason?:string, skip?:'alreadyArchived'|'catalogUntrusted'|'notDue'|'neverUsed'}}
  */
 export function decideCuration(record, now, thresholds, catalogAtIso) {
@@ -129,19 +136,23 @@ export function decideCuration(record, now, thresholds, catalogAtIso) {
   // 跳过原因回在返回值里：lastCuration 要按同一套判据分桶，
   // 调用方再去猜「为什么没归档」就等于造了第二套口径。
   if (typeof record.archivedAt === 'string' && record.archivedAt !== '') return { action: 'none', skip: 'alreadyArchived' }
-  const catAt = typeof catalogAtIso === 'string' ? Date.parse(catalogAtIso) : NaN
-  const seenAt = typeof record.catalogSeenAt === 'string' ? Date.parse(record.catalogSeenAt) : NaN
-  const inCatalog = Number.isFinite(catAt) && Number.isFinite(seenAt) ? seenAt >= catAt : null
-  if (inCatalog === false) return { action: 'archive', reason: 'not-in-catalog' }
   const state = classifyUsage(record, now, thresholds)
   if (state.state !== 'archive-candidate') {
     // new = 从没被加载过（firstSeenAt 不冒充锚点）：这种技能不该按「陈旧」记账，
     // 所以单独一桶，方便看出「账本里躺着的其实是从没用过的」。
     return { action: 'none', skip: state.state === 'new' ? 'neverUsed' : 'notDue' }
   }
-  if (inCatalog === true) return { action: 'archive', reason: 'stale-' + thresholds.archiveAfterDays + 'd' }
-  // inCatalog === null：目录名单不可信，不归档（宁可漏，不误伤）
-  return { action: 'none', skip: 'catalogUntrusted' }
+  const catAt = typeof catalogAtIso === 'string' ? Date.parse(catalogAtIso) : NaN
+  // 目录从未成功刷新 / 刷新结果已过期：本轮不判（宁可漏，不误伤）。
+  if (!Number.isFinite(catAt) || now - catAt > NOT_IN_CATALOG_MISS_DAYS * 86400000) return { action: 'none', skip: 'catalogUntrusted' }
+  const seenAt = typeof record.catalogSeenAt === 'string' ? Date.parse(record.catalogSeenAt) : NaN
+  const misses = Number.isInteger(record.catalogMissCount) && record.catalogMissCount > 0 ? record.catalogMissCount : 0
+  // 这条从未在目录里被见过（不同 scope 的 preset 层技能）：不知道 ≠ 没有。
+  if (!Number.isFinite(seenAt) && misses === 0) return { action: 'none', skip: 'catalogUntrusted' }
+  const missAt = typeof record.lastCatalogMissAt === 'string' ? Date.parse(record.lastCatalogMissAt) : NaN
+  const missingLong = misses >= NOT_IN_CATALOG_MIN_MISSES && Number.isFinite(missAt) && now - missAt >= NOT_IN_CATALOG_MISS_DAYS * 86400000
+  if (missingLong) return { action: 'archive', reason: 'not-in-catalog' }
+  return { action: 'archive', reason: 'stale-' + thresholds.archiveAfterDays + 'd' }
 }
 
 /** 技能名归一化：去首尾空白 + 大小写折叠（用于宽容匹配，不改存储里的原名）。 */
@@ -221,8 +232,9 @@ export function planConsolidation(entries, opts) {
     if (!raw || typeof raw.name !== 'string' || raw.name.trim() === '') continue
     if (typeof raw.archivedAt === 'string' && raw.archivedAt !== '') continue
     const tokens = skillTokens(raw.name + ' ' + String(raw.description ?? ''))
+    const nameTokens = skillTokens(raw.name)
     if (tokens.size === 0) continue
-    rawItems.push({ ...raw, tokens })
+    rawItems.push({ ...raw, tokens, nameTokens })
   }
   // 文档频次：既是「泛词」判据，也是伞名的排序依据（组内越常见的词越像主题词）。
   const frequency = new Map()
@@ -231,6 +243,9 @@ export function planConsolidation(entries, opts) {
   const items = rawItems.map((item) => ({
     ...item,
     informative: new Set([...item.tokens].filter((token) => (frequency.get(token) ?? 0) <= maxDf)),
+    // 名字词单独留着：描述里全是通用词（load/user/app/before），只按描述相似会造假组
+    // （2026-11-12 真机：official-plugins 与 personalized-pages 因描述撞词被聚到一起）。
+    nameTokens: new Set([...item.nameTokens].filter((token) => (frequency.get(token) ?? 0) <= maxDf)),
   }))
   const parent = items.map((_, index) => index)
   const find = (index) => {
@@ -246,6 +261,9 @@ export function planConsolidation(entries, opts) {
   const similarities = new Map()
   for (let i = 0; i < items.length; i += 1) {
     for (let j = i + 1; j < items.length; j += 1) {
+      // 硬闸：两个技能必须共享至少一个「名字词」才可能是同一主题；只靠描述撞词不算。
+      const sharesName = [...items[i].nameTokens].some((token) => items[j].nameTokens.has(token))
+      if (!sharesName) continue
       const sim = overlapCoefficient(items[i].informative, items[j].informative)
       if (sim <= 0 || sim < threshold) continue
       similarities.set(i + ':' + j, sim)
@@ -365,6 +383,8 @@ export function apply(ctx, config) {
           ...(typeof value.reviewedAt === 'string' ? { reviewedAt: value.reviewedAt } : {}),
           ...(typeof value.note === 'string' ? { note: value.note } : {}),
           ...(typeof value.catalogSeenAt === 'string' ? { catalogSeenAt: value.catalogSeenAt } : {}),
+          ...(Number.isInteger(value.catalogMissCount) && value.catalogMissCount > 0 ? { catalogMissCount: value.catalogMissCount } : {}),
+          ...(typeof value.lastCatalogMissAt === 'string' ? { lastCatalogMissAt: value.lastCatalogMissAt } : {}),
           ...(typeof value.archivedAt === 'string' ? { archivedAt: value.archivedAt } : {}),
           ...(typeof value.archivedReason === 'string' ? { archivedReason: value.archivedReason } : {}),
           ...(Number.isInteger(value.patchCount) && value.patchCount > 0 ? { patchCount: value.patchCount } : {}),
@@ -391,17 +411,31 @@ export function apply(ctx, config) {
   async function refreshCatalog(view = {}) {
     try {
       const summaries = await skills.list(view)
+      // 空视图不算一次有效刷新：既不推进 catalogAt，也不记缺席（宁可漏，不误伤）。
+      if (!Array.isArray(summaries) || summaries.length === 0) return catalog.size
       const seenAt = new Date().toISOString()
+      const seenNames = new Set()
       for (const summary of summaries) {
-        if (!summary || typeof summary.name !== 'string') continue
+        if (!summary || typeof summary.name !== 'string' || summary.name === '') continue
+        seenNames.add(summary.name)
         catalog.set(summary.name, {
           source: summary.source,
           provider: summary.provider,
           description: summary.description,
         })
         // 目录里看到的技能打上时间戳：体检据此区分「目录里还有」与「账本残留」。
+        // 看到即清零缺席计数：不同 scope 的视图会轮流漏掉对方，单次没看见不算「没了」。
         const record = ensureRecord(summary.name)
         record.catalogSeenAt = seenAt
+        record.catalogMissCount = 0
+        delete record.lastCatalogMissAt
+      }
+      // 只有「见过目录」的记录才累计缺席；从没见过的（preset 层/别的 scope）不进来。
+      for (const [skillName, record] of records) {
+        if (seenNames.has(skillName)) continue
+        if (typeof record.catalogSeenAt !== 'string' || record.catalogSeenAt === '') continue
+        record.catalogMissCount = (Number.isInteger(record.catalogMissCount) ? record.catalogMissCount : 0) + 1
+        record.lastCatalogMissAt = seenAt
       }
       catalogAt = seenAt
       schedulePersist()
@@ -789,6 +823,7 @@ export function apply(ctx, config) {
             ...(row.source ? { source: row.source } : {}),
             ...(row.archivedAt ? { archivedAt: row.archivedAt } : {}),
             ...(row.archivedReason ? { archivedReason: row.archivedReason } : {}),
+          ...(row.catalogMissCount ? { catalogMissCount: row.catalogMissCount } : {}),
           })),
           ...(planned === null
             ? {}

@@ -33,8 +33,18 @@ ok('刚复核过的旧技能 = 提醒已续期')
 const seenNow = ago(0)
 assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), catalogSeenAt: seenNow }, now, thresholds, seenNow).reason, 'stale-30d')
 ok('curator：目录内 40 天没用 → 归档（stale-30d，活动衰减非从未用过）')
-assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), catalogSeenAt: ago(3) }, now, thresholds, seenNow).reason, 'not-in-catalog')
-ok('curator：本次目录里没看见（上次是 3 天前）→ 归档（not-in-catalog）')
+assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), catalogSeenAt: seenNow }, now, thresholds, seenNow).reason, 'stale-30d')
+ok('curator：单次没看见不算「没了」→ 仍按陈旧归档（stale-30d），不误判 not-in-catalog')
+assert.equal(decideCuration({ uses: 1, lastUsedAt: ago(40), catalogSeenAt: seenNow, catalogMissCount: 2, lastCatalogMissAt: ago(10) }, now, thresholds, seenNow).reason, 'not-in-catalog')
+ok('curator：连续缺席 2 次且最后一次满 7 天 → 才归档（not-in-catalog）')
+assert.equal(decideCuration({ uses: 1, lastUsedAt: ago(40), catalogSeenAt: seenNow, catalogMissCount: 2, lastCatalogMissAt: ago(3) }, now, thresholds, seenNow).reason, 'stale-30d')
+ok('curator：缺席刚满 2 次但未满 7 天 → 先按陈旧归档，不判「目录里没了」')
+assert.equal(decideCuration({ uses: 1, lastUsedAt: ago(40), catalogSeenAt: seenNow, catalogMissCount: 1, lastCatalogMissAt: ago(30) }, now, thresholds, seenNow).reason, 'stale-30d')
+ok('curator：只缺席 1 次 → 不判「目录里没了」')
+assert.equal(decideCuration({ uses: 1, lastUsedAt: ago(40), catalogSeenAt: seenNow }, now, thresholds, ago(10)).action, 'none')
+ok('curator：目录刷新结果超过 7 天 → 本轮不判（catalogUntrusted）')
+assert.equal(decideCuration({ uses: 1, lastUsedAt: ago(40) }, now, thresholds, seenNow).action, 'none')
+ok('curator：从未在目录里见过的记录（别的 scope）→ 不归档，不知道 ≠ 没有')
 assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(40), catalogSeenAt: seenNow }, now, thresholds, null).action, 'none')
 ok('curator：目录名单不可信（catalogAt 缺失）→ 不归档，宁可漏不误伤')
 assert.equal(decideCuration({ uses: 1, firstSeenAt: ago(90), lastUsedAt: ago(20), catalogSeenAt: seenNow }, now, thresholds, seenNow).action, 'none')
@@ -314,6 +324,48 @@ ok('无任何时间锚点 = unknown')
   }
 }
 
+// ── v1.2.1 回归：分 scope 的目录视图只回部分技能时，不许把没看见的技能误判 not-in-catalog ──
+// 事故（2026-11-12）：一次只回 2 个技能的视图把 catalogAt 推到当下，10 个仍在目录里的技能被归档。
+{
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const daysAgo = (days) => new Date(Date.now() - days * DAY).toISOString()
+  const storeDir = mkdtempSync(path.join(os.tmpdir(), 'skill-usage-v121-'))
+  writeFileSync(
+    path.join(storeDir, 'usage.json'),
+    JSON.stringify({
+      version: 1,
+      skills: {
+        P: { uses: 2, firstSeenAt: daysAgo(30), lastUsedAt: daysAgo(1) },
+        Q: { uses: 1, firstSeenAt: daysAgo(30), lastUsedAt: daysAgo(2) },
+      },
+    }),
+    'utf8',
+  )
+  const { ctx, registered } = makeMockContext()
+  let phase = 'full'
+  ctx.skills = { list: async () => (phase === 'full' ? [{ name: 'P' }, { name: 'Q' }] : [{ name: 'P' }]) }
+  mod.apply(ctx, { storeDir })
+  await sleep(350) // 挂载：完整目录视图
+  phase = 'partial'
+  const usageTool = registered.find((tool) => tool.name === 'skill_usage')
+  const statusTool = registered.find((tool) => tool.name === 'skill_usage_status')
+  await usageTool.execute({}) // 触发一次「只看见 P」的刷新
+  await sleep(300)
+  const afterPartial = JSON.parse(readFileSync(path.join(storeDir, 'usage.json'), 'utf8'))
+  assert.equal(afterPartial.skills.Q.archivedAt, undefined, '仍在用、只是在这次视图里没出现的技能，绝不能被归档')
+  assert.equal(afterPartial.skills.Q.catalogMissCount, 1, '缺席要计数，供「连续缺席」判据用')
+  assert.equal((await statusTool.execute({})).lastCuration.archived, 0)
+  // 再来一次 partial：缺席 2 次但未满 7 天 → 仍不许归档（陈旧由 stale 阈值管，不由缺席管）
+  await usageTool.execute({})
+  await sleep(300)
+  const afterSecond = JSON.parse(readFileSync(path.join(storeDir, 'usage.json'), 'utf8'))
+  assert.equal(afterSecond.skills.Q.archivedAt, undefined, '连续缺席 2 次但未满 7 天：不判 not-in-catalog')
+  assert.equal(afterSecond.skills.Q.catalogMissCount, 2)
+  await sleep(250)
+  rmSync(storeDir, { recursive: true, force: true })
+  ok('分 scope 视图缺人不误归档：缺席只计数，不因单次/两次未见就 not-in-catalog')
+}
+
 // ── v1.2.0：合并建议（只读中间档）——纯函数判据 + 工具零副作用 ──
 {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -347,6 +399,16 @@ ok('无任何时间锚点 = unknown')
 
   assert.equal(planConsolidation(entries, { threshold: 0.9 }).clusters.length, 0, '阈值必须真的起作用')
   ok('planConsolidation：阈值生效（0.9 时同组也散开）')
+
+  // 回归（2026-11-12 真机假组）：名字毫无关系、只是描述里撞了几个通用词 → 不许成组。
+  {
+    const unrelated = planConsolidation([
+      { name: 'official-plugins', description: 'Asks the user before loading app plugins' },
+      { name: 'personalized-pages', description: 'Asks the user before creating an app page' },
+    ])
+    assert.equal(unrelated.clusters.length, 0, '共享描述词但名字无共同主题词：不能聚成一组')
+  }
+  ok('planConsolidation：名字无共同词时，描述撞词也不成组（真机假组回归）')
 
   // 工具端到端：只读——调用后 usage.json 逐字节不变，且不写 manifest
   const storeDir = mkdtempSync(path.join(os.tmpdir(), 'skill-usage-v12-'))
