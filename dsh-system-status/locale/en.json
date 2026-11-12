@@ -1,0 +1,12 @@
+{
+  "meta": {
+    "title": "System Overview",
+    "description": "One-call workspace health: runs the workspace system-health probe and returns structured per-check rows (rules/memory/links/pending). Read-only; does not reimplement the probe."
+  },
+  "tools": {
+    "system_status": {
+      "name": "System status",
+      "description": "Whole-workspace health in one call (layer/name/value/limit/ok/note). Use before and after broad changes instead of querying each plugin status tool."
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# dsh-system-status bundle patch.
+#
+# 不写死绝对路径：默认用当前工作区 + 系统 node。
+# 想指向别的工作区或加长超时，在 profile 的 cordis.patch.yml 里覆盖：
+#
+#   - id: system-status
+#     name: "@local/dsh-system-status"
+#     config:
+#       workspaceDir: 'D:\\AI-date\\dsh-date\\dsh-创建'
+#       timeoutMs: 120000
+- insert:
+    - id: system-status
+      name: '@local/dsh-system-status'

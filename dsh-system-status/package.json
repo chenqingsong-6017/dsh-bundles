@@ -1,0 +1,29 @@
+{
+  "name": "@local/dsh-system-status",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.0 <0.3.0"
+  },
+  "type": "module",
+  "description": "One-call workspace health: aggregate the workspace system-health probe into a single system_status tool, so the model sees the whole instead of querying 22 per-plugin status tools one by one.",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "main": "index.js"
+}
