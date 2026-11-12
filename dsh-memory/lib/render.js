@@ -271,12 +271,16 @@ export function renderMemory(allEntries, options) {
           : `⚠ 另有 ${dropped.length} 条未注入（用 memory_search 按 id 或关键词取全文）`
         : ''
     const footer = `（全文 ${full.length}${relevant.length > 0 ? ` · 相关 ${relevant.length}` : ''} · 索引 ${indexed.length}${compact.length > 0 ? ` · 跨域 ${compact.length}` : ''}${dropped.length > 0 ? ` · 未注入 ${dropped.length}` : ''}；跨域或更早的记忆用 memory_search 按 id / 关键词取）`
+    // v4.14（2026-11-12）：注入分层——模仿 claude-mem ContextBuilder 的分段渲染。
+    // 只加分隔行、不改预算分配与排序；Previously/Timeline 需会话事件流（P2 observer），不硬造。
     const block = [
       '<memory>',
       MEMORY_HEADER,
       ...(hasMarks ? [TRUST_LEGEND] : []),
+      ...(full.length + relevant.length > 0 ? ['— 常驻（硬规则/本轮相关） —'] : []),
       ...full.map(lineFull),
       ...relevant.map(lineRelevant),
+      ...(indexed.length + compact.length > 0 ? ['— 索引（按需 memory_search） —'] : []),
       ...indexed.map(lineIndex),
       ...compact.map(lineIndexCompact),
       ...(diagnostic ? [diagnostic] : []),
