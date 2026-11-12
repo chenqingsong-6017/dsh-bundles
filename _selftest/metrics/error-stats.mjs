@@ -18,6 +18,47 @@ export function signature(text) {
 }
 
 /**
+ * 错误分类学：按「谁该修」分，而不是按报错文本分。
+ *
+ * 2026-11-12 从 tool-error-rate.mjs 搬到这里：分类逻辑必须能被单测
+ * （`_selftest/tests/error-classify.test.mjs`），否则改了分类器没有任何东西能证明它没误分类。
+ * 顺序即优先级：越具体的形态越靠前；最后的 `code/other` 是兜底桶，理想情况应为 0。
+ */
+export function classify(msg) {
+  const m = String(msg).toLowerCase()
+  // run_code 的失败形态细分：此前这些大多掉进 code/other（曾占基线 55.3%）或 validation，
+  // 归因器只能说「习惯」，给不出改法。细分后每一类都能落到具体修法。
+  if (/code run failed|program completion|lossless json|toolcallerror/.test(m)) {
+    if (/unknown tool/.test(m)) return 'run_code 工具名错'
+    if (/timed out|timeout|deadline/.test(m)) return 'run_code 超时'
+    if (/invalid-output|lossless json/.test(m)) return 'run_code 输出格式'
+    if (/syntaxerror|unexpected character|unexpected token|unterminated|requires parens|invalid time value|expected /.test(m)) return 'run_code 语法错'
+    return 'run_code 其他异常'
+  }
+  // 直接的工具调用报「工具不存在」（不在 run_code 内）：靠报错文本能认出来，应提示可用工具名
+  if (/unknown tool/.test(m)) return '工具名错（unknown tool）'
+  if (/non-public ip|fetch failed|getaddrinfo|enotfound|econnrefused|econnreset|socket hang up|tls handshake|cross-origin redirect/.test(m)) return 'network 通道'
+  // 顺序理由：`old_string was not found` 属 edit 失误（不是路径错），由下面 edit 规则先认；
+  // 而 `cannot read X: not found` 是路径错、不是写冲突，必须在 filesystem 之前单独认出来。
+  if (/cannot read .*(not found|no such file)|enoent/.test(m)) return 'not-found 路径错'
+  if (/cannot modify|cannot read|fs_stale_version|ebusy|eperm|being used by another/.test(m)) return 'filesystem 写冲突/歧义'
+  if (/expected a semicolon|expected ','|unexpected character|unterminated|requires parens|invalid time value/.test(m)) return 'code 语法/逻辑'
+  if (/matched \d+ times|expected |old_string was not found|must differ|offset \d+ is out of range/.test(m)) return 'edit 用法失误'
+  if (/timed out|timeout|deadline/.test(m)) return 'timeout 超时'
+  if (/aborted|abort/.test(m)) return 'aborted 被打断'
+  if (/session has ended|start_session/.test(m)) return 'session 生命周期'
+  if (/not found|no such file|enoent/.test(m)) return 'not-found 路径错'
+  // 从 code/other 拆出（2026-11-12 用 --dump-errors 逐条看过原文）
+  if (/记忆已占用|单条记忆最多|超预算/.test(m)) return '记忆配额超限'
+  if (/protocol is blocked/.test(m)) return '浏览器协议限制'
+  if (/is not a function/.test(m)) return '插件渲染错'
+  // 已修的旧 bug：留独立类，观察它是否彻底消失（归因 owner=fixed）
+  if (/memory_update 需要新的 text/.test(m)) return '已修：memory_update 元数据'
+  if (/validation|invalid|schema|arguments/.test(m)) return 'validation 参数错'
+  return 'code/other'
+}
+
+/**
  * 把「签名 → 按天计数」汇总成复发指标。
  *
  * 稳定性判据（钱学森式「扰动后能否回到平衡」的可测化）：

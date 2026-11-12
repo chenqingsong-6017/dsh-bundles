@@ -20,7 +20,7 @@
 import { existsSync, readFileSync, readdirSync, statSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
-import { signature, summarizeRepeat, comparePhase } from './error-stats.mjs'
+import { signature, summarizeRepeat, comparePhase, classify } from './error-stats.mjs'
 
 const argv = process.argv.slice(2)
 const arg = (name, dflt) => {
@@ -95,37 +95,8 @@ function listSessionFiles(root) {
   return files
 }
 
-/** 错误分类学：按「谁该修」分，而不是按报错文本分。 */
-function classify(msg) {
-  const m = msg.toLowerCase()
-  // run_code 的失败形态细分（2026-11-12）：此前这些大多掉进 code/other（30 天基线里占 55.3%）或 validation，
-  // 归因器只能说「习惯」，给不出改法。细分后每一类都能落到具体修法。
-  if (/code run failed|program completion|lossless json|toolcallerror/.test(m)) {
-    if (/unknown tool/.test(m)) return 'run_code 工具名错'
-    if (/timed out|timeout|deadline/.test(m)) return 'run_code 超时'
-    if (/invalid-output|lossless json/.test(m)) return 'run_code 输出格式'
-    if (/syntaxerror|unexpected character|unexpected token|unterminated|requires parens|invalid time value|expected /.test(m)) return 'run_code 语法错'
-    return 'run_code 其他异常'
-  }
-  // 直接的工具调用报「工具不存在」（不在 run_code 内）：靠报错文本能认出来，应提示可用工具名
-  if (/unknown tool/.test(m)) return '工具名错（unknown tool）'
-  if (/non-public ip|fetch failed|getaddrinfo|enotfound|econnrefused|econnreset|socket hang up|tls handshake|cross-origin redirect/.test(m)) return 'network 通道'
-  if (/cannot modify|cannot read|fs_stale_version|ebusy|eperm|being used by another/.test(m)) return 'filesystem 写冲突/歧义'
-  if (/expected a semicolon|expected ','|unexpected character|unterminated|requires parens|invalid time value/.test(m)) return 'code 语法/逻辑'
-  if (/matched \d+ times|expected |old_string was not found|must differ|offset \d+ is out of range/.test(m)) return 'edit 用法失误'
-  if (/timed out|timeout|deadline/.test(m)) return 'timeout 超时'
-  if (/aborted|abort/.test(m)) return 'aborted 被打断'
-  if (/session has ended|start_session/.test(m)) return 'session 生命周期'
-  if (/not found|no such file|enoent/.test(m)) return 'not-found 路径错'
-  // 2026-11-12 从 code/other 拆出（--dump-errors 逐条看过原文）
-  if (/记忆已占用|单条记忆最多|超预算/.test(m)) return '记忆配额超限'
-  if (/protocol is blocked/.test(m)) return '浏览器协议限制'
-  if (/is not a function/.test(m)) return '插件渲染错'
-  // 已修的旧 bug：留独立类，观察它是否彻底消失（归因 owner=fixed）
-  if (/memory_update 需要新的 text/.test(m)) return '已修：memory_update 元数据'
-  if (/validation|invalid|schema|arguments/.test(m)) return 'validation 参数错'
-  return 'code/other'
-}
+// 错误分类学 classify() 已搬到 error-stats.mjs（纯函数才能单测，测试见 _selftest/tests/error-classify.test.mjs）。
+
 
 // 归一化签名与「跨天复发」统计在 error-stats.mjs（纯函数，可单测；口径只有一份）。
 
@@ -133,7 +104,10 @@ const DENIED = /dsh-hooks 拦截/
 // write gate 拦截（batch_write 要求先 dry-run）：这是**机制正确拦下了一次误写**，与护栏 deny 同类，
 // 属预期结果，单列不拉高错误率（2026-11-12 从 code/other 里识别出来）。
 const GATE_BLOCKED = /write gate.*dry-run/
+// 策略拒绝（auto-approve 规则命中 / 用户手动拒）：也是机制正常工作，不是工具坏了（2026-11-12 从 code/other 里识别）。
+const REJECTED = /dsh-auto-approve 拒绝了这次调用|the user rejected tool/
 let gateBlocked = 0
+let rejected = 0
 let denials = 0
 const calls = new Map()
 const kindCount = new Map()
@@ -189,6 +163,7 @@ for (const file of listSessionFiles(SESSIONS)) {
       // 护栏拦截是「预期结果」，不是缺陷：单列，不拉高错误率
       if (DENIED.test(text)) { denials++; continue }
       if (GATE_BLOCKED.test(text)) { gateBlocked++; continue }
+      if (REJECTED.test(text)) { rejected++; continue }
       const kind = classify(text)
       if (DUMP) dumpRows.push({ kind, tool, text: text.replace(/\s+/g, ' ').slice(0, 200) })
       totalErrors++
@@ -249,6 +224,7 @@ const report = {
   abortedTurns,
   guardDenials: denials,
   gateBlocked,
+  rejected,
   byKind: sorted(kindCount).map(([k, v]) => ({ kind: k, count: v, share: +(v / (totalErrors || 1)).toFixed(4) })),
   byTool: sorted(toolErr).slice(0, TOP).map(([tool, errs]) => ({ tool, errs, calls: toolCalls.get(tool) || 0, rate: +((toolCalls.get(tool) || 1) ? errs / (toolCalls.get(tool) || 1) : 0).toFixed(4) })),
   perDay: [...perDay.entries()].sort().map(([day, v]) => ({ day, calls: v.calls, errors: v.errors, rate: +(v.errors / (v.calls || 1)).toFixed(4) })),
@@ -291,7 +267,7 @@ if (JSON_OUT) {
   console.log('工具错误率仪表  ' + report.window + ' · ' + report.sessions + ' 个会话')
   console.log('--------------------------------------------------')
   console.log('调用 ' + totalCalls + ' · 报错 ' + totalErrors + ' · 错误率 ' + pct(rate))
-  console.log('中途 steer ' + steers + ' · 未完成回合 ' + abortedTurns + ' · 护栏拦截（不计入错误率）' + denials + ' · write gate 拦截（不计入）' + gateBlocked)
+  console.log('中途 steer ' + steers + ' · 未完成回合 ' + abortedTurns + ' · 护栏拦截（不计入错误率）' + denials + ' · write gate 拦截（不计入）' + gateBlocked + ' · 策略拒绝（不计入）' + rejected)
   console.log('')
   console.log('[分类型]')
   for (const k of report.byKind) console.log('  ' + (100 * k.share).toFixed(1).padStart(5) + '%  ' + String(k.count).padStart(4) + '  ' + k.kind)
