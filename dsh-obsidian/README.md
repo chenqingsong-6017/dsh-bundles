@@ -44,6 +44,19 @@ vault 是人的成品层（画像 / 3观 / 日志 / 调研索引）。没有索�
 
 **真机首跑**：21 篇 / 0 错误 / 0 警告 / 12ms。首跑曾报 6 条，其中 5 条是规则误报（journal 被要求写结论、Home.md 被当命名违规），按「规则服从目的」改规则，没有为了过检而改库。
 
+## 目录摘要（sidecar）索引（v0.5.0）
+
+`_ops/vault-abstract.mjs` 会给每个目录生成 `.abstract.md`（L0，≤60 字）与 `.overview.md`（目录详表）。
+索引**只收录 `.abstract.md`**：
+
+- 条目标 `type='sidecar'`、`title` = L0 全文 → `obsidian_search` 能按目录摘要命中（`type: 'sidecar'` 可单独过滤）；
+- **不进页面契约检查**（它没有 frontmatter / id / 一句话，按页面规则检查只会报假错）；
+- **不算出链**（`links=[]`，避免断链噪声）；
+- `.overview.md` **不收录**（体积大、内容与正文重复），要读时用 `obsidian_note` 直读文件；
+- 其他点号文件（`.obsidian/` 内等）仍不收录。
+
+**为什么加这一层**：sidecar 生成后若检索侧看不见，「记忆只存 L0 指针、按需拉 L2」就是空话——2026-11-12 审计实测 17/17 未收录，改后才闭合。
+
 ## 索引数据布局
 
 ```
@@ -51,7 +64,7 @@ D:\AI\dsh-data\obsidian\
 └── index.json     # 一次全量快照：vault / builtAt / newestMtime / counts / links / parseErrors / notes[]
 ```
 
-`notes[]` 每条的字段：`path / name / title / type / domain / status / review / tier / confidence / id / tags / aliases / mtime / size / links[] / text`（`text` 压成单行、上限 8000 字符，只给检索用）。
+`notes[]` 每条的字段：`path / name / title / type / domain / status / review / tier / confidence / id / tags / aliases / mtime / size / links[] / text`（`text` 压成单行、上限 8000 字符，只给检索用）。目录摘要条目（v0.5.0）`type='sidecar'`、`title/text` 都是 L0 全文、`links=[]`。
 
 ## 配置（cordis.patch.yml 或 profile 层）
 

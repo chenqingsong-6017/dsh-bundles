@@ -2,6 +2,20 @@
 
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v0.5.0 — 2026-11-12
+
+### Added
+- **目录摘要（` .abstract.md`）进索引**：此前一律跳过点文件，导致 `_ops/vault-abstract.mjs` 生成的 17 组 sidecar **检索侧完全看不见**（2026-11-12 审计：17/17 未收录，`obsidian_search` 搜不到、记忆的 `vault://` 指针拿不到 L0）。
+  现在 `listVault` 只收录 `.abstract.md`（`SIDECAR_ABSTRACT` 常量），`buildIndex` 给它 `type='sidecar'`、`title`=L0 全文、`links=[]`（不算出链，避免断链噪声）、`oneLiner=true`。
+- **索引版本升到 2**（`INDEX_VERSION = 2`）：旧 `index.json` 结构不含 sidecar，读回后按版本号强制重建（`ensureIndex` 已有逻辑）。
+
+### Fixed
+- **契约检查不误报 sidecar**：`lintIndex` 对 `type='sidecar'` 直接跳过（sidecar 无 frontmatter / 无 id / 无「一句话」，按页面规则检查只会制造假错误）。
+- **`.overview.md` 仍不收录**：体积大、内容与正文重复；需要读时 `obsidian_note` 可直读（不受收录影响）。
+
+### 测试
+- `_selftest/tests/obsidian.test.mjs` 新增一组：只收录 `.abstract.md`（`.overview.md` 与其他点文件跳过）/ `type=sidecar` / L0 成为可搜索标题 / 无出链 / 契约检查豁免 / `obsidian_search` 能命中 / `obsidian_note` 能直读 `.overview.md`。全套 19 项通过。
+
 ## v0.4.1 — 2026-11-03
 
 ### Fixed

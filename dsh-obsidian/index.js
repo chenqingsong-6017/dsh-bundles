@@ -18,7 +18,7 @@ import path from 'node:path'
 export const name = 'dsh-obsidian'
 export const inject = ['tools']
 
-export const INDEX_VERSION = 1
+export const INDEX_VERSION = 2 // v0.5.0：收录目录摘要 .abstract.md（type=sidecar），旧索引必须重建
 const DEFAULT_VAULT = 'D:\\AI-date\\obsidian\\vault'
 const DEFAULT_STORE = 'D:\\AI\\dsh-data\\obsidian'
 const DEFAULT_MEMORY = 'D:\\AI\\dsh-data\\memory\\memory.json'
@@ -28,6 +28,9 @@ const MAX_TEXT_CHARS = 8000
 const MAX_SNIPPET = 160
 const MAX_INDEX_BYTES = 32 * 1024 * 1024
 const SKIP_DIRS = new Set(['.obsidian', '.git', 'node_modules', '.trash', '.dsh-vision-router'])
+// v0.5.0（2026-11-12）：唯一允许进索引的点文件——目录摘要 L0（生成器 _ops/vault-abstract.mjs）。
+// .overview.md 体积大、内容与正文重复，不收录（需要时 obsidian_note 直读文件）。
+const SIDECAR_ABSTRACT = '.abstract.md'
 const ATTACHMENT_EXT = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.pdf', '.canvas', '.mp3', '.mp4', '.zip', '.excalidraw'])
 
 const text = (value) => ({ type: 'text', text: value })
@@ -182,13 +185,17 @@ export function listVault(vaultDir) {
         continue
       }
       if (!entry.isFile()) continue
-      // v0.2.x（2026-11-12）：跳过点号开头的隐藏文件。Obsidian 的插件会往每个目录写 .abstract.md /
-      // .overview.md 这类自动摘要（实测 12:28 批量生成 34 个），它们没有页面契约 frontmatter，
-      // 进索引只会制造 96 条假契约错误、干扰检索；Obsidian 自己也不把点文件当笔记。
-      if (entry.name.startsWith('.')) continue
+      // v0.5.0（2026-11-12）：点文件只收录目录摘要 .abstract.md（L0）。之前 v0.2.x 一律跳过，
+      // 后果是 sidecar 生成后检索侧完全看不见（2026-11-12 审计：17/17 未收录），「记忆只存 L0 指针」不成立。
+      // 现在收录它、但标 type=sidecar 并让页面契约检查豁免；.overview.md 与其他点文件仍跳过。
+      const isSidecar = entry.name === SIDECAR_ABSTRACT
+      if (entry.name.startsWith('.') && !isSidecar) continue
       const ext = path.extname(entry.name).toLowerCase()
-      allNames.add(entry.name.toLowerCase())
-      allNames.add(baseName(entry.name).toLowerCase())
+      // sidecar 不进 allNames：否则正文里的 [[.abstract]] 之类会解析到它（它不是可跳转的笔记）。
+      if (!isSidecar) {
+        allNames.add(entry.name.toLowerCase())
+        allNames.add(baseName(entry.name).toLowerCase())
+      }
       if (ext === '.md') {
         try {
           const info = statSync(abs)
@@ -226,6 +233,41 @@ export function buildIndex(vaultDir, now = Date.now(), listing) {
   const byName = new Map()
   const notes = []
   for (const file of files.notes) {
+    // v0.5.0：目录摘要没有 frontmatter，不能按页面契约解析；它的检索文本就是 L0 全文。
+    if (file.name === SIDECAR_ABSTRACT) {
+      let sidecarRaw = ''
+      try {
+        sidecarRaw = file.size > MAX_NOTE_BYTES ? '' : readFileSync(file.abs, 'utf8')
+      } catch (error) {
+        parseErrors.push({ path: file.rel, reason: errText(error).slice(0, 120) })
+        continue
+      }
+      const l0 = compact(sidecarRaw, 200)
+      const dirLabel = file.rel.includes('/') ? file.rel.slice(0, file.rel.lastIndexOf('/')) : ''
+      const sidecarEntry = {
+        path: file.rel,
+        name: baseName(file.rel),
+        title: l0 || dirLabel || '目录摘要',
+        type: 'sidecar',
+        domain: '',
+        status: 'active',
+        review: '',
+        tier: '',
+        confidence: '',
+        id: '',
+        tags: [],
+        aliases: [],
+        mtime: file.mtime,
+        size: file.size,
+        links: [],
+        text: l0,
+        oneLiner: true,
+      }
+      notes.push(sidecarEntry)
+      byPath.set(sidecarEntry.path.toLowerCase(), sidecarEntry.path)
+      byPath.set(sidecarEntry.path.toLowerCase().replace(/\.md$/, ''), sidecarEntry.path)
+      continue
+    }
     let raw = ''
     try {
       if (file.size > MAX_NOTE_BYTES) raw = ''
@@ -663,6 +705,8 @@ export function lintIndex(index, options) {
     const rel = String(entry.path ?? '')
     const lower = rel.toLowerCase()
     if (skipPrefixes.some((prefix) => prefix !== '' && lower.startsWith(prefix))) continue
+    // v0.5.0：目录摘要不是页面（无 frontmatter / 无 id / 无「一句话」），契约检查豁免它。
+    if (String(entry.type ?? '').toLowerCase() === 'sidecar') continue
     const isIndex = /(^|\/)_index\.md$/i.test(rel)
     const type = String(entry.type ?? '').toLowerCase()
     for (const field of ['type', 'domain', 'status']) {

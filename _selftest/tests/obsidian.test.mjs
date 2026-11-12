@@ -654,5 +654,46 @@ put('.git/config', '')
   ok('v0.4.1 M4：空 DB + 有 json → 回退 json 且 note 说明；正常 DB 仍走 sqlite（不降级）')
 }
 
+// ---- v0.5.0（2026-11-12）：目录摘要 .abstract.md 进索引、但不进页面契约检查 ----
+// 背景：sidecar 生成后 17/17 不被索引收录（审计实测），「记忆只存 L0 指针」不成立。
+// 判据：能搜到 .abstract.md / 契约检查豁免 / .overview.md 不收录但可直读 / 其他点文件仍跳过。
+{
+  const rootS = mkdtempSync(path.join(os.tmpdir(), 'dsh-obsidian-sidecar-'))
+  const vS = path.join(rootS, 'vault')
+  const storeS = path.join(rootS, 'store')
+  const putS = (rel, body) => {
+    const abs = path.join(vS, rel)
+    mkdirSync(path.dirname(abs), { recursive: true })
+    writeFileSync(abs, body, 'utf8')
+  }
+  putS('a/note.md', '---\ntype: note\ndomain: life\nstatus: active\n---\n# 一篇笔记\n\n> 一句话：正文。\n')
+  putS('a/.abstract.md', 'a：1 条；最新《一篇笔记》 正文里的一句话\n')
+  putS('a/.overview.md', '# a 概览\n\n> 自动生成\n\n| 文件 | 一句话 |\n|---|---|\n')
+  putS('a/.hidden-other.md', '不该进索引\n')
+
+  const listingS = listVault(vS)
+  assert.equal(listingS.notes.length, 2, '只收录正文 + .abstract.md；.overview.md 与其他点文件跳过')
+  const indexS = buildIndex(vS)
+  const sidecar = indexS.notes.find((n) => n.path === 'a/.abstract.md')
+  assert.ok(sidecar, '.abstract.md 必须进索引')
+  assert.equal(sidecar.type, 'sidecar')
+  assert.ok(String(sidecar.title).includes('一篇笔记'), 'L0 内容成为标题（可被搜索）')
+  assert.deepEqual(sidecar.links, [], 'sidecar 不算出链（避免断链噪声）')
+  assert.equal(indexS.notes.some((n) => n.path === 'a/.overview.md'), false, '.overview.md 不收录')
+  assert.equal(indexS.counts.notes, 2)
+  const reportS = lintIndex(indexS, {})
+  assert.ok(!reportS.issues.some((issue) => issue.path === 'a/.abstract.md'), 'sidecar 不该进页面契约检查')
+
+  const hS = host(vS, storeS)
+  const searchedS = await hS.defs.get('obsidian_search').execute({ query: '一篇笔记', type: 'sidecar' })
+  assert.equal(searchedS.ok, true)
+  assert.ok(searchedS.results.some((row) => row.path === 'a/.abstract.md'), 'sidecar 必须能被检索到')
+  const noteS = await hS.defs.get('obsidian_note').execute({ path: 'a/.overview.md' })
+  assert.equal(noteS.ok, true, '.overview.md 不收录但可直接读')
+
+  rmSync(rootS, { recursive: true, force: true })
+  ok('v0.5.0：.abstract.md 进索引（type=sidecar / 可搜索 / 契约豁免）；.overview.md 不收录但可直读')
+}
+
 rmSync(root, { recursive: true, force: true })
 console.log("obsidian: " + passed + " 项通过")
