@@ -7,8 +7,31 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - **安装位置**：`D:\AI\dsh-bundles\dsh-memory`
 - **数据位置**：`D:\AI\dsh-data\memory\`（bundle patch 的 `storeDir`，不落 C 盘）。v4.1 起默认 SQLite 单文件 `memory.db`（`memory.json` / `archive.json` 留作迁移源与回滚备份，SQLite 下不再写）
 - **生效范围**：desktop profile，所有会话。v3.0 起按 cwd 判定——带 `workspaces` 的条目只在匹配工作区注入，其余全局生效
-- **版本 / 引擎**：v4.14.0（2026-11-12）。v4.14.0 加**淘汰可观测 + 可审计**（每次维护运行都留痕 / 归档写 manifest / budget 状态与 health 同源，见 CHANGELOG 与下节）；v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
+- **版本 / 引擎**：v4.15.0（2026-11-12）。v4.15.0 把**存储预算拆成热层/冷层**（`maxBytes` 只管进 prompt 的条目，`maxColdBytes` 管只检索的条目，见下节「分层预算」）；v4.14.0 加**淘汰可观测 + 可审计**（每次维护运行都留痕 / 归档写 manifest / budget 状态与 health 同源，见 CHANGELOG 与下节）；v4.4.0 加**维护循环**（curator 过期归档 + consolidate 未证实巩固，对齐 Hermes 自动生命周期，见下节「v4.4」）；v4.3.0 是**结构重构**（行为不变）：`index.js` 5861 → 2271 行，顶层辅助与存储层拆到 `lib/`（见下节「代码结构」），14 个工具接口与检索/写入行为未动，数据格式与存储路径不变。此前：v4.2 是**写入侧**的四项增强（skip 可推导 / reference / 预算见顶精简建议 / procedure），检索打分与 14 工具接口未动；v4.2.1 堵 procedure 门槛的三条绕过路径与 JSON 后端锁死循环；v4.2.2 修 SQLite 多进程并发写丢条目（H2）并给 `memory_remove` 加 `confirm:true` 门槛（B4）。SQLite 后端用 `node:sqlite` 内置模块，`engines.node >= 23.4.0`；运行时低于该版本时以 `storage: sqlite` 启动会报 `MEMORY_SQLITE_UNAVAILABLE` 并拒绝启动（改 `storage: json` 可继续用旧后端）
 
+
+
+## 分层预算（v4.15 · 2026-11-12）
+
+**问题**：113 条生效 / 11886 字符撞上单预算 12000，`memory_add` 只剩 114 字符；但其中 60 条 / 5872 字符是 `inject:false`（只参与 `memory_search`，**根本不进 prompt**）。curator 也腾不出空间（pinned 20 / rule 19 / notDue 74）——删不得，也不该被挡。
+
+**取经**：Letta Context Constitution「storage 无限、bottleneck 在 context window」；代码侧进上下文的块 5000 字符 vs 外部源 50000，差 10×。结论是**两本账分开记**，不是调阈值。
+
+| 层 | 谁 | 上限 | 满仓后果 |
+|---|---|---|---|
+| 热层 | `inject !== false` 的生效条目（会进 prompt） | `maxBytes`（12000） | 写热层被拒；自动归档**同层**低价值条目 |
+| 冷层 | `inject:false`（只检索、不进 prompt） | `maxColdBytes`（默认 `max(4×maxBytes, 48000)`） | 写冷层被拒；热层不受影响 |
+
+- 判定只认 `inject` 一个字段（`render.js` 对 `inject:false` 连 pinned 都不注入），不另造第二套口径。
+- `memory_status` 同时报 `budget`（热）与 `coldBudget`（冷）；`health` / 体检取**最差层**，任一层的「满」都会被告警。
+- `memory_update` 改 `inject` = 换层，按目标层上限判；`memory_merge` 全冷来源仍产冷条目。
+
+### 验证记录（真机，2026-11-12 13:01）
+
+- 单测 `node _selftest/tests/memory.test.mjs` → **150 项通过**（+4：热满冷可写 / 冷满只拒冷 / 默认与钳制 / 只归档同层 / 换层判据）。
+- 真机（`apply-check.mjs --reload` 后）：`codeFingerprint=4.15.0-tiered-budget`；`health=ok`；`budget={6014/12000, ok}`、`coldBudget={5872/48000, ok}`。
+- 行为变化：冷层写一条 207 字符成功（`coldChars` 5872→6079，`hotChars` 6014 不变）——旧口径下 `11886+207 > 12000` 必被拒。
+- 体检：`[ ok ] L2 记忆写入余量(热层) 50% / <95%`、`[ ok ] L2 记忆写入余量(冷层) 13% / <95%`。
 
 ## 淘汰可观测 + 可审计（v4.14 · 2026-11-12）
 
@@ -92,14 +115,14 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
    </memory>
    ```
 
-   注入**分两层**（v1.1）：存储可以长（`maxBytes`），但每轮 prompt 成本封顶（`maxInjectChars`）。
+   预算**分三层**（v1.1 注入层 + v4.15 存储分层）：热层 `maxBytes`（会进 prompt 的条目）、冷层 `maxColdBytes`（只检索、不进 prompt）、每轮注入封顶 `maxInjectChars`。
    - `pinned` 条目优先全文注入（硬规则用它）；其余从新到旧连续取，装不下就停；
    - 没拿到全文的降级成一行索引 `- (m7) [tag] 摘要…`，索引最多列最新 10 条；
    - 末尾提示 agent 用 `memory_search` 按关键词取全文。
    - 实测：25 条 / 3320 正文字符时，全量注入 3488 字符 → 分层后 1387 字符（**省 60%**）。`maxInjectChars` 约束的是正文行，头部/索引/页脚另有约 150–200 字符固定开销。
 
 2. **不做会话内冻结快照**（和 Hermes 不同）：Hermes 冻结是为了缓存稳定，但 DSH 本来就每步重新装配 context，记忆又只在显式增删改时变化，频率极低。牺牲这点缓存换"刚记住的下一步就生效"，更符合实际用法。
-3. **超预算拒绝写入**，不自动淘汰：上限 12000 字符（可配 `maxBytes`），超了就让 agent 先看 `memory_list` 再 `memory_remove {id, confirm:true}`，避免悄悄丢用户信息。
+3. **超预算拒绝写入**，不自动淘汰：按层判（热层 `maxBytes` 12000 / 冷层 `maxColdBytes` 48000），超了就拒绝并给同层精简建议；真正的删除仍要 `memory_remove {id, confirm:true}`，避免悄悄丢用户信息。
 4. **存储后端（v4.1）**：默认 SQLite 单文件 `memory.db`（WAL，只写脏行），`storage: json` 保留为回滚开关；迁移、备份、回滚见下文「存储后端（v4.1）」「迁移与回滚」。不写会话日志、不新增事件类型。
 
 ## v4.2（2026-11-02）：集百家所长 —— 四个写入侧长板

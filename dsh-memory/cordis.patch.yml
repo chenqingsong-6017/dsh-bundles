@@ -14,12 +14,25 @@
         # v3.21：8000 → 12000。⚠ 这里会**覆盖代码里的 DEFAULT_MAX_BYTES**：
         # 只改代码默认值而不改这一行，生产上仍然是 8000（2026-10-30 实测踩到）。
         maxBytes: 12000
+        # v4.15：冷层预算（inject:false 条目——只检索、不进 prompt）。
+        # 和 maxBytes 分开的理由：热层决定每轮 prompt 成本，冷层只是检索库体量；
+        # 取经 Letta（context-constitution：storage 无限、瓶颈在 context window；constants 里 5000 vs 50000 差 10×）。
+        # 取经依据与真机基线见 lib/constants.js 的 DEFAULT_MAX_COLD_BYTES 注释。
+        # ⚠ 同样会覆盖代码默认值：改上限要两处同改。
+        maxColdBytes: 48000
         # 注入预算：每轮系统提示里最多花多少字符。
         # v1.2：pinned 全文常驻；其余一律出「id + tag + 日期 + 摘要」索引行，
         # 装不下的条目在块尾「⚠ 另有 N 条未注入」里逐条点名（不再静默丢弃）。
         # v3.22（2026-10-31）：1500 → 2500。51 条记忆 8454 字，1500 只够 6 条全文 + 8 条索引，
         # 其余 33 条只剩 id 可见；提到 2500 后约能全文展开 15 条。代价约每轮 +500 tokens。
-        maxInjectChars: 2500
+        # v4.15②（2026-11-12）：2500 → 3200。实测：19 条 pinned（硬规则）全文就要 2322 字符 = 2500 的 93%，
+        # 索引层拿到 0 字符、33 条记忆对模型完全不可见。3200 = pinned 2322 + 索引层 ~700 + 包装 ~180，
+        # 实测索引层从 0 条升到 19 条可见（热条目注入率 15.9% → 33.6%），代价约每轮 +350 tokens。
+        # 配额在代码里（CORE_INJECT_SHARE=0.78）：pinned 再多也只会降级成索引行，不会把索引层挤成 0。
+        maxInjectChars: 3200
+        # v4.15：冷层存储预算（inject:false 的条目——只参与 memory_search，不进 prompt）。
+        # 默认 max(4 × maxBytes, 48000)；不进每轮 prompt，所以上限比热层大一个量级（取经 Letta 5000 vs 50000）。
+        # maxColdBytes: 48000
         # v2.2：scope 加分（cwd 命中条目在召回时加权 ×1.4；对不上不加分、不过滤）
         # 映射表可覆盖，默认 plugin-dev→D:\AI\dsh-bundles / data-infra→D:\AI\dsh-data / dsh-date→D:\AI-date\dsh-date
         # scopeRoots:

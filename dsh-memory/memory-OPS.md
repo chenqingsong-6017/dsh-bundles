@@ -109,7 +109,8 @@ node _ops\memory-rollback-sqlite.mjs --apply     # 导出 memory.json / archive.
 |---|---|---|
 | `storage` | 代码 `json` / 生产 patch `sqlite` | 存储后端；`json` 是回滚开关 |
 | `retrieval` | `index` | 检索路径；`scan` = 回退 v4.0.1 全量遍历 |
-| `maxBytes` | 12000 | 存储预算（生效条目正文字符）；满仓后 add 被拒（先自动归档，可逆） |
+| `maxBytes` | 12000 | 热层预算（`inject !== false` 的生效条目——会进 prompt）；满了只拒热层写入（先自动归档同层，可逆） |
+| `maxColdBytes` | 48000 | 冷层预算（`inject:false`——只检索、不进 prompt）；与热层分开算，默认 max(4×maxBytes, 48000) |
 | `maxInjectChars` | 2500 | 每轮注入预算（不含包装/诊断约 150–200 字符） |
 | `relevanceFloor` | 0.15 | 相关性覆盖率下限；调高更保守（少注入、少误报） |
 | `captureCandidates` | true | 影子候选；false 关闭 |

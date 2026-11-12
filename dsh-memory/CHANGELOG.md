@@ -3,6 +3,44 @@
 本文件从 v3.20 起建立（按「改到谁补谁」的规则补上）。更早的版本记录见 [README.md](README.md) 的版本节。
 格式：Keep a Changelog；版本号跟 `package.json`。
 
+## v4.15.0（2026-11-12）
+
+**记忆预算按「进不进 prompt」分层**——取经 Letta 的「存储 ≠ 上下文」：Context Constitution 前言「You have infinite full-resolution storage … Your memory bottleneck lies in the context window itself」；代码侧 `CORE_MEMORY_BLOCK_CHAR_LIMIT=5000`（进上下文的块）vs `DEFAULT_CORE_MEMORY_SOURCE_CHAR_LIMIT=50000`（外部源），差 10×。
+起因是同日真机观测：113 条生效 / 11886 字符被单预算 12000 卡住，`memory_add` 只剩 114 字符；但其中 60 条 / 5872 字符是 `inject:false`（只检索、不注入），curator 又无候选可归档（pinned 20 / rule 19 / notDue 74）——不该删，也不该被挡。
+
+### Added
+- `maxColdBytes`（默认 `max(4 × maxBytes, 48000)`，上限 256 KiB）：冷层（`inject:false`）独立预算。配置在 `cordis.patch.yml`、代码默认值在 `lib/constants.js`，两处同改才生效。
+- `memory_status` 新字段：`hotChars` / `coldChars` / `maxColdBytes` / `coldBudget{tier,used,max,remaining,state}`；`budget` 增加 `tier:"hot"`。
+- `memory_list` 同口径字段；头部改为「存储 热 X/12000 · 冷 Y/48000（冷层不进 prompt）」。
+
+### Changed
+- 写入/恢复/合并按**目标层**判预算：`memory_add {inject:false}` 走冷层；`memory_update` 改 `inject` = 换层；`memory_merge` 全冷来源仍产冷条目（原来会凭空变成热条目）。
+- `makeRoom` 只归档**同层**条目（热层压力不会归档冷层条目——归档它腾不出空间）。
+- `health`（`memory_status` / `memory_list`）与体检 L2 都取**两层最差**；L2 拆成「热层/冷层」两行各报余量。
+- 代码指纹 → `4.15.0-inject-quota`。
+- 注入侧配额接线（同日 15:4x 追加）：`MAX_RICH_INDEX` 6→8；`INDEX_INJECT_FLOOR_SHARE`（22%）真正接进相关层 cap（原来只是死常量，未生效）；`injectStats` 增 `richIndexCount` / `compactCount`，`indexedCount` 改为「完整 + 紧凑」真实总数（修复漏算紧凑行的口径 bug）。真机 2026-11-12 15:4x：`codeFingerprint=4.15.0-inject-quota`、`indexedCount=31（完整 8 + 紧凑 23）`、`injectedChars=3168/3200`、`droppedCount=0`。
+
+### 测试
+- `memory.test.mjs` **150 项全过**（+4）：①热层 40/40 满时冷层仍可写 50 字符，冷层满只拒冷层且报错点名「冷层」；②默认 `max(4×maxBytes, 48000)` 与「冷 < 热」钳制 + configWarning；③热层压力不归档冷层条目（归档数 0、冷条目原样保留）；④冷→热按热层上限拦、全冷合并仍是冷条目且热层字符不变。
+
+### 验证（真机，2026-11-12 13:01，`apply-check --reload` 后）
+- `codeFingerprint=4.15.0-tiered-budget`（证明进程里是新代码）；`health=ok`；`budget={used:6014,max:12000,state:ok}`；`coldBudget={used:5872,max:48000,state:ok}`。
+- 冷层写入一条 207 字符成功：`coldChars 5872→6079`，`hotChars 6014 不变`——旧口径下 11886+207 > 12000 必被拒。
+- 体检：`记忆写入余量(热层) 50%`、`(冷层) 13%`，结论「通过」。
+
+### Fixed（2026-11-12 收尾 · §7 验收驱动）
+- **makeRoom 会归档 vault:// 指针条目**（真误归档）：`lowestValueCandidate` 只豁免 pinned/rule/draft，§7④ 集成测试一跑就抓到它把指针条目当低价值归档。修法：抽 `isEliminationProtected`（pinned / rule / draft / slot=identity / 正文含 vault://），`makeRoom` 与 `convergeTier` 共用同一判据。
+- **`injectStats.indexedCount` 漏算紧凑行**：v4.15 索引层两级渲染后，该字段只数完整行（真机 8 完整 + 23 紧凑被报成 8）。修法：`indexedCount` = 完整+紧凑，另加 `richIndexCount` / `compactCount`；页脚「跨域 N」改「紧凑 N」（不全是跨域）。
+- **`INDEX_INJECT_FLOOR_SHARE` 是死常量**：常量注释说「22% 是索引层保底」，代码里没人用。修法：相关层 cap 扣掉 22% 保底，索引层才真的拿到下限。
+
+### Changed（同上）
+- `MAX_RICH_INDEX` 从 render.js 函数内魔数（6）移到 `lib/constants.js`，值 **8**（= §7「索引层 ≥8 条」验收线）；`memory_list` 头部直接渲染「索引层 X 条：完整 R + 紧凑 C」。
+- 代码指纹 → `4.15.0-inject-quota`（行为改动必须可区分进程里跑的是哪版）。
+
+### 验证（2026-11-12 15:4x · 真机 + 集成测试）
+- 真机 `memory_list`：`injectedChars=3168/3200`（≤ 上限）、`injectStats.indexedCount=31`（完整 8 + 紧凑 23）、`droppedCount=0`。
+- 集成测试（临时 storeDir，真实 lib）：满库写入 0% 基线拒绝 / 4 天库龄场景收敛归档 3 条后写入成功（0→100%）/ 误归档 0 / restore 成功；`memory.test.mjs` **154 项全过**（+4），全部 9 个 memory 相关测试文件通过（225 项断言）。
+- Recall@5：bench 因 5 个 gold 被当日清理，修题集后 18/21 = **0.857 未达 0.870**；改前库 21/23=0.913（详见值不值判定 §9）。
 ## v4.14.0（2026-11-12）
 
 **淘汰机制补上「可观测 + 可审计 + 不说谎」**——取经 Hermes 的 no-op 原因日志与 run report，起因是 2026-11-12 的真实观测：

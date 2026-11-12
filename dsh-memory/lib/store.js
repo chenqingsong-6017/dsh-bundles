@@ -8,7 +8,7 @@ import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSy
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { ARCHIVE_MANIFEST_MAX_BYTES, BACKUP_KEEP, BM25_ALIAS_WEIGHT, BUDGET_DEGRADED_RATIO, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, CONSOLIDATE_MIN_USES, CURATOR_INTERVAL_MS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
+import { ARCHIVE_MANIFEST_MAX_BYTES, BACKUP_KEEP, BM25_ALIAS_WEIGHT, BUDGET_DEGRADED_RATIO, BM25_B, BM25_K1, BM25_TAG_WEIGHT, CANDIDATE_LIMIT, CANDIDATE_TTL_DAYS, CONSOLIDATE_MIN_USES, CONVERGE_MAX_PER_CALL, CONVERGE_MAX_USES, CONVERGE_MIN_AGE_DAYS, CURATOR_INTERVAL_MS, DB_FILE, DB_MIGRATION_LOCK, DB_SCHEMA_VERSION, FTS_TOKENIZE, MAX_QUERY_CHARS, MAX_TEXT_CHARS, RETRIEVAL_MODES, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, STALE_PENALTY, STORE_BACKENDS } from './constants.js'
 import { curationDecision, detectScope, effectiveImportance, eliminationSignal, isArchivedEntry, isInvalidEntry, isStaleEntry, localDateOf } from './entry.js'
 import { canonicalJson, migrateState, normalizeEntry, schemaTooNewError } from './schema.js'
 import { fail, text } from './util.js'
@@ -18,7 +18,7 @@ import { bm25Doc } from './score.js'
 import { renderMemory } from './render.js'
 import { storeLocation } from './store-snapshot.js'
 
-export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots, relevanceFloor }) {
+export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChars, scopeRoots, relevanceFloor }) {
   const { dir: storeDir, file: storeFile } = storeLocation(config?.storeDir)
   // v3.20：归档条目分文件冷存 —— 主库只留生效记忆，归档落 archive.json（与 aliases.json 同级的旁路文件）。
   // 起因：归档条目永远占着 memory.json，且 memory_list 每次都把 93 条一起吐出来（实测 37 KB），
@@ -1118,14 +1118,14 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
    */
   // v3.25：加 minAgeDays —— 普通写入腾地方时只归档「至少 N 天没动过」的条目，
   // 避免刚写进来的记忆立刻被后续写入挤掉。规则入库通道保持 minAgeDays=0（原行为）。
-  function lowestValueCandidate(minAgeDays = 0) {
+  function lowestValueCandidate(minAgeDays = 0, tier = 'hot') {
     const cutoff = minAgeDays > 0 ? Date.now() - minAgeDays * 86400000 : 0
     const today = localDateOf()
     // Hermes 判断机制：淘汰按「信号」排序，不再拿「从未命中」当唯一/优先判据。
     // stale（到期未复核）是确定性信号，排最前；never-used 是「没证据」，只能垫底，且必须足够旧才准参与。
-    const pool = activeEntries().filter(
-      (entry) => entry.pinned !== true && entry.kind !== 'rule' && entry.status !== 'draft',
-    )
+    // v4.15：只归档**同一层**的条目——归档冷层条目腾不出热层空间，反之亦然（原来不分层，等于白归档）。
+    // v4.15②：豁免并入 isEliminationProtected——2026-11-12 集成测试抓到 makeRoom 会归档 vault:// 指针条目（真误归档）。
+    const pool = activeEntries().filter((entry) => !isEliminationProtected(entry) && tierOf(entry) === tier)
     if (pool.length === 0) return null
     const scored = pool.map((entry) => {
       const sig = eliminationSignal(entry, today)
@@ -1147,11 +1147,12 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   function makeRoom(size, opts) {
     const fallbackReason = typeof opts?.reason === 'string' ? opts.reason : 'auto-archive: 为规则自动入库腾预算'
     const minAgeDays = Number.isFinite(opts?.minAgeDays) ? opts.minAgeDays : 0
+    const tier = opts?.tier === 'cold' ? 'cold' : 'hot'
     const archived = []
     let guard = 0
-    while (usedChars() + size > maxBytes && guard < 20) {
+    while (tierUsed(tier) + size > tierMax(tier) && guard < 20) {
       guard += 1
-      const victim = lowestValueCandidate(minAgeDays)
+      const victim = lowestValueCandidate(minAgeDays, tier)
       if (victim === null) return { ok: false, archived }
       const sig = eliminationSignal(victim, localDateOf())
       victim.status = 'deprecated'
@@ -1161,7 +1162,71 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
       archived.push(victim.id)
       queueManifest([{ ts: victim.archivedAt, by: 'makeRoom', id: victim.id, reason: victim.archiveReason, signal: sig.rank <= 1 ? sig.signal : 'none', chars: victim.text.length }])
     }
-    return { ok: usedChars() + size <= maxBytes, archived }
+    return { ok: tierUsed(tier) + size <= tierMax(tier), archived }
+  }
+
+  /**
+   * v4.15② 满库自动收敛（取经 hindsight 的 merge/evict + Hermes「每条淘汰都要带 why」）。
+   *
+   * 触发条件：**只有那一层已经写满**时才调（degraded 不调）——这是最后一道闸，不是常态淘汰。
+   * 两步，都只归档不删除（memory_restore 可逐条回滚）：
+   *   ① 包含式去重：A 的正文是 B 的子串 → A 冗余，归档 A（reason 写明包含于谁）。
+   *   ② 低价值归档：同层、非 pinned/rule/draft、usedCount ≤ CONVERGE_MAX_USES、
+   *      至少 CONVERGE_MIN_AGE_DAYS 天没动过、正文不含 vault:// 指针（指针是知识入口，不自动归）。
+   * 单次最多 CONVERGE_MAX_PER_CALL 条；够写就停，不顺手清空。
+   *
+   * 为什么不用 LLM 合并：hindsight 的 merge 要 LLM 裁决（consolidator.py:301-374），
+   * 我们没有能保证不丢细节的确定性合并器，硬做就是造假。只做可证明安全的包含式去重。
+   */
+  function convergeTier(size, tier = 'hot') {
+    const archived = []
+    const merged = []
+    const stamp = () => new Date().toISOString()
+    const fits = () => tierUsed(tier) + size <= tierMax(tier)
+    const archive = (entry, reason, by) => {
+      entry.status = 'deprecated'
+      entry.archivedAt = stamp()
+      entry.archiveReason = reason
+      archived.push(entry.id)
+      queueManifest([{ ts: entry.archivedAt, by, id: entry.id, reason, signal: 'none', chars: entry.text.length }])
+    }
+
+    // ① 包含式去重（只碰非豁免条目：pinned / rule / draft / 身份 / vault:// 指针一律不动）
+    const pool = activeEntries().filter((entry) => !isEliminationProtected(entry) && tierOf(entry) === tier)
+    for (const small of pool) {
+      if (fits() || archived.length >= CONVERGE_MAX_PER_CALL) break
+      const body = String(small.text ?? '')
+      if (body.length < 24) continue
+      const host = pool.find((other) => other.id !== small.id && String(other.text ?? '').includes(body))
+      if (host === undefined) continue
+      if (archived.includes(small.id)) continue
+      archive(small, '收敛·包含于 ' + host.id, 'converge:containment')
+      merged.push({ into: host.id, from: small.id })
+    }
+
+    // ② 低价值归档（价值 = 重要度低 → 使用次数少 → 最旧 优先）
+    const cutoff = Date.now() - CONVERGE_MIN_AGE_DAYS * 86400000
+    const today = localDateOf()
+    const lowValue = () =>
+      activeEntries()
+        .filter((entry) => {
+          if (isEliminationProtected(entry)) return false
+          if (tierOf(entry) !== tier) return false
+          if (Number(entry.usedCount ?? 0) > CONVERGE_MAX_USES) return false
+          const ts = Date.parse(String(entry.lastUsedAt ?? entry.updatedAt ?? entry.addedAt ?? ''))
+          return Number.isFinite(ts) && ts < cutoff
+        })
+        .map((entry) => ({ entry, imp: effectiveImportance(entry) }))
+        .sort((a, b) => a.imp - b.imp || Number(a.entry.usedCount ?? 0) - Number(b.entry.usedCount ?? 0))
+
+    while (!fits() && archived.length < CONVERGE_MAX_PER_CALL) {
+      const next = lowValue()[0]
+      if (next === undefined) break
+      const stale = isStaleEntry(next.entry, today)
+      archive(next.entry, stale ? '收敛·staleAfter 已过' : '收敛·低价值（重要度/使用次数最低、≥' + CONVERGE_MIN_AGE_DAYS + ' 天未动）', 'converge:lowValue')
+    }
+
+    return { ok: fits(), tier, archived, merged }
   }
 
   /**
@@ -1213,10 +1278,30 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   }
 
   /** v4.2：见顶报错 = 现状 + 可执行精简建议（合并 / drop），不再只说「超预算」。 */
-  function budgetExceededMessage(need, archivedIds) {
+  // v4.15：按**层**报数——热层（进 prompt）和冷层（只检索）是两本账，混着报会让人以为「删冷条目能腾热空间」。
+  function budgetExceededMessage(need, archivedIds, tier = 'hot') {
     const plan = pruneSuggestions()
     const lines = []
-    lines.push('记忆已占用 ' + usedChars() + ' / ' + maxBytes + ' 字符，本次需 ' + need + ' 字符；自动归档腾地方后仍不够。')
+    const self = tierBudget(tier)
+    const other = tierBudget(tier === 'cold' ? 'hot' : 'cold')
+    lines.push(
+      '记忆' +
+        (tier === 'cold' ? '冷层' : '热层') +
+        '已占用 ' +
+        self.used +
+        ' / ' +
+        self.max +
+        ' 字符（另一层 ' +
+        (tier === 'cold' ? '热层' : '冷层') +
+        ' ' +
+        other.used +
+        ' / ' +
+        other.max +
+        (tier === 'cold' ? '，不进 prompt' : '') +
+        '），本次需 ' +
+        need +
+        ' 字符；自动归档腾地方后仍不够。',
+    )
     if (Array.isArray(archivedIds) && archivedIds.length > 0) {
       lines.push('本轮已自动归档：' + archivedIds.join(' ') + '（可 memory_restore 恢复）。')
     }
@@ -1236,7 +1321,11 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     if (plan.merges.length === 0 && plan.drops.length === 0) {
       lines.push('  没有可合并 / 可 drop 的候选：其余条目都是 pinned / 规则 / 刚写入或高价值，只能 memory_update 精简长条目。')
     }
-    lines.push('若还不够：memory_update 精简长条目，或调大 maxBytes（配置 dsh-memory.maxBytes）。')
+    lines.push(
+      tier === 'cold'
+        ? '若还不够：冷层不占每轮 prompt，可调大 maxColdBytes（配置 dsh-memory.maxColdBytes），或 memory_update 精简长条目。'
+        : '若还不够：memory_update 精简长条目，或调大 maxBytes（热层上限，决定每轮 prompt 成本；冷层不占这里）。',
+    )
     return lines.join('\n')
   }
 
@@ -1831,14 +1920,36 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
   const isActive = (entry) => !isArchivedEntry(entry)
   const activeEntries = () => state.entries.filter(isActive)
   const usedChars = () => activeEntries().reduce((sum, entry) => sum + entry.text.length, 0)
+  // v4.15：两层预算（取经 Letta：上下文里的块和外部存储不是同一个上限）。
+  // 热层 = 会进 prompt 的条目（inject !== false），每轮 prompt 成本由它决定，仍卡 maxBytes；
+  // 冷层 = inject:false（只参与 memory_search），不占 prompt，单独卡 maxColdBytes。
+  // 口径：渲染层 render.js 对 inject:false 一律不注入（连 pinned 也不），所以分层就按 inject 一个字段判，别另造第二套。
+  const tierOf = (entry) => (entry?.inject === false ? 'cold' : 'hot')
+  // v4.15② §7④ 淘汰豁免（单一判据，makeRoom 与 convergeTier 共用）：
+  // pinned（硬规则在场）/ kind=rule（长期约定）/ draft（等人工确认）/ slot=identity（身份画像）/
+  // 正文含 vault://（指针是知识入口，自动归档会断链）——这五类任何自动腾挪都不许动。
+  const isEliminationProtected = (entry) =>
+    entry?.pinned === true ||
+    entry?.kind === 'rule' ||
+    entry?.status === 'draft' ||
+    entry?.slot === 'identity' ||
+    String(entry?.text ?? '').includes('vault://')
+  const tierMax = (tier) => (tier === 'cold' ? maxColdBytes : maxBytes)
+  const tierUsed = (tier) =>
+    activeEntries().reduce((sum, entry) => sum + (tierOf(entry) === tier ? entry.text.length : 0), 0)
+  const hotChars = () => tierUsed('hot')
+  const coldChars = () => tierUsed('cold')
   // v4.14：预算状态（体检/工具同一口径，避免「health 报 ok、写入却被拒」的假安全）。
   // degraded = 已用 ≥95%（新写入随时可能失败）；full = 已经写不进去（除删除/更新变短外无解）。
-  const budgetState = () => {
-    const used = usedChars()
-    const ratio = maxBytes > 0 ? used / maxBytes : 1
-    const state = used >= maxBytes ? 'full' : ratio >= BUDGET_DEGRADED_RATIO ? 'degraded' : 'ok'
-    return { used, max: maxBytes, remaining: Math.max(0, maxBytes - used), state }
+  const tierBudget = (tier = 'hot') => {
+    const max = tierMax(tier)
+    const used = tierUsed(tier)
+    const ratio = max > 0 ? used / max : 1
+    const state = used >= max ? 'full' : ratio >= BUDGET_DEGRADED_RATIO ? 'degraded' : 'ok'
+    return { tier, used, max, remaining: Math.max(0, max - used), state }
   }
+  const budgetState = () => tierBudget('hot')
+  const coldBudgetState = () => tierBudget('cold')
   const publicEntry = (entry) => ({ ...entry })
   const renderOnce = (query, stats, scope, cwd) =>
     renderMemory(state.entries, {
@@ -2090,11 +2201,17 @@ export function createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots,
     newEntryId,
     scoreEntriesIndexed,
     makeRoom,
+    convergeTier,
     budgetExceededMessage,
     autoPromoteRule,
     isActive,
     activeEntries,
     usedChars,
+    tierOf,
+    hotChars,
+    coldChars,
+    tierUsage: tierBudget,
+    coldBudgetState,
     publicEntry,
     renderOnce,
     countUsage,

@@ -1,7 +1,7 @@
 /**
  * 记忆块渲染：注入视图（全文/索引）、列表视图与信任标记。
  */
-import { COMPACT_PEEK_CHARS, COMPOSITE_IMPORTANCE_WEIGHT, COMPOSITE_RECENCY_WEIGHT, DATE_ONLY, INDEX_SUMMARY_CHARS, KIND_PROCEDURE, KIND_REFERENCE, MAX_RELEVANT, MEMORY_HEADER, RELEVANCE_FLOOR, RELEVANT_COMPOSITE_MARGIN, RELEVANT_SHARE, SCOPE_BOOST } from './constants.js'
+import { COLD_IDLE_DAYS, COMPACT_PEEK_CHARS, COMPOSITE_IMPORTANCE_WEIGHT, COMPOSITE_RECENCY_WEIGHT, CORE_INJECT_SHARE, DATE_ONLY, HOT_SCORE_IMPORTANCE_WEIGHT, HOT_SCORE_RECENCY_WEIGHT, HOT_SCORE_USAGE_WEIGHT, INDEX_INJECT_FLOOR_SHARE, INDEX_SUMMARY_CHARS, KIND_PROCEDURE, KIND_REFERENCE, MAX_RELEVANT, MAX_RICH_INDEX, MEMORY_HEADER, RELEVANCE_FLOOR, RELEVANT_COMPOSITE_MARGIN, RELEVANT_SHARE, SCOPE_BOOST } from './constants.js'
 import { applicableAt, effectiveImportance, isTrueAt, localDateOf, recencyOf } from './entry.js'
 import { TRUST_LEGEND } from './schema.js'
 import { gateDecision, relevanceCoverage, scoreEntries } from './score.js'
@@ -43,11 +43,14 @@ const lineRelevant = (entry) => {
 }
 
 const lineIndexCompact = (entry) => {
-  const scope = typeof entry.scope === 'string' && entry.scope !== '' ? entry.scope : (Array.isArray(entry.tags) ? entry.tags[0] : entry.tag) ?? ''
+  // v4.15②：索引层改紧凑行后，大量条目没有 scope → 用 tag 补位（用 [tag] 区分，别把标签伪装成 scope）。
+  const scope = typeof entry?.scope === 'string' && entry.scope !== '' ? entry.scope : ''
+  const tag = scope === '' ? ((Array.isArray(entry?.tags) ? entry.tags[0] : entry?.tag) ?? '') : ''
   // v2.7：只留 <scope> 标签等于没注入——模型看不出这条讲什么，也就不会去搜。压到 14 字主题仍可辨识。
   const flat = String(entry.text ?? '').replace(/\s+/g, ' ').trim()
   const peek = flat.length > COMPACT_PEEK_CHARS ? `${flat.slice(0, COMPACT_PEEK_CHARS)}…` : flat
-  return `- (${entry.id})${trustMark(entry)}${scope ? ` <${scope}>` : ''} ${kindMark(entry)}${peek}`
+  const label = scope !== '' ? ` <${scope}>` : tag !== '' ? ` [${tag}]` : ''
+  return `- (${entry.id})${trustMark(entry)}${label} ${kindMark(entry)}${peek}`
 }
 
 const lineIndex = (entry) => {
@@ -104,11 +107,30 @@ export function renderMemory(allEntries, options) {
   const isExpired = (entry) =>
     typeof entry?.staleAfter === 'string' && DATE_ONLY.test(entry.staleAfter) && entry.staleAfter < todayStr
 
-  // 第一优先级：pinned 全文（硬规则永远在场；真装不下也要进诊断行，不静默消失）
-  for (const entry of entries.filter((item) => item.pinned)) {
+  // 第一优先级：pinned 全文（硬规则永远在场）。
+  // v4.15②：加**配额**。2026-11-12 真机实测：19 条 pinned 占 2154 字符 = 预算 89.5%，
+  //   索引层 0 字符、33 条记忆对模型完全不可见、另有 2 条 pinned 被静默丢弃。
+  // 取经 Letta（core memory 分 block、每桶独立上限，letta@0.9.1 constants.py:326-328）与 quota 混注：
+  //   核心层 ≤ CORE_INJECT_SHARE；溢出的 pinned **降到索引行**（不丢），仍可被 memory_search 找回。
+  // 排序口径：rule 优先 → 重要度 → 使用次数 → 新近；真装不下时先降级最不关键的那条。
+  const pinnedAll = entries.filter((item) => item.pinned)
+  const pinnedOrder = [...pinnedAll].sort((a, b) => {
+    const ruleDiff = (b.kind === 'rule' ? 1 : 0) - (a.kind === 'rule' ? 1 : 0)
+    if (ruleDiff !== 0) return ruleDiff
+    const impDiff = effectiveImportance(b) - effectiveImportance(a)
+    if (Math.abs(impDiff) > 0.001) return impDiff
+    const useDiff = Number(b.usedCount ?? 0) - Number(a.usedCount ?? 0)
+    if (useDiff !== 0) return useDiff
+    return recencyOf(b) - recencyOf(a)
+  })
+  const coreBudget = Math.floor(maxInjectChars * CORE_INJECT_SHARE)
+  // v4.15②：索引层保底（22%）。相关层不能把这块吃光——否则「每轮只看见 pinned + 2 条相关」又把库藏起来。
+  const indexFloor = Math.floor(maxInjectChars * INDEX_INJECT_FLOOR_SHARE)
+  const pinnedDowngraded = []
+  for (const entry of pinnedOrder) {
     const cost = lineFull(entry).length + 1
-    if (used + cost > maxInjectChars) {
-      dropped.push(entry)
+    if (used + cost > coreBudget) {
+      pinnedDowngraded.push(entry)
       continue
     }
     full.push(entry)
@@ -176,7 +198,7 @@ export function renderMemory(allEntries, options) {
         }))
         .sort((a, b) => b.composite - a.composite)
       const topComposite = ranked[0].composite
-      const cap = Math.min(Math.floor(maxInjectChars * RELEVANT_SHARE), maxInjectChars - used)
+      const cap = Math.min(Math.floor(maxInjectChars * RELEVANT_SHARE), Math.max(0, maxInjectChars - used - indexFloor))
       let spent = 0
       // v3.13：覆盖率 top 不再需要单独占位，也**不再用 break 跳过**后面的人 ——
       // v3.11 的注释写着「覆盖率最高的那条天然有资格拿全文」，但旧实现靠循环里的 break 豁免：
@@ -207,7 +229,11 @@ export function renderMemory(allEntries, options) {
 
   // 第三优先级：其余出「一行索引」。本域（或 global）给完整摘要，跨域只留 id + 域标签
   // （Cursor 四态里 globs 的降级版本：跨域事实「知道存在、要看再搜」，别把别域细节当本域规则）。
-  const rest = entries.filter((item) => !item.pinned && !inRelevant.has(item.id))
+  // v4.15②：被配额降级的 pinned 落进索引层（不是丢弃）；再按冷热排序。
+  const rest = [
+    ...pinnedDowngraded,
+    ...entries.filter((item) => !item.pinned && !inRelevant.has(item.id)),
+  ]
   const isCrossScope = (entry) =>
     currentScope !== '' &&
     typeof entry.scope === 'string' &&
@@ -215,36 +241,58 @@ export function renderMemory(allEntries, options) {
     entry.scope !== currentScope &&
     entry.scope !== 'global'
   const compact = []
-  // v3.6：索引层不再「新→旧」，改按 importance（含遗忘曲线衰减）+ recency 排序。
-  // 理由：预算装不下所有条目时，先被挤出去的应该是「旧且不重要」的，而不是「旧的」。
+  // v4.15②：索引层排序 = 冷热分（使用次数 0.5 + 重要度 0.3 + 新近 0.2）。
+  // 旧口径只有 importance+recency，导致 m4（used=108）、m131（used=72）这类最常被检索的条目在注入层永无位置。
+  // 冷层（从未命中且 ≥COLD_IDLE_DAYS 天没动）不进索引层：它们只该被 memory_search 按需拉，不占每轮预算。
   const nowForRank = Date.now()
-  const indexRank = (entry) =>
-    0.6 * (effectiveImportance(entry, nowForRank) / 10) + 0.4 * recencyOf(entry, nowForRank)
-  const orderIndex = new Map(rest.map((entry, position) => [entry.id, position]))
-  const ordered = [...rest].sort((a, b) => {
-    const diff = indexRank(b) - indexRank(a)
-    if (Math.abs(diff) > 0.05) return diff
+  const lastTouchOf = (entry) => {
+    const raw =
+      typeof entry?.lastUsedAt === 'string' && entry.lastUsedAt !== ''
+        ? entry.lastUsedAt
+        : entry?.updatedAt ?? entry?.addedAt
+    const ms = Date.parse(String(raw ?? ''))
+    return Number.isFinite(ms) ? ms : NaN
+  }
+  const usageNorm = (entry) => Math.min(1, Math.log1p(Math.max(0, Number(entry?.usedCount ?? 0) || 0)) / Math.log1p(50))
+  const hotScoreOf = (entry) =>
+    HOT_SCORE_USAGE_WEIGHT * usageNorm(entry) +
+    HOT_SCORE_IMPORTANCE_WEIGHT * (effectiveImportance(entry, nowForRank) / 10) +
+    HOT_SCORE_RECENCY_WEIGHT * recencyOf(entry, nowForRank)
+  const isColdEntry = (entry) => {
+    if (entry?.pinned === true || entry?.kind === 'rule') return false
+    if (Number(entry?.usedCount ?? 0) > 0) return false
+    const ts = lastTouchOf(entry)
+    return Number.isFinite(ts) && (nowForRank - ts) / 86400000 >= COLD_IDLE_DAYS
+  }
+  const coldSuppressed = []
+  const hotRest = []
+  for (const entry of rest) {
+    if (isColdEntry(entry)) coldSuppressed.push(entry)
+    else hotRest.push(entry)
+  }
+  const orderIndex = new Map(hotRest.map((entry, position) => [entry.id, position]))
+  const ordered = [...hotRest].sort((a, b) => {
+    const diff = hotScoreOf(b) - hotScoreOf(a)
+    if (Math.abs(diff) > 0.02) return diff
     // 同档时按写入顺序倒排（数组越靠后越新）——没有时间戳的老条目也有确定顺序。
     return (orderIndex.get(b.id) ?? 0) - (orderIndex.get(a.id) ?? 0)
   })
+  // v4.15②：索引层两级渲染 —— 本域热点用**完整索引行**（id + 标签 + 日期 + 44 字摘要），
+  // 其余（跨域，或本域里排到后面的）用**紧凑行**（id + 标签/域 + 14 字主题）。
+  // 依据：2026-11-12 真机实测，19 条 pinned 占 2311 字符后索引层拿到 0 条、33 条记忆对模型不可见；
+  // 紧凑行约 33 字符、完整行约 65 字符，按「前 MAX_RICH_INDEX 条给摘要、其余给主题」混排，
+  // 同样预算下可见条目从 0 提到 26（完整 14 + 紧凑 12），同时保住本域条目的可读性。
+  // 上限放在 lib/constants.js（阈值集中，别在函数里散落魔数）；8 是 §7 的验收线。
   for (const entry of ordered) {
-    if (isCrossScope(entry)) continue
-    const cost = lineIndex(entry).length + 1
+    const rich = !isCrossScope(entry) && indexed.length < MAX_RICH_INDEX
+    const line = rich ? lineIndex(entry) : lineIndexCompact(entry)
+    const cost = line.length + 1
     if (used + cost > maxInjectChars) {
       dropped.push(entry)
       continue
     }
-    indexed.push(entry)
-    used += cost
-  }
-  for (const entry of ordered) {
-    if (!isCrossScope(entry)) continue
-    const cost = lineIndexCompact(entry).length + 1
-    if (used + cost > maxInjectChars) {
-      dropped.push(entry)
-      continue
-    }
-    compact.push(entry)
+    if (rich) indexed.push(entry)
+    else compact.push(entry)
     used += cost
   }
 
@@ -270,7 +318,7 @@ export function renderMemory(allEntries, options) {
           ? `⚠ 另有 ${dropped.length} 条未注入：${ids.join(' ')}${groupText}（用 memory_search 按 id 或关键词取全文）`
           : `⚠ 另有 ${dropped.length} 条未注入（用 memory_search 按 id 或关键词取全文）`
         : ''
-    const footer = `（全文 ${full.length}${relevant.length > 0 ? ` · 相关 ${relevant.length}` : ''} · 索引 ${indexed.length}${compact.length > 0 ? ` · 跨域 ${compact.length}` : ''}${dropped.length > 0 ? ` · 未注入 ${dropped.length}` : ''}；跨域或更早的记忆用 memory_search 按 id / 关键词取）`
+    const footer = `（全文 ${full.length}${relevant.length > 0 ? ` · 相关 ${relevant.length}` : ''} · 索引 ${indexed.length}${compact.length > 0 ? ` · 紧凑 ${compact.length}` : ''}${dropped.length > 0 ? ` · 未注入 ${dropped.length}` : ''}${pinnedDowngraded.length > 0 ? ` · 📌降级 ${pinnedDowngraded.length}` : ''}${coldSuppressed.length > 0 ? ` · 冷层 ${coldSuppressed.length}（只可检索）` : ''}；跨域或更早的记忆用 memory_search 按 id / 关键词取）`
     // v4.14（2026-11-12）：注入分层——模仿 claude-mem ContextBuilder 的分段渲染。
     // 只加分隔行、不改预算分配与排序；Previously/Timeline 需会话事件流（P2 observer），不硬造。
     const block = [
@@ -328,11 +376,14 @@ export function renderMemory(allEntries, options) {
     statsOut.relevanceCoverage = Number(relevanceSeen.toFixed(4))
     statsOut.compact = compact.map((entry) => entry.id)
     statsOut.dropped = dropped.map((entry) => entry.id)
+    // v4.15②：冷热分层的可观测——降级了多少 pinned、冷层甩掉多少条。
+    statsOut.pinnedDowngraded = pinnedDowngraded.map((entry) => entry.id)
+    statsOut.coldSuppressed = coldSuppressed.map((entry) => entry.id)
     // v3.24：注入收益度量（学 Google ADK 的 _prompt_chars_saved）——
     // 光报「注入了多少」不够，还要能答「降级成索引行替我们省了多少」。
     const sizeOf = (list, render) => list.reduce((n, entry) => n + render(entry).length + 1, 0)
     statsOut.fullChars = sizeOf(full, lineFull)
-    statsOut.indexedChars = sizeOf(indexed, lineIndex)
+    statsOut.indexedChars = sizeOf(indexed, lineIndex) + sizeOf(compact, lineIndexCompact)
     statsOut.droppedFullChars = sizeOf(dropped, lineFull)
   }
 

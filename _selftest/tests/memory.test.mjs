@@ -127,8 +127,10 @@ const dated = renderMemory(
   [{ id: 'd1', text: '带日期的条目内容'.repeat(4), tag: 'env', updatedAt: '2026-10-28T10:00:00.000Z' }],
   { maxInjectChars: 1200 },
 )
-assert.ok(/^- \(d1\) \[env\] 2026-10-28 /m.test(dated), '索引行应带 id / tag / 日期，便于按 id 续取正文')
-ok('v1.2 索引行格式：id + tag + 日期 + 摘要')
+// v4.15②：索引层改紧凑行（id + 标签 + 14 字主题）。原来的 44 字摘要 + 日期一行要 65 字符，
+// 实测 3200 预算下只能装 7 条；紧凑行同样预算装 19 条。断言口径改成「id + 标签必须可见」。
+assert.ok(/^- \(d1\) \[env\] /m.test(dated), '索引行应带 id + 标签，便于按 id 续取正文（v4.15 起日期不再进索引行）')
+ok('v1.2 索引行格式：id + 标签 + 主题摘要（v4.15 紧凑行）')
 
 const crowd = Array.from({ length: 20 }, (_, i) => ({ id: `x${i}`, text: `条目 ${i} ` + '填充'.repeat(30) }))
 const tight = renderMemory(crowd, { maxInjectChars: 400 })
@@ -427,7 +429,8 @@ const crossBlock = renderMemory(crossPool, { maxInjectChars: 1200, scope: 'plugi
 assert.ok(/- \(in1\) \[plugin\]/.test(crossBlock), '本域条目给完整索引行')
 assert.ok(/- \(out1\) <machine>/.test(crossBlock), '跨域条目压成 id + 域标签')
 assert.ok(!crossBlock.includes('抖音客户端必须用普通权限启动'), '跨域条目不再带摘要')
-assert.ok(/跨域 1/.test(crossBlock), '页脚要标出跨域条数')
+// v4.15②：紧凑行不只跨域（本域超出完整行配额也走紧凑行），页脚口径改成「紧凑」。
+assert.ok(/紧凑 1/.test(crossBlock), '页脚要标出紧凑行条数')
 assert.ok(crossBlock.includes('memory_search'), '页脚显式引导按需检索')
 ok('v2.4 跨域索引压缩：本域带摘要、跨域只点名，页脚标数与引导')
 
@@ -1608,6 +1611,212 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   ok('v4.14 预算状态：ok→degraded→full 与 health 同源，撞墙时状态不再说谎')
 }
 
+// ---- v4.15 分层预算：热层（进 prompt）与冷层（只检索）分开 ----
+// 取经依据：Letta Context Constitution「storage 无限、bottleneck 在 context window」+
+// letta/constants.py 里 CORE_MEMORY_BLOCK_CHAR_LIMIT=5000 vs DEFAULT_CORE_MEMORY_SOURCE_CHAR_LIMIT=50000（差 10×）。
+// 真机背景（2026-11-12）：113 条里冷层 60 条 / 5872 字符，却被单预算 12000 一起卡住，memory_add 只剩 114 字符余量。
+{
+  const tmp = makeTmp('dsh-memory-tier')
+  const h = host(tmp, { maxBytes: 40, maxColdBytes: 60 })
+  await h.defs.get('memory_add').execute({ text: 'a'.repeat(40), kind: 'rule' })
+  let st = await h.defs.get('memory_status').execute({})
+  assert.equal(st.budget.state, 'full', '热层 40/40 应报 full')
+  assert.equal(st.budget.tier, 'hot')
+  assert.equal(st.coldBudget.max, 60)
+  assert.equal(st.coldBudget.state, 'ok')
+  // 热层满，冷层照样能写：冷层条目不进 prompt，不该被热层预算挡住。
+  const cold = await h.defs.get('memory_add').execute({ text: 'c'.repeat(50), kind: 'fact', inject: false })
+  assert.equal(typeof cold.entry.id, 'string', '冷层写入应成功')
+  st = await h.defs.get('memory_status').execute({})
+  assert.equal(st.hotChars, 40)
+  assert.equal(st.coldChars, 50)
+  assert.equal(st.budget.state, 'full')
+  assert.equal(st.coldBudget.state, 'ok')
+  assert.equal(st.health, 'full', 'health 取最差层：热层满就是 full')
+  const listed = await h.defs.get('memory_list').execute({})
+  assert.ok(!listed.block.includes('cccc'), '冷层条目不许进注入块')
+  // 冷层满：只拒冷层写入，报错里必须点名冷层（不许让人以为要删热层条目）。
+  await assert.rejects(
+    () => h.defs.get('memory_add').execute({ text: 'd'.repeat(20), kind: 'fact', inject: false }),
+    (error) => error.code === 'MEMORY_BUDGET_EXCEEDED' && error.message.includes('冷层'),
+  )
+  await assert.rejects(
+    () => h.defs.get('memory_add').execute({ text: 'e'.repeat(5), kind: 'rule' }),
+    (error) => error.code === 'MEMORY_BUDGET_EXCEEDED',
+  )
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v4.15 分层预算：热层满时冷层仍可写；冷层满只拒冷层；health 取最差层；冷层不进注入')
+}
+
+{
+  // 默认冷层预算：max(4 × maxBytes, 48000)；配反了（冷 < 热）钳住并留痕。
+  const t1 = makeTmp('dsh-memory-tier-default')
+  const s1 = await host(t1, { maxBytes: 40 }).defs.get('memory_status').execute({})
+  assert.equal(s1.maxColdBytes, 48000, 'maxBytes 小时冷层取兜底 48000，实际 ' + s1.maxColdBytes)
+  const t2 = makeTmp('dsh-memory-tier-ratio')
+  const s2 = await host(t2, { maxBytes: 20000 }).defs.get('memory_status').execute({})
+  assert.equal(s2.maxColdBytes, 80000, 'maxBytes 大时冷层 = 4×maxBytes，实际 ' + s2.maxColdBytes)
+  const t3 = makeTmp('dsh-memory-tier-clamp')
+  const s3 = await host(t3, { maxBytes: 100, maxColdBytes: 50 }).defs.get('memory_status').execute({})
+  assert.equal(s3.maxColdBytes, 100, '冷层小于热层应钳到热层')
+  assert.ok(String(s3.configWarning).includes('maxColdBytes'), '钳住必须留痕：' + s3.configWarning)
+  rmSync(t1, { recursive: true, force: true })
+  rmSync(t2, { recursive: true, force: true })
+  rmSync(t3, { recursive: true, force: true })
+  ok('v4.15 冷层默认预算 max(4×maxBytes, 48000)；冷 < 热时钳住并写 configWarning')
+}
+
+{
+  // 归档只动同层：热层压力不许归档冷层条目（归档它一点空间也腾不出来）。
+  const tmp = makeTmp('dsh-memory-tier-room')
+  const oldCold = normalizeEntry({
+    id: 'm1',
+    text: '旧冷事实 ' + 'x'.repeat(30),
+    kind: 'fact',
+    inject: false,
+    addedAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+  })
+  writeFileSync(path.join(tmp, 'memory.json'), JSON.stringify({ version: 1, nextId: 2, entries: [oldCold] }), 'utf8')
+  const h = host(tmp, { maxBytes: 50, maxColdBytes: 500 })
+  await assert.rejects(
+    () => h.defs.get('memory_add').execute({ text: 'h'.repeat(60), kind: 'fact' }),
+    (error) => error.code === 'MEMORY_BUDGET_EXCEEDED',
+  )
+  const listed = await h.defs.get('memory_list').execute({ includeArchived: true })
+  const archived = listed.entries.filter((entry) => entry.status === 'deprecated')
+  assert.equal(archived.length, 0, '热层撞墙不该归档冷层条目，实际归档 ' + archived.length)
+  assert.equal(listed.entries.filter((entry) => entry.inject === false).length, 1, '冷层条目应原样保留')
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v4.15 makeRoom 只归档同层：热层压力不归档冷层条目')
+}
+
+{
+  // 改 inject 就是换层：冷 → 热必须按热层上限判；全冷合并结果仍是冷层。
+  const tmp = makeTmp('dsh-memory-tier-move')
+  const h = host(tmp, { maxBytes: 40, maxColdBytes: 200 })
+  await h.defs.get('memory_add').execute({ text: 'a'.repeat(40), kind: 'rule' })
+  const cold = await h.defs.get('memory_add').execute({ text: 'c'.repeat(20), kind: 'fact', inject: false })
+  await assert.rejects(
+    () => h.defs.get('memory_update').execute({ id: cold.entry.id, text: 'c'.repeat(20), inject: true }),
+    (error) => error.code === 'MEMORY_BUDGET_EXCEEDED' && error.message.includes('热层'),
+  )
+  const a = await h.defs.get('memory_add').execute({ text: '冷事实甲 ' + 'p'.repeat(10), kind: 'fact', inject: false })
+  const b = await h.defs.get('memory_add').execute({ text: '冷事实乙 ' + 'q'.repeat(10), kind: 'fact', inject: false })
+  const merged = await h.defs.get('memory_merge').execute({ ids: [a.entry.id, b.entry.id] })
+  assert.equal(merged.entry.inject, false, '全冷来源的合并结果必须仍是冷层')
+  const st = await h.defs.get('memory_status').execute({})
+  assert.equal(st.hotChars, 40, '合并不该给热层加字符，实际 ' + st.hotChars)
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v4.15 换层按目标层判：冷→热被热层上限拦；全冷合并仍是冷层')
+}
+
+// ---- v4.15② §7 验收条款：满库写入 0→100% / 误归档 0 / restore 演练 ----
+// 用临时 storeDir 跑真实 lib 代码（apply 全链路），不碰生产记忆。
+{
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString()
+  const seedStore = (dir, lowAgeDays) => {
+    // 受保护条目：pinned 规则 / 规则 / draft / vault:// 指针——收敛一条都不许归档。
+    const entries = [
+      normalizeEntry({ id: 'p1', text: '📌 硬规则 ' + '甲'.repeat(91), kind: 'rule', pinned: true, addedAt: daysAgo(30), updatedAt: daysAgo(30) }),
+      normalizeEntry({ id: 'p2', text: '规则条目 ' + '乙'.repeat(76), kind: 'rule', addedAt: daysAgo(30), updatedAt: daysAgo(30) }),
+      normalizeEntry({ id: 'p3', text: '未证实草稿 ' + '丙'.repeat(36), kind: 'fact', status: 'draft', addedAt: daysAgo(30), updatedAt: daysAgo(30) }),
+      normalizeEntry({ id: 'p4', text: '知识卡指针 vault://30-Build/x.md#1', kind: 'reference', addedAt: daysAgo(30), updatedAt: daysAgo(30) }),
+      normalizeEntry({ id: 'v1', text: '低价值事实一 ' + '丁'.repeat(43), kind: 'fact', usedCount: 0, addedAt: daysAgo(lowAgeDays), updatedAt: daysAgo(lowAgeDays) }),
+      normalizeEntry({ id: 'v2', text: '低价值事实二 ' + '戊'.repeat(43), kind: 'fact', usedCount: 0, addedAt: daysAgo(lowAgeDays), updatedAt: daysAgo(lowAgeDays) }),
+      normalizeEntry({ id: 'v3', text: '低价值事实三 ' + '己'.repeat(43), kind: 'fact', usedCount: 0, addedAt: daysAgo(lowAgeDays), updatedAt: daysAgo(lowAgeDays) }),
+    ]
+    const used = entries.reduce((sum, entry) => sum + entry.text.length, 0)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'memory.json'), JSON.stringify({ version: 1, nextId: 20, entries }), 'utf8')
+    return { used, entries }
+  }
+  // 145 字符 payload：与 §7 改前真机复测同口径。
+  const payload = '收敛集成测试：满库写入应成功。' + 'X'.repeat(130)
+  assert.equal(payload.length, 145, 'payload 必须是 145 字符，实际 ' + payload.length)
+
+  // A) 0% 基线：低价值条目只有 1 天库龄（< CONVERGE_MIN_AGE_DAYS=3），收敛不许动它 → 写被拒，且 0 条误归档。
+  const tmpA = makeTmp('dsh-memory-converge-reject')
+  const seededA = seedStore(tmpA, 1)
+  assert.equal(seededA.used, 400, 'A 场景种子应恰好写满 400 字符，实际 ' + seededA.used)
+  const hA = host(tmpA, { maxBytes: 400, maxColdBytes: 400 })
+  await assert.rejects(
+    () => hA.defs.get('memory_add').execute({ text: payload, kind: 'fact' }),
+    (error) => error.code === 'MEMORY_BUDGET_EXCEEDED',
+  )
+  const listA = await hA.defs.get('memory_list').execute({ includeArchived: true })
+  assert.equal(listA.entries.filter((entry) => entry.status === 'deprecated').length, 0, '被拒时不许归档任何条目（0 误归档）')
+  for (const id of ['p1', 'p2', 'p3', 'p4', 'v1', 'v2', 'v3']) {
+    assert.ok(listA.entries.some((entry) => entry.id === id), '被拒场景不许动 ' + id)
+  }
+  rmSync(tmpA, { recursive: true, force: true })
+  ok('v4.15② 满库写入 0% 基线：无合规候选时拒绝，0 条误归档')
+
+  // B) 100%：同样的满库，但低价值条目 4 天库龄（≥3 天）→ 收敛归档它们腾地方，写入成功。
+  const tmpB = makeTmp('dsh-memory-converge-ok')
+  const seededB = seedStore(tmpB, 4)
+  assert.equal(seededB.used, 400)
+  const hB = host(tmpB, { maxBytes: 400, maxColdBytes: 400 })
+  const beforeB = await hB.defs.get('memory_status').execute({})
+  assert.ok(beforeB.budget.remaining < payload.length, '满库时余量应小于 payload：' + beforeB.budget.remaining)
+  const addedB = await hB.defs.get('memory_add').execute({ text: payload, kind: 'fact' })
+  assert.equal(typeof addedB.entry.id, 'string', '满库收敛后写入必须成功（0→100%）')
+  assert.ok(addedB.converged !== undefined, '成功写入必须带 converged 明细，便于审计')
+  assert.equal(addedB.converged.tier, 'hot', '本次写的是热层')
+  assert.equal(addedB.converged.archived.length, 3, '应收敛 3 条低价值条目，实际 ' + addedB.converged.archived.join(','))
+  const archivedB = addedB.converged.archived
+  // ④ 误归档 0：pinned / rule / draft / vault:// 指针一条都不许进归档名单。
+  for (const id of ['p1', 'p2', 'p3', 'p4']) assert.ok(!archivedB.includes(id), '受保护条目不许被归档：' + id)
+  for (const id of archivedB) assert.ok(['v1', 'v2', 'v3'].includes(id), '只许归档低价值条目，实际归档 ' + id)
+  const statusB = await hB.defs.get('memory_status').execute({})
+  assert.equal(statusB.archived, 3, '归档账本应记 3 条，实际 ' + statusB.archived)
+  assert.ok(statusB.hotChars <= 400, '写入后热层不许超预算：' + statusB.hotChars)
+  const manifestFile = path.join(tmpB, 'archive-manifest.jsonl')
+  assert.ok(existsSync(manifestFile), '归档必须落 archive-manifest.jsonl（可审计）')
+  const manifestRows = readFileSync(manifestFile, 'utf8').split('\n').filter(Boolean)
+  assert.equal(manifestRows.length, 3, 'manifest 行数应等于归档数，实际 ' + manifestRows.length)
+  const listB = await hB.defs.get('memory_list').execute({ includeArchived: true })
+  for (const id of ['p1', 'p2', 'p3', 'p4']) {
+    const entry = listB.entries.find((item) => item.id === id)
+    assert.ok(entry !== undefined && entry.status !== 'deprecated', '受保护条目必须原样生效：' + id)
+  }
+  ok('v4.15② 满库写入 0→100%：合规收敛归档 3 条、护住 pinned/rule/draft/vault 指针（误归档 0）')
+
+  // ⑥ restore 演练：给足预算后把自动归档的一条恢复回来，账本回到生效。
+  const hB2 = host(tmpB, { maxBytes: 800, maxColdBytes: 800 })
+  const restoreTarget = archivedB[0]
+  const restoredB = await hB2.defs.get('memory_restore').execute({ id: restoreTarget })
+  assert.equal(restoredB.restored, true, 'restore 演练必须成功')
+  const statusB2 = await hB2.defs.get('memory_status').execute({})
+  assert.equal(statusB2.archived, 2, '恢复后归档数应 3→2，实际 ' + statusB2.archived)
+  assert.ok(statusB2.hotChars > statusB.hotChars, '恢复后热层应重新计入该条字符：' + statusB.hotChars + '→' + statusB2.hotChars)
+  rmSync(tmpB, { recursive: true, force: true })
+  ok('v4.15② restore 演练：自动归档条目可 memory_restore 恢复，账本一致')
+}
+
+// ---- v4.15② §7 验收条款：注入配额（索引层 ≥8 / 总长 ≤ maxInjectChars）----
+{
+  const tmp = makeTmp('dsh-memory-inject-quota')
+  const now = new Date().toISOString()
+  const entries = []
+  // 18 条 pinned 硬规则（每条约 130 字符）：核心层配额 0.78×3200=2496，一定溢出降级。
+  for (let i = 0; i < 18; i += 1) entries.push(normalizeEntry({ id: 'p' + i, text: '硬规则' + i + ' ' + '规'.repeat(122), kind: 'rule', pinned: true, addedAt: now, updatedAt: now }))
+  // 40 条普通条目：索引层要有东西可放。
+  for (let i = 0; i < 40; i += 1) entries.push(normalizeEntry({ id: 'r' + i, text: '普通事实' + i + ' ' + '实'.repeat(30), kind: 'fact', addedAt: now, updatedAt: now }))
+  mkdirSync(tmp, { recursive: true })
+  writeFileSync(path.join(tmp, 'memory.json'), JSON.stringify({ version: 1, nextId: entries.length + 1, entries }), 'utf8')
+  const h = host(tmp, { maxBytes: 12000, maxInjectChars: 3200 })
+  const listed = await h.defs.get('memory_list').execute({})
+  const stats = listed.injectStats
+  assert.ok(listed.block.length <= 3200, '注入块总长必须 ≤ maxInjectChars：' + listed.block.length)
+  assert.ok(stats.pinnedDowngraded > 0 || (stats.richIndexCount ?? 0) + (stats.compactCount ?? 0) > 0, 'pinned 溢出必须降级不丢弃')
+  assert.ok(stats.indexedCount >= 8, '索引层 ≥8 条（§7），实际 ' + stats.indexedCount)
+  assert.equal(stats.indexedCount, (stats.richIndexCount ?? 0) + (stats.compactCount ?? 0), 'indexedCount 必须等于完整行+紧凑行（不漏算）')
+  assert.ok(stats.richIndexCount <= 8, '完整索引行上限 8（MAX_RICH_INDEX），实际 ' + stats.richIndexCount)
+  assert.ok(stats.richIndexCount >= 8, '预算充足时完整行应占满 8 条，实际 ' + stats.richIndexCount)
+  rmSync(tmp, { recursive: true, force: true })
+  ok('v4.15② 注入配额：索引层 ≥8（完整 8 + 紧凑若干）、总长 ≤ maxInjectChars、pinned 溢出降级不丢')
+}
 // ---- v3.19 自动入库 + 预算保护：真跑一遍 turn-stopping（闭包逻辑的集成测试） ----
 {
   const workTmp = makeTmp('dsh-memory-ws')

@@ -26,7 +26,7 @@
 
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { CONFLICT_FLOOR, CONSOLIDATE_MIN_USES, CONTEXT_ORDER, DATE_ONLY, DEFAULT_MAX_BYTES, DEFAULT_MAX_INJECT_CHARS, DEFAULT_SCOPE_ROOTS, KIND_PROCEDURE, MAX_CANDIDATES_PER_TURN, MAX_SIMILAR_HINT, MAX_TEXT_CHARS, PROCEDURE_MIN_VERIFIED, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, TEXT_TOO_LONG_HINT, PROFILE_SLOTS, PROFILE_SLOT_LABELS } from './lib/constants.js'
+import { CONFLICT_FLOOR, CONSOLIDATE_MIN_USES, CONTEXT_ORDER, DATE_ONLY, DEFAULT_MAX_BYTES, DEFAULT_MAX_COLD_BYTES, DEFAULT_MAX_INJECT_CHARS, DEFAULT_SCOPE_ROOTS, MAX_COLD_BYTES_CAP, KIND_PROCEDURE, MAX_CANDIDATES_PER_TURN, MAX_SIMILAR_HINT, MAX_TEXT_CHARS, PROCEDURE_MIN_VERIFIED, ROOM_MIN_AGE_DAYS, SCHEMA_VERSION, SIMILAR_HINT_FLOOR, TEXT_TOO_LONG_HINT, PROFILE_SLOTS, PROFILE_SLOT_LABELS } from './lib/constants.js'
 import { deriveStaleAfter, detectContradictions, effectiveImportance, entityCoccur, entityIndex, importanceOf, isArchivedEntry, isInvalidEntry, isNotYetValid, isStaleEntry, isTrueAt, profileView, localDateOf, parseTimestamp } from './lib/entry.js'
 import { stripHarnessBlocks, suggestAliases, textSimilarity } from './lib/text.js'
 import { collectRuleFiles, derivableHit, extractCandidates, extractRuleCandidates } from './lib/candidates.js'
@@ -52,6 +52,12 @@ export { readStoreSnapshot } from './lib/store-snapshot.js'
 export function apply(ctx, config) {
   const maxBytes =
     Number.isInteger(config?.maxBytes) && config.maxBytes > 0 ? Math.min(config.maxBytes, 64 * 1024) : DEFAULT_MAX_BYTES
+  // v4.15：冷层预算——默认 max(4 × maxBytes, 48000)，上限 256 KiB（取经依据见 lib/constants.js）。
+  // 配置与代码默认值仍要两处同口径：只改一处不生效（v3.21 真机踩过）。
+  let maxColdBytes =
+    Number.isInteger(config?.maxColdBytes) && config.maxColdBytes > 0
+      ? Math.min(config.maxColdBytes, MAX_COLD_BYTES_CAP)
+      : Math.max(maxBytes * 4, DEFAULT_MAX_COLD_BYTES)
   let maxInjectChars =
     Number.isInteger(config?.maxInjectChars) && config.maxInjectChars > 0
       ? Math.min(config.maxInjectChars, 32 * 1024)
@@ -63,6 +69,13 @@ export function apply(ctx, config) {
     configWarning =
       'maxInjectChars(' + maxInjectChars + ') 大于 maxBytes(' + maxBytes + ')：已钳到 ' + maxBytes + '。注入预算不该超过存储预算。'
     maxInjectChars = maxBytes
+  }
+  // v4.15：冷层不该比热层小（冷层不进 prompt，比热层小只会更早撞墙，没有收益）。配反了同样钳住并留痕。
+  if (maxColdBytes < maxBytes) {
+    configWarning +=
+      (configWarning === '' ? '' : '；') +
+      'maxColdBytes(' + maxColdBytes + ') 小于 maxBytes(' + maxBytes + ')：冷层不该比热层小，已钳到 ' + maxBytes + '。'
+    maxColdBytes = maxBytes
   }
   // v4.2：可推导写入过滤开关（默认 'skip'；'off' 整体关闭）。这是写策略，不碰检索路径。
   const deriveGate = config?.deriveGate === 'off' ? 'off' : 'skip'
@@ -78,7 +91,7 @@ export function apply(ctx, config) {
   // v3.10（A11）：relevanceFloor <= 0 等于把相关性门槛关掉（会把无关记忆当相关注入），忽略这种配置。
   const relevanceFloor = Number.isFinite(config?.relevanceFloor) && config.relevanceFloor > 0 ? config.relevanceFloor : undefined
   // v4.3.0：存储层搬到 lib/store.js 的工厂里，apply 只负责组装：建 store、注册工具、挂注入层。
-  const store = createStore({ ctx, config, maxBytes, maxInjectChars, scopeRoots, relevanceFloor })
+  const store = createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChars, scopeRoots, relevanceFloor })
   const {
     storeDir,
     storeFile,
@@ -99,11 +112,16 @@ export function apply(ctx, config) {
     newEntryId,
     scoreEntriesIndexed,
     makeRoom,
+    convergeTier,
     budgetExceededMessage,
     autoPromoteRule,
     isActive,
     activeEntries,
     usedChars,
+    tierOf,
+    hotChars,
+    coldChars,
+    tierUsage,
     publicEntry,
     renderOnce,
     countUsage,
@@ -132,28 +150,38 @@ export function apply(ctx, config) {
       ).length,
       archived: state.entries.length - entries.length,
       // v3.25（考虑以后）：容量预警——撞墙前先让人看见，而不是等 memory_add 报错。
-      health:
-        store.storeHealth !== 'ok'
-          ? store.storeHealth
-          : usedChars() / maxBytes >= 0.95
-            ? 'full'
-            : usedChars() / maxBytes >= 0.85
-              ? 'near-full'
-              : 'ok',
+      // v4.15：两层里取最差的一层。任一层满 = 写那一层会被拒；只说总账会让人以为「还有空间」。
+      health: (() => {
+        if (store.storeHealth !== 'ok') return store.storeHealth
+        const hot = tierUsage('hot')
+        const cold = tierUsage('cold')
+        if (hot.state === 'full' || cold.state === 'full') return 'full'
+        if (hot.state === 'degraded' || cold.state === 'degraded') return 'near-full'
+        return 'ok'
+      })(),
       ...(store.corruptCopy !== '' ? { healthNote: store.corruptCopy } : {}),
       usedChars: usedChars(),
+      hotChars: hotChars(),
+      coldChars: coldChars(),
       maxBytes,
+      maxColdBytes,
+      budget: tierUsage('hot'),
+      coldBudget: tierUsage('cold'),
       maxInjectChars,
       injectedChars: block.length,
       // v2.8：maxInjectChars 只管正文行，头部/索引/诊断另有固定开销，所以总长会略超——
       // 与其让人猜，不如直接把「是否超」标出来。
       injectedOverBudget: block.length > maxInjectChars,
       // v3.24：降级收益——索引行花了多少、被出局的条目若全量展开要花多少。
+      // v4.15②：索引层现在两级渲染（完整行 + 紧凑行）。indexedCount 修回「索引层总条数」——
+      // 只数完整行会让「索引层 23 条」被报成 6 条（值不值判定 §7 的 0→≥8 口径就断了）。
       injectStats: {
         fullChars: listStats.fullChars ?? 0,
         indexedChars: listStats.indexedChars ?? 0,
         droppedFullChars: listStats.droppedFullChars ?? 0,
-        indexedCount: Array.isArray(listStats.indexed) ? listStats.indexed.length : 0,
+        indexedCount: (Array.isArray(listStats.indexed) ? listStats.indexed.length : 0) + (Array.isArray(listStats.compact) ? listStats.compact.length : 0),
+        richIndexCount: Array.isArray(listStats.indexed) ? listStats.indexed.length : 0,
+        compactCount: Array.isArray(listStats.compact) ? listStats.compact.length : 0,
         droppedCount: Array.isArray(listStats.dropped) ? listStats.dropped.length : 0,
       },
       ...(configWarning !== '' ? { configWarning } : {}),
@@ -190,11 +218,40 @@ export function apply(ctx, config) {
           indexedChars: { type: 'integer' },
           droppedFullChars: { type: 'integer' },
           indexedCount: { type: 'integer' },
+          richIndexCount: { type: 'integer' },
+          compactCount: { type: 'integer' },
           droppedCount: { type: 'integer' },
         },
       },
       usedChars: { type: 'integer' },
+      hotChars: { type: 'integer' },
+      coldChars: { type: 'integer' },
       maxBytes: { type: 'integer' },
+      maxColdBytes: { type: 'integer' },
+      budget: {
+        type: 'object',
+        properties: {
+          tier: { type: 'string', enum: ['hot', 'cold'] },
+          used: { type: 'integer' },
+          max: { type: 'integer' },
+          remaining: { type: 'integer' },
+          state: { type: 'string', enum: ['ok', 'degraded', 'full'] },
+        },
+        required: ['tier', 'used', 'max', 'remaining', 'state'],
+        additionalProperties: false,
+      },
+      coldBudget: {
+        type: 'object',
+        properties: {
+          tier: { type: 'string', enum: ['hot', 'cold'] },
+          used: { type: 'integer' },
+          max: { type: 'integer' },
+          remaining: { type: 'integer' },
+          state: { type: 'string', enum: ['ok', 'degraded', 'full'] },
+        },
+        required: ['tier', 'used', 'max', 'remaining', 'state'],
+        additionalProperties: false,
+      },
       maxInjectChars: { type: 'integer' },
       injectedChars: { type: 'integer' },
       injectedOverBudget: { type: 'boolean' },
@@ -213,16 +270,22 @@ export function apply(ctx, config) {
       value?.health === 'corrupt'
         ? `\n⚠ 记忆库损坏保护中（原文件已另存：${value?.healthNote ?? '未知'}），写入已禁用，修好后重载插件。`
         : value?.health === 'full'
-          ? '\n⚠ 存储 ≥95%：下次写入会先归档「30 天没动过、从未被检索命中」的条目腾地方（可 memory_restore 恢复）。建议先 memory_audit 看重复项。'
+          ? '\n⚠ 存储见顶（热层=进 prompt，冷层=只检索）：写已满的那层会先归档同层低价值条目腾地方，仍不够才拒绝（可 memory_restore 恢复）。建议先 memory_audit 看重复项。'
           : value?.health === 'near-full'
-            ? '\n（存储已达 85%：写入会先归档低价值条目腾地方，归档可 memory_restore 恢复。）'
+            ? '\n（存储有一层已达 85%：写入会先归档同层低价值条目腾地方，归档可 memory_restore 恢复。）'
             : ''
     const archivedCount = value?.archived ?? 0
     const hiddenHint =
       archivedCount > 0 && value?.includeArchived !== true
         ? `\n（另有 ${archivedCount} 条归档未列出：它们不计预算、不参与注入，存在 archive.json；要看加 includeArchived:true）`
         : ''
-    const head = `记忆 ${value?.active ?? 0} 条生效 / ${archivedCount} 条归档（合计 ${value?.total ?? 0}），存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入 ${value?.injectedChars ?? 0}/${value?.maxInjectChars ?? 0} 字符${value?.injectedOverBudget ? ' ⚠超预算' : ''}${hiddenHint}${healthWarn}`
+    // v4.15②：索引层条数直接给在头上——验收与排查都要看得见，不用去翻 block 数行。
+    const injectStats = value?.injectStats
+    const indexStatLine =
+      injectStats && Number(injectStats.indexedCount ?? 0) > 0
+        ? `（索引层 ${injectStats.indexedCount} 条：完整 ${injectStats.richIndexCount ?? 0} + 紧凑 ${injectStats.compactCount ?? 0}）`
+        : ''
+    const head = `记忆 ${value?.active ?? 0} 条生效 / ${archivedCount} 条归档（合计 ${value?.total ?? 0}），存储 热 ${value?.hotChars ?? 0}/${value?.maxBytes ?? 0} · 冷 ${value?.coldChars ?? 0}/${value?.maxColdBytes ?? 0} 字符（冷层不进 prompt），本轮注入 ${value?.injectedChars ?? 0}/${value?.maxInjectChars ?? 0} 字符${indexStatLine}${value?.injectedOverBudget ? ' ⚠超预算' : ''}${hiddenHint}${healthWarn}`
     if (entries.length === 0) return [text(`${head}\n（还没有任何记忆。用 memory_add 写入第一条。）`)]
     const lines = entries.map(
       (entry) =>
@@ -651,6 +714,25 @@ export function apply(ctx, config) {
             confidenceBoosted: { type: 'boolean' },
             usedChars: { type: 'integer' },
             maxBytes: { type: 'integer' },
+            // v4.15②：满库自动收敛的明细（只在真的触发时出现）。
+            converged: {
+              type: 'object',
+              properties: {
+                tier: { type: 'string', enum: ['hot', 'cold'] },
+                archived: { type: 'array', items: { type: 'string' } },
+                merged: {
+                  type: 'array',
+                  items: {
+                    type: 'object',
+                    properties: { from: { type: 'string' }, into: { type: 'string' } },
+                    required: ['from', 'into'],
+                    additionalProperties: false,
+                  },
+                },
+              },
+              required: ['tier', 'archived', 'merged'],
+              additionalProperties: false,
+            },
             // v4.2：可推导过滤命中时 entry 缺省（不写库），改为返回诊断三件套。
             skipped: { type: 'boolean' },
             deriveReason: { type: 'string' },
@@ -707,7 +789,10 @@ export function apply(ctx, config) {
             aliasHint && Array.isArray(aliasHint.suggestion) && aliasHint.suggestion.length > 0
               ? `\n💡 没写别名：${aliasHint.suggestion.join('、')}（围绕这些词补 3–5 个同义/缩写/中英对照，用 memory_update {id:"${entry?.id}", aliases:[...]}；别名是「用户换种说法时」的召回桥）`
               : ''
-          return [text(`${head}\n${entry?.text ?? ''}\n（占用 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，下一条模型请求起生效）${hint}${aliasLine}`)]
+          const convLine = value?.converged
+            ? `\n满库自动收敛（${value.converged.tier === 'cold' ? '冷层' : '热层'}）：归档 ${value.converged.archived.join(' ') || '无'}${value.converged.merged.length > 0 ? '；包含式去重 ' + value.converged.merged.map((item) => item.from + '→' + item.into).join(' ') : ''}（memory_restore 可逐条恢复）`
+            : ''
+          return [text(`${head}\n${entry?.text ?? ''}\n（存储 热 ${tierUsage('hot').used}/${maxBytes} · 冷 ${tierUsage('cold').used}/${maxColdBytes}，冷层不进 prompt；下一条模型请求起生效）${convLine}${hint}${aliasLine}`)]
         },
       },
       async execute(args) {
@@ -881,23 +966,28 @@ export function apply(ctx, config) {
               ' 做法：先把流程真跑两遍确认可复现，再 memory_add {kind:"procedure", verifiedCount:' + PROCEDURE_MIN_VERIFIED + '}；之后每次复用成功用 memory_update {id, verifiedCount:N+1} 累计。',
           )
         }
-        if (usedChars() + raw.length > maxBytes) {
-          const room = makeRoom(raw.length, { reason: 'auto-archive: 为新记忆腾预算', minAgeDays: ROOM_MIN_AGE_DAYS })
+        // v4.15：按**目标层**算账——inject:false 写冷层（只检索、不进 prompt），其余写热层。
+        // 原来两层共用 maxBytes，等于让「不花 prompt 的事实」挤占「要进 prompt 的判据」的空间。
+        const targetTier = args?.inject === false ? 'cold' : 'hot'
+        const targetBudget = tierUsage(targetTier)
+        // v4.15②：满库自动收敛。顺序 = 先按旧规则腾（stale/从未命中且够旧）→ 再收敛（包含式去重 + 低价值归档）
+        // → 仍不够才拒绝。收敛只归档不删除，memory_restore 可逐条回；单次最多 10 条。
+        let converged = null
+        if (targetBudget.used + raw.length > targetBudget.max) {
+          const room = makeRoom(raw.length, {
+            tier: targetTier,
+            reason: 'auto-archive: 为新记忆腾预算',
+            minAgeDays: ROOM_MIN_AGE_DAYS,
+          })
           if (!room.ok) {
-            const cutoff = Date.now() - ROOM_MIN_AGE_DAYS * 86400000
-            const candidates = activeEntries()
-              .filter(
-                (entry) =>
-                  entry.pinned !== true &&
-                  (entry.usedCount ?? 0) === 0 &&
-                  entry.kind !== 'rule' &&
-                  entry.status !== 'draft' &&
-                  Date.parse(String(entry.updatedAt ?? entry.addedAt ?? '')) < cutoff,
+            converged = convergeTier(raw.length, targetTier)
+            if (!converged.ok) {
+              // v4.2（Anthropic A2）：不只拒绝，给出「合并哪几条 / drop 哪些 stale」的具体建议。
+              throw fail(
+                'MEMORY_BUDGET_EXCEEDED',
+                budgetExceededMessage(raw.length, [...room.archived, ...converged.archived], targetTier),
               )
-              .map((entry) => entry.id)
-              .slice(0, 10)
-            // v4.2（Anthropic A2）：不只拒绝，给出「合并哪几条 / drop 哪些 stale」的具体建议。
-            throw fail('MEMORY_BUDGET_EXCEEDED', budgetExceededMessage(raw.length, room.archived))
+            }
           }
         }
         const now = new Date().toISOString()
@@ -1006,6 +1096,7 @@ export function apply(ctx, config) {
           deduped: false,
           usedChars: usedChars(),
           maxBytes,
+          ...(converged !== null ? { converged } : {}),
           ...(similar.length > 0
             ? {
                 similar: similar.map((item) => ({
@@ -1110,7 +1201,7 @@ export function apply(ctx, config) {
           additionalProperties: false,
         },
         render(_args, value) {
-          return [text(`已更新 ${value?.entry?.id}：\n${value?.entry?.text ?? ''}\n（占用 ${value?.usedChars ?? 0} 字符）`)]
+          return [text(`已更新 ${value?.entry?.id}：\n${value?.entry?.text ?? ''}\n（存储 热 ${tierUsage('hot').used}/${maxBytes} · 冷 ${tierUsage('cold').used}/${maxColdBytes}）`)]
         },
       },
       async execute(args) {
@@ -1151,9 +1242,16 @@ export function apply(ctx, config) {
             'procedure 需要 verifiedCount ≥ ' + PROCEDURE_MIN_VERIFIED + '（当前 ' + nextVerified + (becomingProcedure ? '；改成 procedure 必须本次显式给证据，不能沿用存量值' : '') + '）：先真跑成功 ≥2 次再入库/改 kind。',
           )
         }
-        const projected = usedChars() - entry.text.length + (next !== '' ? next.length : 0)
-        if (projected > maxBytes) {
-          throw fail('MEMORY_BUDGET_EXCEEDED', `更新后会到 ${projected} / ${maxBytes} 字符，超预算。请精简或先删掉别的条目。`)
+        // v4.15：按目标层算账——inject 从 false 改回 true 就是「冷 → 热」，必须按热层上限判，不能沿用总账。
+        const nextTier = args?.inject === false ? 'cold' : args?.inject === true ? 'hot' : tierOf(entry)
+        const nextBudget = tierUsage(nextTier)
+        const projected =
+          nextBudget.used - (tierOf(entry) === nextTier ? entry.text.length : 0) + (next !== '' ? next.length : 0)
+        if (projected > nextBudget.max) {
+          throw fail(
+            'MEMORY_BUDGET_EXCEEDED',
+            `更新后会到 ${projected} / ${nextBudget.max} 字符（${nextTier === 'cold' ? '冷层' : '热层'}），超预算。请精简或先删掉别的条目。`,
+          )
         }
         if (args?.supersede === true) {
           // v4.2.1（M2）：supersede 会「新条目生效 + 旧条作废」，没有正文就只会造出一条空记忆并废掉旧条。
@@ -1430,7 +1528,7 @@ export function apply(ctx, config) {
           additionalProperties: false,
         },
         render(_args, value) {
-          if (value?.restored) return [text(`已恢复 ${value?.id}（占用 ${value?.usedChars ?? 0} 字符，下一条模型请求起重新注入）`)]
+          if (value?.restored) return [text(`已恢复 ${value?.id}（存储 热 ${tierUsage('hot').used}/${maxBytes} · 冷 ${tierUsage('cold').used}/${maxColdBytes}；下一条模型请求起重新注入）`)]
           if (value?.reason === 'not-archived') return [text(`${value?.id} 本来就是生效记忆，不用恢复`)]
           return [text(`没有这条记忆：${value?.id}`)]
         },
@@ -1450,9 +1548,12 @@ export function apply(ctx, config) {
         if (typeof entry.supersededBy === 'string' && entry.supersededBy !== '') {
           throw fail('MEMORY_SUPERSEDED', `${id} 已被 ${entry.supersededBy} 取代，不能直接恢复（会同时存在两个版本）。要保留内容请用 memory_add 重写一条。`)
         }
-        if (usedChars() + entry.text.length > maxBytes) {
-          throw fail('MEMORY_BUDGET_EXCEEDED', 
-            `恢复后会到 ${usedChars() + entry.text.length} / ${maxBytes} 字符，超预算。先用 memory_remove {id, confirm:true} 删掉别的，或调大 maxBytes。`,
+        // v4.15：恢复按条目自己的层算账（冷层恢复不动热层预算）。
+        const restoreTier = tierOf(entry)
+        const restoreBudget = tierUsage(restoreTier)
+        if (restoreBudget.used + entry.text.length > restoreBudget.max) {
+          throw fail('MEMORY_BUDGET_EXCEEDED',
+            `恢复后会到 ${restoreBudget.used + entry.text.length} / ${restoreBudget.max} 字符（${restoreTier === 'cold' ? '冷层' : '热层'}），超预算。先用 memory_remove {id, confirm:true} 删掉别的，或调大 ${restoreTier === 'cold' ? 'maxColdBytes' : 'maxBytes'}。`,
           )
         }
         delete entry.status
@@ -1648,7 +1749,7 @@ export function apply(ctx, config) {
         },
         render(_args, value) {
           const entry = value?.entry
-          return [text(`已合并 ${(value?.merged ?? []).join(', ')} → ${entry?.id}\n${entry?.text ?? ''}\n（占用 ${value?.usedChars ?? 0} 字符，旧条目留档不再注入）`)]
+          return [text(`已合并 ${(value?.merged ?? []).join(', ')} → ${entry?.id}\n${entry?.text ?? ''}\n（存储 热 ${tierUsage('hot').used}/${maxBytes} · 冷 ${tierUsage('cold').used}/${maxColdBytes}；旧条目留档不再注入）`)]
         },
       },
       async execute(args) {
@@ -1689,9 +1790,16 @@ export function apply(ctx, config) {
               ' 做法：先真跑两遍，再用 memory_merge {ids, kind:"procedure", verifiedCount:' + PROCEDURE_MIN_VERIFIED + '} 显式给证据。',
           )
         }
-        const freed = sources.reduce((sum, entry) => sum + entry.text.length, 0)
-        if (usedChars() - freed + mergedText.length > maxBytes) {
-          throw fail('MEMORY_BUDGET_EXCEEDED', `合并后超预算（上限 ${maxBytes} 字符）。请先精简或删掉别的条目。`)
+        // v4.15：合并结果默认进热层——除非来源全是冷层，否则「合并两条冷事实」会凭空生成一条热条目。
+        const allCold = sources.every((entry) => tierOf(entry) === 'cold')
+        const mergedTier = allCold ? 'cold' : 'hot'
+        const mergedBudget = tierUsage(mergedTier)
+        const freedInTier = sources.reduce((sum, entry) => sum + (tierOf(entry) === mergedTier ? entry.text.length : 0), 0)
+        if (mergedBudget.used - freedInTier + mergedText.length > mergedBudget.max) {
+          throw fail(
+            'MEMORY_BUDGET_EXCEEDED',
+            `合并后超预算（${mergedTier === 'cold' ? '冷层' : '热层'}上限 ${mergedBudget.max} 字符）。请先精简或删掉别的条目。`,
+          )
         }
         const now = new Date().toISOString()
         // 别名继承：合并时把各来源的别名并起来，否则每合并一次「桥」就淡一次（v3.6 发现的稀疏化根因）。
@@ -1728,6 +1836,7 @@ export function apply(ctx, config) {
           ...(importanceValues.length > 0 ? { importance: Math.max(...importanceValues) } : {}),
           ...(staleValues.length > 0 ? { staleAfter: staleValues[0] } : {}),
           ...(args?.pinned === true || first.pinned === true ? { pinned: true } : {}),
+          ...(allCold ? { inject: false } : {}),
           addedAt: now,
           updatedAt: now,
         })
@@ -1850,7 +1959,7 @@ export function apply(ctx, config) {
           const mostUsed = Array.isArray(value?.mostUsed) ? value.mostUsed : []
           const byScope = Array.isArray(value?.byScope) ? value.byScope : []
           const lines = [
-            `记忆审计：${value?.total ?? 0} 条（生效 ${value?.active ?? 0} / 失效 ${value?.superseded ?? 0}），占用 ${value?.budget?.usedChars ?? 0}/${value?.budget?.maxBytes ?? 0} 字符，本轮注入 ${value?.budget?.injectedChars ?? 0}`,
+            `记忆审计：${value?.total ?? 0} 条（生效 ${value?.active ?? 0} / 失效 ${value?.superseded ?? 0}），存储 热 ${tierUsage('hot').used}/${maxBytes} · 冷 ${tierUsage('cold').used}/${maxColdBytes} 字符（冷层不进 prompt），本轮注入 ${value?.budget?.injectedChars ?? 0}`,
             `scope 分布：${byScope.map((item) => `${item.scope} ${item.count}`).join(' / ') || '（空）'}`,
             `重复候选 ${duplicates.length} 组：${duplicates.map((item) => `${item.ids.join('~')}(${item.similarity})`).join(' ') || '无'}`,
             `过期候选 ${stale.length} 条：${stale.map((item) => `${item.id}(${item.days}天)`).join(' ') || '无'}`,
@@ -2012,7 +2121,7 @@ export function apply(ctx, config) {
     const md = [
       '# 记忆概览',
       '',
-      '生成于 ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + ' · ' + entries.length + ' 条 · 正文 ' + usedChars() + '/' + maxBytes + ' 字符 · 本轮注入 ' + block.length + '/' + maxInjectChars + (overBudget ? '（超 ' + (block.length - maxInjectChars) + '）' : ''),
+      '生成于 ' + new Date().toISOString().slice(0, 16).replace('T', ' ') + ' · ' + entries.length + ' 条 · 供注入 ' + tierUsage('hot').used + '/' + maxBytes + ' 字符 · 只检索 ' + tierUsage('cold').used + '/' + maxColdBytes + ' 字符 · 本轮注入 ' + block.length + '/' + maxInjectChars + (overBudget ? '（超 ' + (block.length - maxInjectChars) + '）' : ''),
       '',
       ...section('⏰ 已过期待重验', overdue, 'memory_update 重验，或 supersede 推倒'),
       ...section('❓ 未证实', unverified, 'memory_update 加 verified:true 确认'),
@@ -2317,8 +2426,13 @@ export function apply(ctx, config) {
             persistCandidates()
             return { action, pending: pendingCandidates().length, item: slim(item) }
           }
-          if (usedChars() + item.text.length > maxBytes) {
-            throw fail('MEMORY_BUDGET_EXCEEDED', `记忆已占用 ${usedChars()} / ${maxBytes} 字符，先清理过时条目再接受。`)
+          // v4.15：候选接受进热层（没有 inject:false 的候选来源），按热层上限判。
+          const acceptBudget = tierUsage('hot')
+          if (acceptBudget.used + item.text.length > acceptBudget.max) {
+            throw fail(
+              'MEMORY_BUDGET_EXCEEDED',
+              `记忆热层已占用 ${acceptBudget.used} / ${acceptBudget.max} 字符，先清理过时条目再接受。`,
+            )
           }
           const now = new Date().toISOString()
           const entry = normalizeEntry({
@@ -2389,7 +2503,10 @@ export function apply(ctx, config) {
             active: { type: 'integer' },
             archived: { type: 'integer' },
             usedChars: { type: 'integer' },
+            hotChars: { type: 'integer' },
+            coldChars: { type: 'integer' },
             maxBytes: { type: 'integer' },
+            maxColdBytes: { type: 'integer' },
             maxInjectChars: { type: 'integer' },
             configWarning: { type: 'string' },
             codeFingerprint: { type: 'string' },
@@ -2429,12 +2546,25 @@ export function apply(ctx, config) {
             budget: {
               type: 'object',
               properties: {
+                tier: { type: 'string', enum: ['hot', 'cold'] },
                 used: { type: 'integer' },
                 max: { type: 'integer' },
                 remaining: { type: 'integer' },
                 state: { type: 'string', enum: ['ok', 'degraded', 'full'] },
               },
-              required: ['used', 'max', 'remaining', 'state'],
+              required: ['tier', 'used', 'max', 'remaining', 'state'],
+              additionalProperties: false,
+            },
+            coldBudget: {
+              type: 'object',
+              properties: {
+                tier: { type: 'string', enum: ['hot', 'cold'] },
+                used: { type: 'integer' },
+                max: { type: 'integer' },
+                remaining: { type: 'integer' },
+                state: { type: 'string', enum: ['ok', 'degraded', 'full'] },
+              },
+              required: ['tier', 'used', 'max', 'remaining', 'state'],
               additionalProperties: false,
             },
           },
@@ -2449,7 +2579,10 @@ export function apply(ctx, config) {
             'active',
             'archived',
             'usedChars',
+            'hotChars',
+            'coldChars',
             'maxBytes',
+            'maxColdBytes',
             'maxInjectChars',
           ],
           additionalProperties: false,
@@ -2466,14 +2599,14 @@ export function apply(ctx, config) {
             maint && typeof maint.lastRunAt === 'string' && maint.lastRunAt !== ''
               ? `\n维护循环：上次 ${maint.lastRunAt.slice(0, 19).replace('T', ' ')} · 检查 ${maint.checked ?? 0} · 归档 ${maint.archived ?? 0} · 巩固 ${maint.promoted ?? 0}${skippedLine}${maint.note ? '\n' + maint.note : ''}`
               : '\n维护循环：尚未运行（读路径触发，6h 节流）'
-          const budget = value?.budget
-          const budgetLine =
-            budget && budget.state !== 'ok'
-              ? `\n⚠ 存储${budget.state === 'full' ? '已满' : '接近上限'}：${budget.used}/${budget.max} 字符（剩 ${budget.remaining}），新的 memory_add 会被拒绝——先 memory_remove 精简，或调大 maxBytes（配置与代码默认值两处同改）`
+          const budgetLineOf = (item) =>
+            item && item.state !== 'ok'
+              ? `\n⚠ ${item.tier === 'cold' ? '冷层（只检索、不进 prompt）' : '热层（会进 prompt）'}存储${item.state === 'full' ? '已满' : '接近上限'}：${item.used}/${item.max} 字符（剩 ${item.remaining}），写这层会被拒绝——先 memory_remove 精简，或调大 ${item.tier === 'cold' ? 'maxColdBytes' : 'maxBytes'}（配置与代码默认值两处同改）`
               : ''
+          const budgetLine = budgetLineOf(value?.budget) + budgetLineOf(value?.coldBudget)
           return [
             text(
-              `记忆库可用：${value?.active ?? 0} 条生效 / ${value?.archived ?? 0} 条归档，存储 ${value?.usedChars ?? 0}/${value?.maxBytes ?? 0} 字符，本轮注入预算 ${value?.maxInjectChars ?? 0} 字符，库文件 ${value?.storeFile ?? '?'}${maintLine}${budgetLine}\n代码指纹 ${value?.codeFingerprint ?? '?'}`,
+              `记忆库可用：${value?.active ?? 0} 条生效 / ${value?.archived ?? 0} 条归档，存储 热 ${value?.hotChars ?? 0}/${value?.maxBytes ?? 0} · 冷 ${value?.coldChars ?? 0}/${value?.maxColdBytes ?? 0}（冷层不进 prompt），本轮注入预算 ${value?.maxInjectChars ?? 0} 字符，库文件 ${value?.storeFile ?? '?'}${maintLine}${budgetLine}\n代码指纹 ${value?.codeFingerprint ?? '?'}`,
             ),
           ]
         },
@@ -2529,7 +2662,16 @@ export function apply(ctx, config) {
         // v4.14：预算状态与健康度同源（2026-11-12 实测：11945/12000 时 health 仍报 ok，
         // 而 memory_add 已经被拒——诊断说没事、动作却失败，就是假安全）。
         const budget = store.budgetState()
-        const health = store.storeHealth !== 'ok' ? store.storeHealth : budget.state
+        const coldBudget = store.coldBudgetState()
+        // v4.15：health 报「最差的那层」——任一层满，对应写入就会被拒，不许只报热层说 ok。
+        const health =
+          store.storeHealth !== 'ok'
+            ? store.storeHealth
+            : budget.state === 'full' || coldBudget.state === 'full'
+              ? 'full'
+              : budget.state === 'degraded' || coldBudget.state === 'degraded'
+                ? 'degraded'
+                : 'ok'
         const liveEntries = activeEntries()
         const active = liveEntries.length
         // v4.12：类目分布（tag / scope）。只统计生效条目；tag 只报前 20，避免状态输出膨胀。
@@ -2575,7 +2717,10 @@ export function apply(ctx, config) {
           active,
           archived: state.entries.length - active,
           usedChars: usedChars(),
+          hotChars: budget.used,
+          coldChars: coldBudget.used,
           maxBytes,
+          maxColdBytes,
           maxInjectChars,
           ...(configWarning !== '' ? { configWarning } : {}),
           facets,
@@ -2583,9 +2728,10 @@ export function apply(ctx, config) {
           maintenance: store.maintenance,
           // v4.14：预算状态——degraded/full 时新的写入会被拒绝，别等撞墙才发现。
           budget,
+          coldBudget,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.14.0-elimination-observe',
+          codeFingerprint: '4.15.0-inject-quota',
         }
       },
     }),

@@ -9,6 +9,18 @@
 // 实测后果是「记忆加不进去」（7892/8000 只剩 108 字符）。注入预算才是真正影响 token 成本的那层，存储层放宽。
 export const DEFAULT_MAX_BYTES = 12000
 
+// v4.15：冷层预算（inject:false 的条目——只参与 memory_search，不占每轮 prompt）。
+// 取经 Letta 两份一手证据：
+//   ① context-constitution 前言：「You have infinite full-resolution storage … Your memory bottleneck lies in the context window itself」
+//      （https://github.com/letta-ai/context-constitution/blob/main/constitution/CONSTITUTION.md）
+//   ② 代码侧两个上限差 10×：CORE_MEMORY_BLOCK_CHAR_LIMIT=5000（进上下文的块）vs DEFAULT_CORE_MEMORY_SOURCE_CHAR_LIMIT=50000（外部源）
+//      （letta-ai/letta@0.9.1 letta/constants.py）
+// 结论：存储不该和上下文同价。热层仍卡 maxBytes（它决定每轮 prompt 成本）；冷层单独卡，且上限大一个量级。
+// 默认 = max(4 × maxBytes, 48000)：4× 是工程余量、不是实测最优；48000 保证 12k 配置下冷层有 4 倍空间。
+// 真机基线（2026-11-12，改前）：113 条生效里热层 53 条 / 6014 字符、冷层 60 条 / 5872 字符；单预算 11886/12000 把「不进 prompt 的一半」也卡住了。
+export const DEFAULT_MAX_COLD_BYTES = 48000
+export const MAX_COLD_BYTES_CAP = 256 * 1024
+
 export const BACKUP_KEEP = 10
 
 // v4.1（P2）：存储后端。'sqlite' = 单文件 memory.db（node:sqlite，内置 SQLite，零依赖）；
@@ -221,3 +233,33 @@ export const EXPANSION_WEIGHT = 0.2
 // 中文：身份/偏好/习惯/环境/禁忌/目标/里程碑。
 export const PROFILE_SLOTS = ['identity', 'preference', 'habit', 'environment', 'taboo', 'goal', 'milestone']
 export const PROFILE_SLOT_LABELS = { identity: '身份', preference: '偏好', habit: '习惯', environment: '环境', taboo: '禁忌', goal: '目标', milestone: '里程碑' }
+
+// ── v4.15② 注入分层配额（取经 Letta 分桶上限 + distill-mem quota 混注，2026-11-12）──
+// 为什么要有配额：2026-11-12 真机实测 19 条 pinned 占 2154 字符 = 注入预算 2500 的 89.5%，
+//   索引层拿到 0 字符、33 条记忆对模型完全不可见、另有 2 条 pinned 被静默丢掉。
+// Letta 的对位做法是 block 分桶 + 每桶独立上限（letta@0.9.1 constants.py:326-328），不是单池硬裁。
+export const CORE_INJECT_SHARE = 0.78
+// 核心层（pinned）最多吃掉注入预算的 78%；剩下的 22% **预留给索引层**（相关层不能吃进这块）：
+// render.js 把相关层的 cap 扣掉这块，保证模型总能看到「库里还有什么」。
+export const INDEX_INJECT_FLOOR_SHARE = 0.22
+// 索引层里“完整行”（id + 标签 + 日期 + 44 字摘要）的上限，其余用紧凑行（id + 标签 + 14 字主题）。
+// 8 = 值不值判定 §7 验收线「索引层 ≥8 条」；3200 预算下 8 条完整行约 530 字符，仍在 22% 保底（704）以内。
+export const MAX_RICH_INDEX = 8
+// 冷热排序权重：使用次数（LFU）为主、重要度次之、新近（LRU）兜底。
+// 旧排序只看 importance+recency，usedCount 完全不参与——所以 m4（used=108）、m131（used=72）这类
+// 最常被检索的条目在注入层永无位置。
+export const HOT_SCORE_USAGE_WEIGHT = 0.5
+export const HOT_SCORE_IMPORTANCE_WEIGHT = 0.3
+export const HOT_SCORE_RECENCY_WEIGHT = 0.2
+// 冷层（不注入、只可检索）：从未被命中 且 超过这个天数没动过。
+// 为什么不是「used 少就冷」：Hermes curator.py:334-338 明令 use=0 只是「没证据」，需要年龄旁证。
+export const COLD_IDLE_DAYS = 21
+
+// ── v4.15② 满库自动收敛（取经 hindsight 的 merge/evict + Hermes 的「淘汰要有 why」）──
+// 为什么要有它：v4.15 把存储拆成热/冷两层后，单个层仍可能被写满；此时 makeRoom 只认
+//   「stale 或从未命中且 ≥7 天」的候选，实测库龄不够时永远为空 → 又回到硬拒。
+// 收敛只在「那一层已经满」时才触发（degraded 不触发），是最后一道闸，不是常态淘汰。
+export const CONVERGE_MAX_USES = 2 // usedCount ≤ 2 才算低价值（3 次以上算「用过」）
+export const CONVERGE_MIN_AGE_DAYS = 3 // 至少 3 天没动过（防止刚写的条目被后续写入挤掉）
+export const CONVERGE_MAX_PER_CALL = 10 // 单次最多归档 10 条，宁可多写几次也不一次清空
+

@@ -137,7 +137,9 @@ const priming = (h) => h.layers[0].text({ agent: { session: {} } })
       nextId: 9,
       entries: [
         { id: 'm1', text: '部署流程甲：先跑 npm run check，再提交到 git 仓库', kind: 'note', addedAt: now, updatedAt: now },
-        { id: 'm2', text: '部署流程甲：先跑 npm run check，再提交到 git 仓库。', kind: 'note', addedAt: now, updatedAt: now },
+        // v4.15②：m2 刻意写成「相似但不包含 m1」——v4.15 起满库会做包含式去重，m1 ⊂ m2 会被自动归档，
+        // 那样就测不到「建议合并」这条路。包含式去重由 memory.test.mjs 的收敛用例单独覆盖。
+        { id: 'm2', text: '部署流程乙：先跑 npm run check，再提交到 git 仓库并推送', kind: 'note', addedAt: now, updatedAt: now },
         { id: 'm3', text: '旧版接口要用 token 认证（已过复核期）', kind: 'fact', staleAfter: '2026-01-01', addedAt: now, updatedAt: now },
         // m4：从未命中、60 天未更新的**规则**——可以合并/归档吗？不行：规则不该被建议 drop（2026-11-02 复核抓到）
         { id: 'm4', text: '硬规则：插件源码放 D 盘，数据不落 C 盘', kind: 'rule', usedCount: 0, addedAt: new Date(Date.now() - 60 * 86400000).toISOString(), updatedAt: new Date(Date.now() - 60 * 86400000).toISOString() },
