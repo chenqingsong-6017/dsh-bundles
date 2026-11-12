@@ -130,9 +130,14 @@ for (const ws of WORKSPACES) {
 // ---- 规则 3：插件管理器日志（需三查：排查时是唯一证据）----
 const logRoot = 'C:\\Users\\cqs6017\\.dsh\\profiles\\desktop\\.plugin-manager\\logs'
 if (existsSync(logRoot)) {
-  const dirs = readdirSync(logRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort()
-  for (const name of dirs.slice(0, Math.max(0, dirs.length - LOG_KEEP))) {
-    add(path.join(logRoot, name), '插件管理器日志（只留最近 ' + LOG_KEEP + ' 次）', false, '出过一次装坏插件的故障后，这些日志就是唯一证据链')
+  // 2026-11-12 修口径：原先按目录名 sort() 取前 N 个，把今天的 operation-C1r3BO 误当「最老」（名字 C 排前），
+  // 实际它 mtime 最新。改为按 mtime 降序，只保留最近 LOG_KEEP 个。
+  const dirs = readdirSync(logRoot, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => { const p = path.join(logRoot, e.name); let m = 0; try { m = statSync(p).mtimeMs } catch {} return { p, m } })
+    .sort((a, b) => b.m - a.m)
+  for (const d of dirs.slice(LOG_KEEP)) {
+    add(d.p, '插件管理器日志（只留最近 ' + LOG_KEEP + ' 次）', false, '出过一次装坏插件的故障后，这些日志就是唯一证据链')
   }
 }
 
