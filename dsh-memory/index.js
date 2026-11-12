@@ -1214,8 +1214,20 @@ export function apply(ctx, config) {
         const next = typeof args?.text === 'string' ? args.text.trim() : ''
         if (id === '') throw fail('MEMORY_ARG_MISSING', 'memory_update 需要 id。')
         // v4.2：允许 verifiedCount-only 更新（procedure 每复用成功一次只累加证据，不必重发正文）。
-        if (next === '' && !Number.isInteger(args?.verifiedCount)) {
-          throw fail('MEMORY_ARG_MISSING', 'memory_update 需要新的 text；要删除请用 memory_remove {id, confirm:true}。')
+        // v4.16（2026-11-12）：放行「只更新元数据」——aliases/tags/pinned/status/inject/scope/kind 等。
+        // 起因：工具自己的提示（aliasHint、missing-alias tip）就在推荐 `memory_update {id, aliases:[...]}`，
+        // 但原校验只认 verifiedCount，形成「推荐的用法被自己的校验拒绝」——30 天 metrics 最高频错误（11 次）。
+        const META_UPDATE_FIELDS = [
+          'tag', 'tags', 'aliases', 'scope', 'kind', 'workspaces', 'importance', 'status',
+          'staleAfter', 'sources', 'entities', 'invalidAt', 'validFrom', 'slot', 'softDeadline',
+          'inject', 'pinned', 'verified', 'verifiedCount',
+        ]
+        const hasMetaUpdate = META_UPDATE_FIELDS.some((field) => args?.[field] !== undefined)
+        if (next === '' && !hasMetaUpdate) {
+          throw fail(
+            'MEMORY_ARG_MISSING',
+            'memory_update 需要新的 text，或至少一个可更新字段（aliases/tags/pinned/status/inject/verifiedCount 等）；要删除请用 memory_remove {id, confirm:true}。',
+          )
         }
         if (next.length > MAX_TEXT_CHARS) throw fail('MEMORY_TEXT_TOO_LONG', `单条记忆最多 ${MAX_TEXT_CHARS} 字符，当前 ${next.length}。${TEXT_TOO_LONG_HINT}`)
         const entry = state.entries.find((item) => item.id === id)

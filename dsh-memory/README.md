@@ -52,6 +52,11 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - `_selftest/tests/memory-eviction-integration.test.mjs`：4 组真实链路断言（走 `apply(ctx)` → memory.json → runMaintenance → archive → restore）。
 - 全量回归：`memory.test.mjs` 154 项通过；`memory-bench` Recall@5 = 1.000（21/21）。
 
+### memory_update 元数据放行（v4.16 · 并发会话改动，2026-11-12 由 Lead 验证收口）
+
+- **问题**：工具自己的 `aliasHint` / missing-alias 提示就在推荐 `memory_update {id, aliases:[...]}`，但 v4.2 的校验只放行 `verifiedCount`-only → **推荐的用法被自己的校验拒绝**；30 天 metrics 里这是最高频错误签名（11 次）。
+- **改法**：`META_UPDATE_FIELDS` 白名单（tag/tags/aliases/scope/kind/workspaces/importance/status/staleAfter/sources/entities/invalidAt/validFrom/slot/softDeadline/inject/pinned/verified/verifiedCount）；只给 `id` 什么都不给仍然拒绝（防误调用把条目改空）。每个放行字段都有落盘路径，**不是放行后静默丢弃**。
+- **验证**：`_selftest/tests/memory-meta-update.test.mjs` 5 场景（只 aliases / 只 pinned / 只 tags / 只 text 回归 / 只 id 必拒）；`memory.test.mjs` 155 项回归全过；**真机**用该能力把 11 条缺别名条目补齐（m301/m302/m303/m304/m305/m306/m307/m309/m310/m311/m313），`memory-retrievability-check` 缺别名 11→0。
 ### v4.16.1（2026-11-12 晚间·高标准自查补的两处）
 
 1. **跨工作区误伤保护**：`workspaces` 限定的条目只在**匹配的工作区**里可被时间淘汰（`curationDecision` 新增第 4 个参数 `cwd`，store 传 `lastKnownCwd`）。
