@@ -81,7 +81,20 @@ export function evictionAnchor(entry) {
  *   ② 锚点窗口（新增）：age ≥ kind 窗口 且 usedCount < 3 且 importance < 8 且最近 7 天没动 → 归档。
  * 返回 `{ archive, reason }`；reason 空串 = 未到期（调用方计 notDue），非空且 archive=false = 有理由的豁免。
  */
-export function curationDecision(entry, today = localDateOf(), now = Date.now()) {
+export function curationDecision(entry, today = localDateOf(), now = Date.now(), cwd = '') {
+  // v4.16.1（2026-11-12 高标准自查）：workspaces 限定的条目只在「匹配的工作区」里可被时间淘汰。
+  // 为什么：淘汰是全局动作（归档后所有工作区都看不到它）；若在 A 工作区淘汰掉只属于 B 工作区的条目，
+  // B 那边无从发现、也不会去 A 的 memory_status 里找 reason。本机实测 16/111 条带 workspaces —— 不是理论风险。
+  // cwd 未知（''）时一律保护：宁可少归档，不可误伤。
+  // 路径写法归一：大小写 / 反斜杠 vs 正斜杠 / 尾斜杠（用户手写 workspaces 时这三种都会出现）。
+  const normPath = (value) => String(value ?? '').toLowerCase().replace(/\\/g, '/').replace(/\/+$/, '')
+  const workspaces = Array.isArray(entry?.workspaces) ? entry.workspaces.map(normPath).filter((item) => item !== '') : []
+  if (workspaces.length > 0) {
+    const cwdKey = normPath(cwd)
+    if (cwdKey === '' || !workspaces.includes(cwdKey)) {
+      return { archive: false, reason: 'workspace 限定，当前工作区不匹配（保护）' }
+    }
+  }
   // ① stale 到期（原语义，不回归）：到期 + 宽限期内无复核/使用 → 归档
   if (isStaleEntry(entry, today)) {
     const ref = entry?.lastUsedAt ?? entry?.updatedAt ?? entry?.addedAt

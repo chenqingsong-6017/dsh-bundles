@@ -37,13 +37,14 @@ const pinnedR = await seed.defs.get('memory_add').execute({ text: '钉住的硬�
 const ruleR = await seed.defs.get('memory_add').execute({ text: '长期约定不该自动归档', kind: 'rule' })
 const vaultR = await seed.defs.get('memory_add').execute({ text: '知识入口见 vault://30-Build/x.md#1', kind: 'fact' })
 const usedR = await seed.defs.get('memory_add').execute({ text: '被检索过很多次的旧事实', kind: 'fact' })
+const otherWs = await seed.defs.get('memory_add').execute({ text: '别的开发区的旧观察记录', kind: 'fact', workspaces: ['D:\\AI\\other-workspace'] })
 
 // 伪造年龄（memory_add 不能写回 100 天前）：直接改 memory.json，再重新加载走真实读路径。
 const file = path.join(tmp, 'memory.json')
 const data = JSON.parse(readFileSync(file, 'utf8'))
 const oldStamp = new Date(Date.now() - 100 * 86400000).toISOString()
 for (const entry of data.entries) {
-  if (lowValue.includes(entry.id) || entry.id === vaultR.entry.id || entry.id === usedR.entry.id) {
+  if (lowValue.includes(entry.id) || entry.id === vaultR.entry.id || entry.id === usedR.entry.id || entry.id === otherWs.entry.id) {
     entry.addedAt = oldStamp
     entry.updatedAt = oldStamp
   }
@@ -64,10 +65,11 @@ ok('集成：低价值旧事实被归档、单轮 ≤5、summary 带 ids/freedCh
 
 const archivedSet = new Set(summary.ids);
 for (const id of summary.ids) assert.ok(lowValue.includes(id), '只能归档低价值条目，误伤了 ' + id);
-for (const protectedId of [pinnedR.entry.id, ruleR.entry.id, vaultR.entry.id, usedR.entry.id]) {
+for (const protectedId of [pinnedR.entry.id, ruleR.entry.id, vaultR.entry.id, usedR.entry.id, otherWs.entry.id]) {
   assert.ok(!archivedSet.has(protectedId), '受保护条目被误归档：' + protectedId);
 }
-ok('集成：pinned / rule / vault 指针 / usedCount≥3 全部未误伤')
+assert.ok(status.maintenance.skipped.capped >= 1, '10 条候选 + 单轮上限 5 → 必须有 capped 留待下轮，实际 ' + status.maintenance.skipped.capped);
+ok('集成：pinned / rule / vault 指针 / usedCount≥3 / 别的工作区 全部未误伤；单轮上限生效（capped≥1）')
 
 const restored = await h.defs.get('memory_restore').execute({ id: summary.ids[0] })
 assert.equal(restored.restored, true, '归档条目必须可 memory_restore 恢复');

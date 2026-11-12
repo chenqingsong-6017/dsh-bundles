@@ -87,4 +87,23 @@ const daysAgo = (n) => new Date(now - n * 86400000).toISOString()
   ok('有效重要度：importance 参与护栏判断（不是只看静态字段）')
 }
 
+// ---- 7. workspace 限定：跨工作区不淘汰（v4.16.1，高标准自查补的边界） ----
+{
+  const old = daysAgo(200)
+  const base = { kind: 'fact', text: 'x', usedCount: 0, updatedAt: old }
+  const other = { ...base, workspaces: ['D:\\AI\\other-workspace'] }
+  const here = { ...base, workspaces: ['D:\\AI\\date\\dsh-date\\dsh-创建'] }
+  const hereUpper = { ...base, workspaces: ['D:\\AI\\DATE\\DSH-DATE\\DSH-创建'] }
+  assert.equal(curationDecision(other, today, now, 'D:\\AI\\date\\dsh-date\\dsh-创建').archive, false, '别的工作区的条目不能被本工作区淘汰')
+  assert.ok(curationDecision(other, today, now, 'D:\\AI\\date\\dsh-date\\dsh-创建').reason.includes('workspace'), '理由必须写明 workspace 保护')
+  assert.equal(curationDecision(here, today, now, 'D:\\AI\\date\\dsh-date\\dsh-创建').archive, true, '匹配工作区的旧条目可以淘汰')
+  assert.equal(curationDecision(here, today, now, '').archive, false, 'cwd 未知时一律保护（宁可少归档）')
+  assert.equal(curationDecision(hereUpper, today, now, 'd:\\ai\\date\\dsh-date\\dsh-创建').archive, true, 'Windows 路径大小写不敏感')
+  const hereTrailing = { ...base, workspaces: ['D:\\AI\\date\\dsh-date\\dsh-创建\\'] }
+  assert.equal(curationDecision(hereTrailing, today, now, 'D:\\AI\\date\\dsh-date\\dsh-创建').archive, true, 'workspaces 带尾斜杠仍算匹配')
+  const hereForward = { ...base, workspaces: ['D:/AI/date/dsh-date/dsh-创建'] }
+  assert.equal(curationDecision(hereForward, today, now, 'D:\\AI\\date\\dsh-date\\dsh-创建').archive, true, '正斜杠写法仍算匹配')
+  ok('workspace 限定：跨工作区/未知 cwd 不淘汰；匹配工作区才进入时间淘汰（大小写不敏感）')
+}
+
 console.log(`\nmemory-eviction-v416: ${passed} 组断言通过`)

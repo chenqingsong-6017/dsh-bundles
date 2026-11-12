@@ -1817,6 +1817,18 @@ ok('v3.4 输出契约：每个工具的 required 字段都真的返回，且不�
   rmSync(tmp, { recursive: true, force: true })
   ok('v4.15② 注入配额：索引层 ≥8（完整 8 + 紧凑若干）、总长 ≤ maxInjectChars、pinned 溢出降级不丢')
 }
+
+// ---- v4.16.1：注入收益度量口径（差值可正可负，学 ADK 允许负收益） ----
+{
+  const longStats = {}
+  renderMemory([{ id: 'l1', text: '长'.repeat(300), kind: 'fact' }, { id: 's1', text: '短', kind: 'fact' }], { maxInjectChars: 400, stats: longStats })
+  assert.ok(Number.isInteger(longStats.indexedIfFullChars) && longStats.indexedIfFullChars >= 0, 'indexedIfFullChars 必须是非负整数')
+  assert.ok(longStats.indexedIfFullChars > longStats.indexedChars, '长条目：全量展开字符数应大于索引行（正收益），实际 ' + longStats.indexedIfFullChars + ' vs ' + longStats.indexedChars)
+  const shortStats = {}
+  renderMemory([{ id: 's2', text: '短', kind: 'fact' }], { maxInjectChars: 400, stats: shortStats })
+  assert.ok(shortStats.indexedIfFullChars <= shortStats.indexedChars, '短条目：索引行可能比全文更长（负收益，ADK 也允许），实际 ' + shortStats.indexedIfFullChars + ' vs ' + shortStats.indexedChars)
+  ok('v4.16.1 收益度量：长条目正收益、短条目可为负收益（不虚报“总是省”）')
+}
 // ---- v3.19 自动入库 + 预算保护：真跑一遍 turn-stopping（闭包逻辑的集成测试） ----
 {
   const workTmp = makeTmp('dsh-memory-ws')

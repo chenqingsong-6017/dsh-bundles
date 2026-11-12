@@ -52,6 +52,15 @@ DSH bundle（Host 侧插件）：把"用户级事实"存下来，注入**每个�
 - `_selftest/tests/memory-eviction-integration.test.mjs`：4 组真实链路断言（走 `apply(ctx)` → memory.json → runMaintenance → archive → restore）。
 - 全量回归：`memory.test.mjs` 154 项通过；`memory-bench` Recall@5 = 1.000（21/21）。
 
+### v4.16.1（2026-11-12 晚间·高标准自查补的两处）
+
+1. **跨工作区误伤保护**：`workspaces` 限定的条目只在**匹配的工作区**里可被时间淘汰（`curationDecision` 新增第 4 个参数 `cwd`，store 传 `lastKnownCwd`）。
+   - 为什么：淘汰是全局动作（归档后所有工作区都看不到它）；在 A 工作区淘汰只属于 B 的条目，B 无从发现、也不会去 A 的 `memory_status` 里找原因。
+   - 本机实测 **16/111 条带 `workspaces`** —— 不是理论风险。`cwd` 未知（`''`）时一律保护：宁可少归档，不可误伤。
+2. **收益度量口径写清「差值可负」**：短条目（如 10 字）的索引行会带 `id`/日期/标签开销，可能比全文更长 → `indexedIfFullChars - indexedChars` 可为负。这正是取经 ADK 时它明写允许负收益（`_prompt_chars_saved` 注释 `Negative when the compaction grows the request instead`）的原因；**不把「总是省字符」写成结论**。
+
+测试：纯函数 7 组（+workspace 保护）、集成 4 组（+capped 上限与别的工作区不误伤）、`memory.test.mjs` 155 项（+收益度量正/负两种口径）。
+
 ### 边界与回滚
 
 - 只归档不物理删；`memory_restore` 逐条回；`archive-manifest.jsonl` 留痕。

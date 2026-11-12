@@ -2004,7 +2004,7 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
       if (isEliminationProtected(entry)) continue
       const anchor = evictionAnchor(entry)
       const windowDays = evictionWindowDays(entry)
-      const decision = curationDecision(entry, today, now)
+      const decision = curationDecision(entry, today, now, lastKnownCwd)
       rows.push({
         id: entry.id,
         kind: typeof entry.kind === 'string' ? entry.kind : '',
@@ -2066,7 +2066,7 @@ export function createStore({ ctx, config, maxBytes, maxColdBytes, maxInjectChar
         skipped.rule += 1
         continue
       }
-      const decision = curationDecision(entry, today, now)
+      const decision = curationDecision(entry, today, now, lastKnownCwd)
       if (!decision.archive) {
         // v4.16：reason 区分「窗口未到」（window ...）/「有理由的豁免」（stale 宽限、usedCount/importance 护栏）。
         if (decision.reason.startsWith('window ')) skipped.window += 1
