@@ -182,6 +182,10 @@ export function listVault(vaultDir) {
         continue
       }
       if (!entry.isFile()) continue
+      // v0.2.x（2026-11-12）：跳过点号开头的隐藏文件。Obsidian 的插件会往每个目录写 .abstract.md /
+      // .overview.md 这类自动摘要（实测 12:28 批量生成 34 个），它们没有页面契约 frontmatter，
+      // 进索引只会制造 96 条假契约错误、干扰检索；Obsidian 自己也不把点文件当笔记。
+      if (entry.name.startsWith('.')) continue
       const ext = path.extname(entry.name).toLowerCase()
       allNames.add(entry.name.toLowerCase())
       allNames.add(baseName(entry.name).toLowerCase())
