@@ -286,7 +286,7 @@ export function apply(ctx, config) {
     const injectStats = value?.injectStats
     const indexStatLine =
       injectStats && Number(injectStats.indexedCount ?? 0) > 0
-        ? `（索引层 ${injectStats.indexedCount} 条：完整 ${injectStats.richIndexCount ?? 0} + 紧凑 ${injectStats.compactCount ?? 0}）`
+        ? `（索引层 ${injectStats.indexedCount} 条：完整 ${injectStats.richIndexCount ?? 0} + 紧凑 ${injectStats.compactCount ?? 0}，较全量展开${(injectStats.indexedIfFullChars ?? 0) - (injectStats.indexedChars ?? 0) >= 0 ? '省' : '多花'} ${Math.abs((injectStats.indexedIfFullChars ?? 0) - (injectStats.indexedChars ?? 0))} 字符）`
         : ''
     const head = `记忆 ${value?.active ?? 0} 条生效 / ${archivedCount} 条归档（合计 ${value?.total ?? 0}），存储 热 ${value?.hotChars ?? 0}/${value?.maxBytes ?? 0} · 冷 ${value?.coldChars ?? 0}/${value?.maxColdBytes ?? 0} 字符（冷层不进 prompt），本轮注入 ${value?.injectedChars ?? 0}/${value?.maxInjectChars ?? 0} 字符${indexStatLine}${value?.injectedOverBudget ? ' ⚠超预算' : ''}${hiddenHint}${healthWarn}`
     if (entries.length === 0) return [text(`${head}\n（还没有任何记忆。用 memory_add 写入第一条。）`)]
@@ -2820,7 +2820,7 @@ export function apply(ctx, config) {
           coldBudget,
           // 代码指纹：真机验证「HMR 是否已加载本版代码」的可观测点（2026-11-05 验收补强）。
           // 本文件任何行为改动后必须同步更新此指纹，否则进程内新旧代码无法区分。
-          codeFingerprint: '4.15.0-inject-quota',
+          codeFingerprint: '4.16.2-eviction-forecast',
         }
       },
     }),
