@@ -11,6 +11,13 @@ import { promises as fsp } from 'node:fs';
 
 const ROUTE = '/plugins/archived-purge';
 
+// The harness has no reconciler: expand function components in place,
+// exactly as React would render them, so the whole page tree is walkable.
+function expand(type, props, children) {
+  const node = { type, props, children };
+  return typeof type === 'function' ? type({ ...props, children }) : node;
+}
+
 function makeRuntime() {
   const slots = [];
   const effects = [];
@@ -21,7 +28,7 @@ function makeRuntime() {
 
   const React = {
     createElement(type, props, ...children) {
-      return { type, props: props ?? {}, children: children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false) };
+      return expand(type, props ?? {}, children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false));
     },
     useState(initial) {
       const index = cursor++;
@@ -387,6 +394,48 @@ test('the orphan-attachment sweep asks before deleting anything', async () => {
     tree = await panel.settle(tree);
     assert.equal(executed, true);
     assert.match(textOf(tree), /orphanGcDone/);
+  } finally {
+    panel.restore();
+  }
+});
+test('the automatic sweep is visible, restorable and checkable from the page', async () => {
+  const responses = {
+    '/state': stateResponse,
+    '/auto': () => ({
+      ok: true,
+      enabled: true,
+      config: { intervalHours: 6, graceDays: 30, retainDays: 7 },
+      lastRunAt: 1_700_000_000_000,
+      nextRunAt: 1_700_021_600_000,
+      heldBytes: 2048,
+      held: [{ entryId: '20260101T000000.000Z-session-a', sessionId: 'session-a', title: 'Held one', bytes: 2048, expiresInMs: 3 * 24 * 60 * 60 * 1000 }],
+    }),
+    '/auto/restore': () => ({ ok: true, restored: ['C:\\home\\sessions\\--x--\\session-a'], skipped: [] }),
+    '/auto/run': () => ({ ok: true, dryRun: true, held: [{ sessionId: 'session-b' }], skipped: [{ id: 'session-a', reason: 'resident' }] }),
+  };
+  const panel = await mountPanel(responses);
+  try {
+    const card = find(panel.tree, (node) => hasClass(node, 'ap-auto'))[0];
+    assert.ok(card, 'the auto card rendered above the list');
+    assert.match(textOf(card), /autoTitle/);
+    assert.match(textOf(card), /autoOn/);
+    assert.match(textOf(card), /Held one/);
+
+    const restore = find(card, (node) => node.type === 'button' && textOf(node) === 'autoRestore')[0];
+    assert.ok(restore, 'each held entry has a restore button');
+    restore.props.onClick();
+    let tree = await panel.settle(panel.tree);
+    const restoredCall = panel.calls.find((call) => call.url.endsWith('/auto/restore'));
+    assert.equal(restoredCall.body.entryId, '20260101T000000.000Z-session-a');
+    assert.match(textOf(tree), /autoRestored/);
+
+    const check = find(tree, (node) => node.type === 'button' && textOf(node) === 'autoRecheck')[0];
+    assert.ok(check, 'the check-now button exists');
+    check.props.onClick();
+    tree = await panel.settle(tree);
+    const runCall = panel.calls.find((call) => call.url.endsWith('/auto/run'));
+    assert.equal(runCall.body?.apply, undefined, 'the page only previews; it never applies');
+    assert.match(textOf(tree), /autoChecked/);
   } finally {
     panel.restore();
   }

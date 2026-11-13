@@ -49,17 +49,34 @@ import {
   walkFiles,
   writeManifest,
 } from './lib/clean.js';
+import { startScheduler } from './lib/auto.js';
+import { registerRoutes } from './lib/routes.js';
+import { registerTools } from './lib/tools.js';
+import { createSessionView } from './lib/session-view.js';
+import {
+  dirStats,
+  formatError,
+  isInside,
+  readArchivedState,
+  readCacheDoc,
+  removeTree,
+  resolveHome,
+  scanSessionDirs,
+  titleOfCache,
+  workspaceOf,
+} from './lib/store.js';
 
 export const name = 'archived-purge';
-export const inject = ['webServer', 'workspaceRegistry', 'sessions', 'sessionPersistence'];
+// `timer` is a base-layer service (dsh-base), and `ctx.interval` refuses to be
+// read without it: declaring it here is what makes the official timer channel
+// usable instead of a bare setTimeout. See _research/2026-11-13-归档会话自动清理取经.md §2.2.
+export const inject = ['webServer', 'workspaceRegistry', 'sessions', 'sessionPersistence', 'timer', 'tools'];
 
 /** Innermost `next` of the activity waterfall: no listener means no work. */
 const NO_ACTIVITY = () => Promise.resolve([]);
 
-const ROUTE = '/plugins/archived-purge';
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,199}$/;
 const MAX_IDS = 500;
-const MAX_BODY = 64 * 1024;
 const MAX_CASCADE_DEPTH = 8;
 /**
  * Objects younger than this are never collected: an attachment is published
@@ -67,155 +84,6 @@ const MAX_CASCADE_DEPTH = 8;
  * lag its in-memory state by one checkpoint.
  */
 const GC_MIN_AGE_MS = 10 * 60 * 1000;
-
-function resolveHome() {
-  const env = process.env.DSH_HOME;
-  if (env && path.isAbsolute(env)) return env;
-  const profileDir = process.env.DSH_PROFILE_DIR;
-  if (profileDir && path.isAbsolute(profileDir)) return path.resolve(profileDir, '..', '..');
-  return path.join(os.homedir(), '.dsh');
-}
-
-function isInside(root, target) {
-  const rel = path.relative(path.resolve(root), path.resolve(target));
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
-}
-
-async function readJson(file) {
-  const text = await fsp.readFile(file, 'utf8');
-  return JSON.parse(text);
-}
-
-export async function readArchivedState(home) {
-  const workspaceFile = path.join(home, 'storages', 'workspace.json');
-  let doc;
-  try {
-    doc = await readJson(workspaceFile);
-  } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      return { archived: [], workspaces: {}, workspaceFile, missing: true };
-    }
-    throw error;
-  }
-  const archived = Array.isArray(doc?.global?.archivedSessionIds)
-    ? doc.global.archivedSessionIds.filter((id) => typeof id === 'string')
-    : [];
-  const workspaces = doc?.tables?.workspaces && typeof doc.tables.workspaces === 'object'
-    ? doc.tables.workspaces
-    : {};
-  return { archived, workspaces, workspaceFile, missing: false };
-}
-
-export async function scanSessionDirs(root) {
-  /** @type {Map<string, string[]>} */
-  const map = new Map();
-  let entries;
-  try {
-    entries = await fsp.readdir(root, { withFileTypes: true });
-  } catch {
-    return map;
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !entry.name.startsWith('--')) continue;
-    const projectDir = path.join(root, entry.name);
-    let children;
-    try {
-      children = await fsp.readdir(projectDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const child of children) {
-      if (!child.isDirectory()) continue;
-      const dir = path.join(projectDir, child.name);
-      const list = map.get(child.name);
-      if (list) list.push(dir);
-      else map.set(child.name, [dir]);
-    }
-  }
-  return map;
-}
-
-export async function dirStats(dir) {
-  let bytes = 0;
-  let newest = 0;
-  let files = 0;
-  const stack = [dir];
-  while (stack.length > 0) {
-    const current = stack.pop();
-    let entries;
-    try {
-      entries = await fsp.readdir(current, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      try {
-        const stat = await fsp.stat(full);
-        bytes += stat.size;
-        files += 1;
-        if (stat.mtimeMs > newest) newest = stat.mtimeMs;
-      } catch {
-        /* an unreadable file does not make the row fail */
-      }
-    }
-  }
-  return { bytes, newest, files };
-}
-
-async function removeTree(dir) {
-  let lastError;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      await fsp.rm(dir, { recursive: true, force: true, maxRetries: 2, retryDelay: 80 });
-      return;
-    } catch (error) {
-      lastError = error;
-      await new Promise((resolve) => setTimeout(resolve, 120 * (attempt + 1)));
-    }
-  }
-  throw lastError;
-}
-
-function formatError(error) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function workspaceIndex(workspaces) {
-  const byId = new Map();
-  for (const [workspaceId, record] of Object.entries(workspaces)) {
-    if (!record || typeof record !== 'object') continue;
-    byId.set(workspaceId, record);
-  }
-  return byId;
-}
-
-function workspaceOf(workspaces, sessionId) {
-  for (const [workspaceId, record] of Object.entries(workspaces)) {
-    if (!record || !Array.isArray(record.sessionIds)) continue;
-    if (record.sessionIds.includes(sessionId)) return { workspaceId, record };
-  }
-  return undefined;
-}
-
-function titleOfCache(doc) {
-  const value = doc?.record?.rows?.title?.val;
-  return typeof value === 'string' && value.trim() ? value.trim() : '';
-}
-
-async function readCacheDoc(cacheDir, sessionId) {
-  try {
-    const doc = await readJson(path.join(cacheDir, `${sessionId}.json`));
-    return doc;
-  } catch {
-    return undefined;
-  }
-}
 
 export function createHandlers(deps) {
   const { home, sessions, workspaceRegistry, sessionPersistence, activity, getSchedule, emit } = deps;
@@ -256,28 +124,6 @@ export function createHandlers(deps) {
     } catch {
       return false;
     }
-  }
-
-  /** Session id → the directory that Session could write into. */
-  async function cwdBySession() {
-    const map = new Map();
-    if (sessionPersistence && typeof sessionPersistence.list === 'function') {
-      try {
-        for (const snapshot of await sessionPersistence.list()) {
-          const id = snapshot?.header?.id;
-          const cwd = snapshot?.header?.cwd;
-          if (typeof id === 'string' && typeof cwd === 'string') map.set(id, cwd);
-        }
-      } catch {
-        /* fall back to the workspace records below */
-      }
-    }
-    const { workspaces } = await readArchivedState(home);
-    for (const record of Object.values(workspaces)) {
-      if (!record || !Array.isArray(record.sessionIds) || typeof record.path !== 'string') continue;
-      for (const id of record.sessionIds) if (!map.has(id)) map.set(id, record.path);
-    }
-    return map;
   }
 
   /**
@@ -388,18 +234,6 @@ export function createHandlers(deps) {
   async function requestImagesPlan() {
     const entries = await walkFiles(requestImagesRoot);
     return { files: entries, bytes: entries.reduce((sum, entry) => sum + entry.bytes, 0) };
-  }
-
-  /** Workspace files the given Sessions explicitly wrote or presented. */
-  async function artifactScan(ids) {
-    const cwds = await cwdBySession();
-    const scanned = await scanSessionArtifacts({
-      sessionPersistence,
-      sessionIds: ids,
-      home,
-      workspacesBySession: cwds,
-    });
-    return { ...scanned, cwds };
   }
 
   async function state() {
@@ -714,7 +548,7 @@ export function createHandlers(deps) {
     // and the manifest a later leftover scan reads once the log is gone. Both
     // must be derived here, while the log is still readable; the request never
     // decides what is allowed.
-    const scannedArtifacts = await artifactScan([...ids, ...childIds]);
+    const scannedArtifacts = await view.artifactScan([...ids, ...childIds]);
     const schedulePlan = await scheduleTasksOf([...ids, ...childIds]);
     const artifactFiles = scannedArtifacts.files;
     const artifactCwd = scannedArtifacts.cwds ?? new Map();
@@ -901,7 +735,7 @@ export function createHandlers(deps) {
   async function scanAll(ids) {
     const plan = await attachmentPlan(new Set(ids));
     const images = await requestImagesPlan();
-    const { files, unreadable } = await artifactScan(ids);
+    const { files, unreadable } = await view.artifactScan(ids);
     const scheduled = await scheduleTasksOf(ids);
     return {
       ok: true,
@@ -1186,45 +1020,34 @@ export function createHandlers(deps) {
     return { ok: true, announced };
   }
 
-  return { state, remove, announce, finalizePending, collectGarbage, scanAll, leftoverScan, purgeLeftovers, sessionsRoot, cacheRoot };
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let size = 0;
-    const chunks = [];
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > MAX_BODY) {
-        reject(Object.assign(new Error('request body too large'), { code: 'too-large' }));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
+  // The view owns the per-Session facts (log dirs, cache, produced files,
+  // liveness); the entry keeps only wiring so the frozen structure gate
+  // keeps shrinking instead of carrying a second implementation.
+  const view = createSessionView({
+    home,
+    sessions,
+    workspaceRegistry,
+    sessionPersistence,
+    activityKinds,
+    getSchedule,
   });
-}
 
-function sameOrigin(req) {
-  const origin = req.headers.origin;
-  if (!origin) return true;
-  try {
-    const url = new URL(origin);
-    return url.host === req.headers.host;
-  } catch {
-    return false;
+  function autoDeps(extras) {
+    return view.autoDeps(extras);
   }
-}
-
-function send(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'cache-control': 'no-store',
-  });
-  res.end(body);
+  return {
+    state,
+    remove,
+    announce,
+    finalizePending,
+    collectGarbage,
+    scanAll,
+    leftoverScan,
+    purgeLeftovers,
+    autoDeps,
+    sessionsRoot,
+    cacheRoot,
+  };
 }
 
 export function apply(ctx) {
@@ -1273,268 +1096,24 @@ export function apply(ctx) {
     ctx.logger?.warn?.(`archived-purge: finalizing deleted sessions failed: ${formatError(error)}`);
   });
 
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/state`,
-    async handler(req, res) {
-      if (req.method !== 'GET' && req.method !== 'HEAD') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      try {
-        send(res, 200, await handlers.state());
-      } catch (error) {
-        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
-      }
-    },
-  }));
-
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/delete`,
-    async handler(req, res) {
-      if (req.method !== 'POST') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      const type = String(req.headers['content-type'] ?? '');
-      if (!type.includes('application/json')) {
-        send(res, 415, { ok: false, code: 'content-type-required' });
-        return;
-      }
-      let payload;
-      try {
-        payload = JSON.parse(await readBody(req));
-      } catch (error) {
-        send(res, 400, {
-          ok: false,
-          code: error?.code === 'too-large' ? 'payload-too-large' : 'invalid-json',
-          message: formatError(error),
-        });
-        return;
-      }
-      try {
-        const result = await handlers.remove(payload?.sessionIds, {
-          files: payload?.files,
-          // One switch for the whole derived set; the Host still decides what
-          // is eligible, so a crafted `everything` can never reach more.
-          everything: payload?.everything === true,
-          // Tri-state: omitted means "follow `everything`", false opts out.
-          attachments: typeof payload?.attachments === 'boolean' ? payload.attachments : undefined,
-          requestImages: payload?.requestImages === true,
-        });
-        // A well-formed request that removed nothing is a business outcome,
-        // not a transport failure: 200 keeps `result.message` and
-        // `result.results` readable instead of surfacing a bare "HTTP 400".
-        send(res, 200, result);
-      } catch (error) {
-        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
-      }
-    },
-  }));
-
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/scan`,
-    async handler(req, res) {
-      if (req.method !== 'POST') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      const type = String(req.headers['content-type'] ?? '');
-      if (!type.includes('application/json')) {
-        send(res, 415, { ok: false, code: 'content-type-required' });
-        return;
-      }
-      let payload;
-      try {
-        payload = JSON.parse(await readBody(req));
-      } catch (error) {
-        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
-        return;
-      }
-      const ids = Array.isArray(payload?.sessionIds)
-        ? payload.sessionIds.filter((id) => typeof id === 'string' && ID_RE.test(id))
-        : [];
-      try {
-        send(res, 200, await handlers.scanAll(ids));
-      } catch (error) {
-        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
-      }
-    },
-  }));
-
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/gc`,
-    async handler(req, res) {
-      if (req.method !== 'POST') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      const type = String(req.headers['content-type'] ?? '');
-      if (!type.includes('application/json')) {
-        send(res, 415, { ok: false, code: 'content-type-required' });
-        return;
-      }
-      let payload;
-      try {
-        payload = JSON.parse(await readBody(req));
-      } catch (error) {
-        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
-        return;
-      }
-      try {
-        // `dryRun` must be explicitly false to delete anything.
-        send(res, 200, await handlers.collectGarbage({
-          dryRun: payload?.dryRun !== false,
-          requestImages: payload?.requestImages === true,
-        }));
-      } catch (error) {
-        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
-      }
-    },
-  }));
-
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/leftovers`,
-    async handler(req, res) {
-      if (req.method !== 'POST') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      try {
-        send(res, 200, await handlers.leftoverScan());
-      } catch (error) {
-        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
-      }
-    },
-  }));
-
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/purge-leftovers`,
-    async handler(req, res) {
-      if (req.method !== 'POST') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      const type = String(req.headers['content-type'] ?? '');
-      if (!type.includes('application/json')) {
-        send(res, 415, { ok: false, code: 'content-type-required' });
-        return;
-      }
-      let payload;
-      try {
-        payload = JSON.parse(await readBody(req));
-      } catch (error) {
-        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
-        return;
-      }
-      try {
-        send(res, 200, await handlers.purgeLeftovers({
-          files: Array.isArray(payload?.files) ? payload.files : [],
-          logs: payload?.logs === true,
-          caches: payload?.caches === true,
-          accounting: payload?.accounting === true,
-          archived: payload?.archived === true,
-          attachments: payload?.attachments === true,
-          requestImages: payload?.requestImages === true,
-        }));
-      } catch (error) {
-        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
-      }
-    },
-  }));
-
-  // Replay stale client rows: a row deleted out of band (a host restart before
-  // the client refreshed) would otherwise stay under "未分组" forever.
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/announce`,
-    async handler(req, res) {
-      if (req.method !== 'POST') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      const type = String(req.headers['content-type'] ?? '');
-      if (!type.includes('application/json')) {
-        send(res, 415, { ok: false, code: 'content-type-required' });
-        return;
-      }
-      let payload;
-      try {
-        payload = JSON.parse(await readBody(req));
-      } catch (error) {
-        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
-        return;
-      }
-      try {
-        send(res, 200, handlers.announce(payload?.sessionIds));
-      } catch (error) {
-        send(res, 500, { ok: false, code: 'internal', message: formatError(error) });
-      }
-    },
-  }));
-
-  // Browser-side mount diagnostics: the Client half reports a failed apply here
-  // so a future slot/API change leaves a readable trace instead of only a
-  // generic "entry did not activate" dialog.
-  ctx.effect(() => ctx.webServer.register({
-    kind: 'exact',
-    path: `${ROUTE}/client-error`,
-    async handler(req, res) {
-      if (req.method !== 'POST') {
-        send(res, 405, { ok: false, code: 'method-not-allowed' });
-        return;
-      }
-      if (!sameOrigin(req)) {
-        send(res, 403, { ok: false, code: 'foreign-origin' });
-        return;
-      }
-      try {
-        const payload = JSON.parse(await readBody(req));
-        const line = [
-          new Date().toISOString(),
-          String(payload?.message ?? '').slice(0, 4000),
-          String(payload?.stack ?? '').slice(0, 8000),
-          '---',
-          '',
-        ].join('\n');
-        await fsp.appendFile(path.join(home, 'archived-purge-client-errors.log'), line, 'utf8');
-        send(res, 200, { ok: true });
-      } catch (error) {
-        send(res, 400, { ok: false, code: 'invalid-json', message: formatError(error) });
-      }
-    },
-  }));
+  // The automatic sweep runs on its own beat; the HTTP surface is only the
+  // status and manual-override door. Both are registered here so the entry
+  // file stays an assembly point instead of a pile of handlers.
+  const auto = {
+    deps: handlers.autoDeps({
+      logger: ctx.logger,
+      // The official dispose-aware timer; `lib/auto.js` still falls back to an
+      // unref'd timeout when the service is absent.
+      interval: (fn, ms) => ctx.interval(fn, ms),
+    }),
+  };
+  ctx.effect(() => startScheduler(auto.deps));
+  registerRoutes(ctx, { home, handlers, auto });
+  // The page is for hand-picking; the tools are how an agent or a person in
+  // chat sees the automatic sweep and undoes one hold.
+  registerTools(ctx, ctx.tools, auto.deps);
 }
+
+// Kept as named exports for the tests and for any Host-side consumer of the
+// storage layout; the implementation lives in `lib/store.js`.
+export { dirStats, readArchivedState, scanSessionDirs } from './lib/store.js';
