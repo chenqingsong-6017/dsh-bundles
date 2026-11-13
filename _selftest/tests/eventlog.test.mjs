@@ -254,4 +254,31 @@ const host = (dir, extra) => {
   ok("自动捕获：显式 isError:false 且带 error 字段时不误报")
 }
 
+// ---- v0.2.0：captureToolCalls=true 记成功摘要；默认不记 ----
+{
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-eventlog-calls-'))
+  const h = host(dir, { captureToolCalls: true })
+  const capture = h.handlers.find((item) => item.name === 'session/event')
+  capture.handler({ header: { id: 's' } }, { type: 'tool/call', data: { callId: 'ok1', name: 'read' } })
+  capture.handler(
+    { header: { id: 's' } },
+    { type: 'tool/result', data: { message: { isError: false, toolCallId: 'ok1', content: [{ type: 'text', text: 'hello' }] } } },
+  )
+  const calls = await h.defs.get('log_query').execute({ code: 'TOOL-CALL' })
+  assert.equal(calls.matched, 1, '开启后成功调用要记')
+  assert.ok(calls.entries[0].message.includes('read'), '摘要要含工具名')
+  const st = await h.defs.get('log_status').execute({})
+  assert.equal(st.captureToolCalls, true, '状态要报开关')
+  rmSync(dir, { recursive: true, force: true })
+
+  const dir2 = mkdtempSync(path.join(os.tmpdir(), 'dsh-eventlog-nocalls-'))
+  const h2 = host(dir2)
+  const cap2 = h2.handlers.find((item) => item.name === 'session/event')
+  cap2.handler({ header: { id: 's' } }, { type: 'tool/result', data: { message: { isError: false, toolCallId: 'ok2', content: [{ type: 'text', text: 'x' }] } } })
+  const none = await h2.defs.get('log_query').execute({ code: 'TOOL-CALL' })
+  assert.equal(none.matched, 0, '默认不记成功调用（保持原行为）')
+  rmSync(dir2, { recursive: true, force: true })
+  ok('TOOL-CALL：开关控制成功摘要，默认关')
+}
+
 console.log(`eventlog: ${passed} 项通过`)

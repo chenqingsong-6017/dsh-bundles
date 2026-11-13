@@ -6,11 +6,13 @@
  * 没日志就永远查不出来（本机真实教训：DSH 升级后 computer-use 工具静默归零、notify 全哑）。
  *
  * 三条约束：①不进上下文（永不注入系统提示，只在被问到时用 log_query 查）；
- * ②fail-safe（写失败绝不影响主流程，记账不抛）；③不重复（工具调用全量审计归 dsh-audit，这里只记错误与运维事件）。
+ * ②fail-safe（写失败绝不影响主流程，记账不抛）；③默认只记错误与运维事件；成功工具调用可按
+ *   captureToolCalls 开关记摘要（TOOL-CALL），不存参数/输出全文（dsh-audit 不存在，2026-11-13 用 asar 与 profile 清单核实）。
  *
  * 数据：<storeDir>/events-YYYY-MM-DD.jsonl，每天一个文件，按 keepDays 清理。
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { installToolCapture } from './lib/capture.js'
 import path from 'node:path'
 
 export const name = 'dsh-eventlog'
@@ -119,6 +121,7 @@ export function apply(ctx, config) {
   const minLevelRaw = String(config?.minLevel ?? '').toLowerCase()
   const minLevel = LEVELS.includes(minLevelRaw) ? minLevelRaw : DEFAULT_MIN_LEVEL
   const captureToolErrors = config?.captureToolErrors !== false
+  const captureToolCalls = config?.captureToolCalls === true
   let lastError = ''
   let written = 0
 
@@ -224,88 +227,9 @@ export function apply(ctx, config) {
     return out.slice(0, MAX_SCAN_FILES)
   }
 
-  // ---- 自动捕获：工具报错（静默失败里最常见的一类；全量调用审计归 dsh-audit） ----
-  // 真实事件形状（2026-11-01 用 _selftest/metrics/tool-error-rate.mjs 反向确认，v0.1.0 读错字段）：
-  //   tool/call   data = { callId, name, ... }
-  //   tool/result data = { message: { isError, toolCallId, content: [{ type, text }], error? } }
-  // 旧实现读 data.isError / data.name —— 真实 payload 里都没有，结果是 source=unknown、message=[object Object]。
-  const toolNames = new Map()
-
-  function rememberToolCall(data) {
-    const callId = data?.callId ?? data?.id
-    const toolName = data?.name
-    if (callId === undefined || callId === null || typeof toolName !== 'string' || toolName === '') return
-    toolNames.set(String(callId), toolName)
-    while (toolNames.size > MAX_TOOL_CACHE) toolNames.delete(toolNames.keys().next().value)
-  }
-
-  // 取「人能看懂的那句」：真实 payload（2026-11-01 从会话日志反解）长这样：
-  //   data.message.content = [{ type: 'text', text: 'Error: code run failed ... \n    at ...' }]
-  //   data.error = { name: 'CodeRunFailedError', code: 'CODE_RUN_FAILED' }（只有类名，没有原因）
-  // 所以顺序必须 content 优先、error.name 兜底，否则只记到类名，等于没记原因。
-  function textOf(candidate) {
-    if (typeof candidate === 'string') return candidate
-    if (Array.isArray(candidate)) {
-      return candidate
-        .map((item) => (typeof item === 'string' ? item : item?.text))
-        .filter((item) => typeof item === 'string' && item !== '')
-        .join(' ')
-    }
-    if (candidate !== null && typeof candidate === 'object') {
-      if (typeof candidate.text === 'string' && candidate.text !== '') return candidate.text
-      if (typeof candidate.message === 'string' && candidate.message !== '') return candidate.message
-      if (typeof candidate.name === 'string' && candidate.name !== '') return candidate.name
-      try { return JSON.stringify(candidate) } catch (error) { return String(candidate) }
-    }
-    return ''
-  }
-
-  function errorTextOf(data, message) {
-    const candidates = [message?.error, message?.content, data?.message, data?.content, data?.error]
-    for (const candidate of candidates) {
-      if (candidate === undefined || candidate === null) continue
-      const text = textOf(candidate)
-      if (text !== '') return text
-    }
-    return ''
-  }
-
-  ctx.effect(() =>
-    ctx.on('session/event', (session, event) => {
-      try {
-        const type = event?.type
-        if (type !== 'tool/call' && type !== 'tool/result') return
-        if (captureToolErrors !== true) return
-        const data = event?.data ?? {}
-        if (type === 'tool/call') {
-          rememberToolCall(data)
-          return
-        }
-        const message = data.message ?? {}
-        // 显式 isError:false 一律当成功：有些 payload 会带一个非致命 error 字段，别误报成失败
-        const explicitSuccess = message.isError === false || data.isError === false
-        const failed = explicitSuccess
-          ? false
-          : message.isError === true || data.isError === true || message.error !== undefined || data.error !== undefined
-        if (!failed) return
-        const callId = message.toolCallId ?? data.toolCallId ?? data.callId
-        const known = callId === undefined || callId === null ? undefined : toolNames.get(String(callId))
-        const toolName = String(known ?? data.name ?? message.name ?? 'unknown').slice(0, 64)
-        // 只取首行：错误正文后面常带整段调用栈，塞进 message 没有信息增量
-        const detail = (errorTextOf(data, message).split('\n')[0] || '').replace(/\s+/g, ' ').trim().slice(0, 240)
-        append({
-          level: 'warn',
-          channel: 'agent',
-          code: 'TOOL-ERROR',
-          source: toolName,
-          message: detail === '' ? toolName + ' 调用失败' : toolName + ' 调用失败：' + detail,
-          session: String(session?.id ?? session?.header?.id ?? session?.sessionId ?? ''),
-        })
-      } catch (error) {
-        noteError(error)
-      }
-    }),
-  )
+  // ---- 自动捕获：工具报错（默认）+ 成功调用摘要（captureToolCalls 开启时） ----
+  // 实现见 lib/capture.js（index.js 只装配；2026-11-13 从入口抽出，禁屎山存量只许减）
+  installToolCapture(ctx, { append, captureToolErrors, captureToolCalls, noteError, maxToolCache: MAX_TOOL_CACHE })
 
   // ---- 启动事件：解决「什么时候开始不对」 ----
   append({ level: 'info', channel: 'system', code: 'LOG-START', source: 'dsh-eventlog', message: '事件日志已启动（keepDays=' + keepDays + '，store=' + storeDir + '）' })
@@ -486,17 +410,18 @@ export function apply(ctx, config) {
             keepDays: { type: 'integer' },
             minLevel: { type: 'string' },
             captureToolErrors: { type: 'boolean' },
+            captureToolCalls: { type: 'boolean' },
             writtenThisRun: { type: 'integer' },
             lastError: { type: 'string' },
           },
-          required: ['ready', 'unavailableReason', 'storeDir', 'files', 'entries', 'bytes', 'keepDays', 'minLevel', 'captureToolErrors', 'writtenThisRun', 'lastError'],
+          required: ['ready', 'unavailableReason', 'storeDir', 'files', 'entries', 'bytes', 'keepDays', 'minLevel', 'captureToolErrors', 'captureToolCalls', 'writtenThisRun', 'lastError'],
           additionalProperties: false,
         },
         render(_args, value) {
           if (value?.ready === false) return [text('不可用：' + (value.unavailableReason || '未知原因'))]
           const head = '事件日志：' + (value?.files ?? 0) + ' 个文件 / ' + (value?.entries ?? 0) + ' 条 / ' + Math.round((value?.bytes ?? 0) / 1024) + ' KB'
           const range = value?.oldest ? '，范围 ' + String(value.oldest).slice(0, 10) + ' → ' + String(value.newest).slice(0, 10) : ''
-          const tail = '（保留 ' + (value?.keepDays ?? 0) + ' 天，最低级别 ' + (value?.minLevel ?? '') + '，本次已写 ' + (value?.writtenThisRun ?? 0) + ' 条）'
+          const tail = '（保留 ' + (value?.keepDays ?? 0) + ' 天，最低级别 ' + (value?.minLevel ?? '') + '，成功摘要 ' + (value?.captureToolCalls ? '开' : '关') + '，本次已写 ' + (value?.writtenThisRun ?? 0) + ' 条）'
           const err = value?.lastError ? '\n⚠ 最近错误：' + value.lastError : ''
           return [text(head + range + tail + err)]
         },
@@ -541,6 +466,7 @@ export function apply(ctx, config) {
           keepDays,
           minLevel,
           captureToolErrors,
+          captureToolCalls,
           writtenThisRun: written,
           lastError,
         }
